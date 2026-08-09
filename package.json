@@ -1,0 +1,25 @@
+{
+  "name": "local-devteam",
+  "version": "0.2.0",
+  "description": "A local dashboard and MCP coordination server for AI development teams.",
+  "type": "module",
+  "bin": {
+    "devteam": "bin/devteam.mjs",
+    "bridge": "bin/bridge.mjs"
+  },
+  "scripts": {
+    "dev": "node bin/devteam.mjs start",
+    "start": "node bin/devteam.mjs start",
+    "test": "node --test",
+    "doctor": "node bin/devteam.mjs doctor"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "express": "^5.2.1",
+    "zod": "^4.0.0"
+  },
+  "license": "MIT"
+}

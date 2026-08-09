@@ -1,0 +1,1274 @@
+import { EventEmitter } from "node:events";
+import { randomBytes, randomUUID } from "node:crypto";
+import { mkdirSync } from "node:fs";
+import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
+
+const now = () => new Date().toISOString();
+const json = (value) => JSON.stringify(value ?? null);
+const fromJson = (value, fallback = null) => {
+  try {
+    return value == null ? fallback : JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+};
+
+export class DevTeamStore extends EventEmitter {
+  constructor(dataDir, { liveness = {} } = {}) {
+    super();
+    this.dataDir = path.resolve(dataDir);
+    mkdirSync(this.dataDir, { recursive: true });
+    this.databasePath = path.join(this.dataDir, "devteam.sqlite");
+    this.db = new DatabaseSync(this.databasePath);
+    this.db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
+    this.#migrate();
+    this.token = this.#getOrCreateToken();
+    // Presence and ownership are different questions. A *busy* agent that goes quiet is
+    // presumed to still be working — reasoning and editing make no MCP calls — so it keeps
+    // its claim; only its presence lapses (it becomes 'unresponsive'). Silence alone never
+    // transfers a write lease; only explicit disconnect, a confirmed transport close, a
+    // same-identity reconnect, or a human force-release does. Long-silent *read-only* claims
+    // are safe to requeue because no filesystem write is at risk.
+    this.liveness = {
+      presenceMs: 120_000,   // quiet longer than this: a waiting agent is gone, a busy one is 'unresponsive'
+      staleWorkMs: 900_000,  // quiet longer than this: a read-only claim may be safely recovered
+      ...liveness,
+    };
+    this.#recoverOrphanedClaims("Recovered an orphaned assignment during server startup.");
+    this.#syncAllTaskStatuses();
+  }
+
+  #migrate() {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS metadata (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS projects (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        root TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS agents (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        capabilities TEXT NOT NULL,
+        status TEXT NOT NULL,
+        current_task_id TEXT,
+        connected_at TEXT NOT NULL,
+        last_seen TEXT NOT NULL,
+        disconnected_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS tasks (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        description TEXT NOT NULL,
+        status TEXT NOT NULL,
+        version INTEGER NOT NULL DEFAULT 1,
+        required_approvals INTEGER NOT NULL DEFAULT 2,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS assignments (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        description TEXT NOT NULL,
+        role TEXT NOT NULL,
+        requires_write INTEGER NOT NULL DEFAULT 0,
+        target_agent_name TEXT,
+        agent_id TEXT REFERENCES agents(id),
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        claimed_at TEXT,
+        completed_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        agent_id TEXT REFERENCES agents(id),
+        type TEXT NOT NULL,
+        message TEXT NOT NULL,
+        metadata TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS approvals (
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+        version INTEGER NOT NULL,
+        summary TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (task_id, agent_id, version)
+      );
+
+      CREATE TABLE IF NOT EXISTS message_receipts (
+        event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+        agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+        delivered_at TEXT,
+        seen_at TEXT,
+        PRIMARY KEY (event_id, agent_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS proposals (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        proposer_id TEXT REFERENCES agents(id),
+        proposer_name TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        details TEXT NOT NULL,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        resolved_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS proposal_votes (
+        proposal_id TEXT NOT NULL REFERENCES proposals(id) ON DELETE CASCADE,
+        voter_id TEXT NOT NULL,
+        voter_name TEXT NOT NULL,
+        vote TEXT NOT NULL,
+        comment TEXT,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (proposal_id, voter_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS assignment_checklists (
+        assignment_id TEXT PRIMARY KEY REFERENCES assignments(id) ON DELETE CASCADE,
+        items TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS task_members (
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+        role TEXT NOT NULL DEFAULT 'contributor',
+        joined_at TEXT NOT NULL,
+        PRIMARY KEY (task_id, agent_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS assignment_write_scopes (
+        assignment_id TEXT PRIMARY KEY REFERENCES assignments(id) ON DELETE CASCADE,
+        paths TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project_id, status);
+      CREATE INDEX IF NOT EXISTS idx_assignments_queue ON assignments(status, target_agent_name, created_at);
+      CREATE INDEX IF NOT EXISTS idx_assignments_task_status ON assignments(task_id, status);
+      CREATE INDEX IF NOT EXISTS idx_events_task_id ON events(task_id, id);
+      CREATE INDEX IF NOT EXISTS idx_events_type_created ON events(type, created_at);
+      CREATE INDEX IF NOT EXISTS idx_agents_status_seen ON agents(status, last_seen);
+      CREATE INDEX IF NOT EXISTS idx_receipts_agent ON message_receipts(agent_id, delivered_at, seen_at);
+      CREATE INDEX IF NOT EXISTS idx_proposals_task_status ON proposals(task_id, status);
+      CREATE INDEX IF NOT EXISTS idx_task_members_agent ON task_members(agent_id);
+      PRAGMA optimize;
+    `);
+  }
+
+  #getOrCreateToken() {
+    const existing = this.db.prepare("SELECT value FROM metadata WHERE key = 'auth_token'").get();
+    if (existing?.value) return existing.value;
+    const token = randomBytes(24).toString("base64url");
+    this.db.prepare("INSERT INTO metadata (key, value) VALUES ('auth_token', ?)").run(token);
+    return token;
+  }
+
+  #transaction(callback) {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = callback();
+      this.db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  #event(taskId, agentId, type, message, metadata = {}) {
+    const stamp = now();
+    const info = this.db.prepare(`
+      INSERT INTO events (task_id, agent_id, type, message, metadata, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(taskId, agentId || null, type, message, json(metadata), stamp);
+    return Number(info.lastInsertRowid);
+  }
+
+  #changed(type, taskId = null) {
+    this.emit("change", { type, taskId, at: now() });
+  }
+
+  #syncTaskStatus(taskId, stamp = now()) {
+    const task = this.db.prepare("SELECT status FROM tasks WHERE id = ?").get(taskId);
+    if (!task || ["accepted", "blocked", "cancelled"].includes(task.status)) return task?.status || null;
+    const openAssignments = this.db.prepare(`
+      SELECT role FROM assignments
+      WHERE task_id = ? AND status IN ('queued', 'claimed')
+    `).all(taskId);
+    const reviewRoles = new Set(["reviewer", "security-reviewer", "tester"]);
+    let status = "review";
+    if (openAssignments.some((assignment) => String(assignment.role).toLowerCase() === "planner")) {
+      status = "planning";
+    } else if (openAssignments.some((assignment) => !reviewRoles.has(String(assignment.role).toLowerCase()))) {
+      status = "active";
+    }
+    if (task.status !== status) {
+      this.db.prepare("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?").run(status, stamp, taskId);
+    }
+    return status;
+  }
+
+  #syncAllTaskStatuses() {
+    const taskIds = this.db.prepare(`
+      SELECT id FROM tasks WHERE status NOT IN ('accepted', 'blocked', 'cancelled')
+    `).all();
+    const stamp = now();
+    for (const task of taskIds) this.#syncTaskStatus(task.id, stamp);
+  }
+
+  #releaseAgentClaims(agent, stamp, reason) {
+    const taskIds = this.db.prepare(`
+      SELECT DISTINCT task_id FROM assignments WHERE agent_id = ? AND status = 'claimed'
+    `).all(agent.id).map((row) => row.task_id);
+    const released = this.db.prepare(`
+      UPDATE assignments SET status = 'queued', agent_id = NULL, claimed_at = NULL
+      WHERE agent_id = ? AND status = 'claimed'
+    `).run(agent.id).changes;
+    this.db.prepare(`
+      UPDATE agents
+      SET status = 'disconnected', current_task_id = NULL, last_seen = ?, disconnected_at = ?
+      WHERE id = ?
+    `).run(stamp, stamp, agent.id);
+    for (const taskId of taskIds) {
+      this.#event(taskId, agent.id, "agent.disconnected", `${agent.name} disconnected and released unfinished work.`, {
+        reason,
+        releasedAssignments: released,
+      });
+      this.#syncTaskStatus(taskId, stamp);
+    }
+    return taskIds;
+  }
+
+  // Refresh presence and recover only what is safe to recover. This deliberately does NOT
+  // release a busy agent's work on silence: a quiet agent that holds a claim is presumed to
+  // still be reasoning/editing (which produce no MCP calls). It is flagged 'unresponsive' but
+  // keeps its claim. Write leases are never transferred here; read-only claims held by an
+  // agent that has been silent past staleWorkMs are requeued because nothing on disk is at risk.
+  #reapStaleAgents() {
+    const presenceBefore = new Date(Date.now() - this.liveness.presenceMs).toISOString();
+    const staleWorkBefore = new Date(Date.now() - this.liveness.staleWorkMs).toISOString();
+    const stamp = now();
+    const affectedTasks = new Set();
+    let presenceChanged = false;
+    this.#transaction(() => {
+      // Idle (waiting) agents that went silent are simply gone; they own nothing to protect.
+      const goneIdle = this.db.prepare(`
+        SELECT * FROM agents WHERE status = 'waiting' AND last_seen < ?
+      `).all(presenceBefore);
+      for (const agent of goneIdle) {
+        for (const taskId of this.#releaseAgentClaims(agent, stamp, "Agent presence timed out while idle.")) affectedTasks.add(taskId);
+        presenceChanged = true;
+      }
+      // Busy agents that went silent are presumed still working: keep the claim, flag presence.
+      const flagged = this.db.prepare(`
+        UPDATE agents SET status = 'unresponsive' WHERE status = 'busy' AND last_seen < ?
+      `).run(presenceBefore).changes;
+      if (flagged) presenceChanged = true;
+      // Read-only work whose owner has been silent a long time is safe to recover.
+      const recoverable = this.db.prepare(`
+        SELECT a.id, a.task_id, COALESCE(ag.name, 'An agent') AS agent_name
+        FROM assignments a JOIN agents ag ON ag.id = a.agent_id
+        WHERE a.status = 'claimed' AND a.requires_write = 0
+          AND ag.status IN ('unresponsive', 'disconnected') AND ag.last_seen < ?
+      `).all(staleWorkBefore);
+      for (const row of recoverable) {
+        this.db.prepare("UPDATE assignments SET status = 'queued', agent_id = NULL, claimed_at = NULL WHERE id = ?").run(row.id);
+        this.#event(row.task_id, null, "assignment.released", `${row.agent_name}'s read-only assignment was recovered after a long silence.`, { assignmentId: row.id, reason: "stale-readonly-recovery" });
+        this.#syncTaskStatus(row.task_id, stamp);
+        affectedTasks.add(row.task_id);
+      }
+    });
+    for (const taskId of affectedTasks) this.#changed("assignment.released", taskId);
+    if (presenceChanged) this.#changed("agent.disconnected");
+    return [];
+  }
+
+  #recoverOrphanedClaims(reason = "Recovered an assignment whose agent is disconnected.") {
+    const orphans = this.db.prepare(`
+      SELECT DISTINCT a.task_id, a.agent_id, COALESCE(ag.name, 'Unknown agent') AS agent_name
+      FROM assignments a
+      LEFT JOIN agents ag ON ag.id = a.agent_id
+      WHERE a.status = 'claimed' AND (ag.id IS NULL OR ag.status = 'disconnected')
+    `).all();
+    if (!orphans.length) return [];
+    const stamp = now();
+    this.#transaction(() => {
+      this.db.prepare(`
+        UPDATE assignments SET status = 'queued', agent_id = NULL, claimed_at = NULL
+        WHERE status = 'claimed' AND (
+          agent_id IS NULL OR agent_id IN (SELECT id FROM agents WHERE status = 'disconnected')
+        )
+      `).run();
+      for (const orphan of orphans) {
+        this.#event(orphan.task_id, orphan.agent_id, "assignment.released", `${orphan.agent_name}'s orphaned assignment was returned to the queue.`, { reason });
+        this.#syncTaskStatus(orphan.task_id, stamp);
+      }
+    });
+    for (const taskId of new Set(orphans.map((orphan) => orphan.task_id))) this.#changed("assignment.released", taskId);
+    return orphans;
+  }
+
+  // Public sweep used by the server's periodic reaper so the dashboard reflects
+  // crashed or silently-closed desktop agents even when no request is in flight.
+  reapAndRecover() {
+    const reaped = this.#reapStaleAgents();
+    this.#recoverOrphanedClaims();
+    return reaped;
+  }
+
+  // Snapshot of whether the team is still doing something. Drives the keepWaiting
+  // hint so a waiting agent stays assembled while work is in flight and only
+  // leaves once the room is genuinely quiet.
+  teamActivity() {
+    const openWork = Number(this.db.prepare(`
+      SELECT COUNT(*) AS count FROM assignments a
+      JOIN tasks t ON t.id = a.task_id
+      WHERE a.status IN ('queued', 'claimed') AND t.status NOT IN ('accepted', 'blocked', 'cancelled')
+    `).get().count);
+    const busyAgents = Number(this.db.prepare("SELECT COUNT(*) AS count FROM agents WHERE status = 'busy'").get().count);
+    const waitingAgents = Number(this.db.prepare("SELECT COUNT(*) AS count FROM agents WHERE status = 'waiting'").get().count);
+    return { active: openWork > 0 || busyAgents > 0, openWork, busyAgents, waitingAgents };
+  }
+
+  // Return undirected/directed human messages this agent has not yet received,
+  // and record delivery. "Directed" = target is this agent's name; broadcasts use
+  // target "all". Only messages posted during this session are delivered live;
+  // older history is still visible through devteam_state.
+  // Is this timeline event a live message for the given agent? Human messages reach the agent
+  // if broadcast ("all") or addressed to its name. Agent messages are only *pushed* when they
+  // are directed to this agent by name (never the sender's own, never undirected broadcasts —
+  // those stay timeline notes read via devteam_state).
+  #messageIsForAgent(event, agent) {
+    const nameLower = String(agent.name).toLowerCase();
+    if (event.type === "human.message") {
+      const target = String(event.metadata.target || "all").toLowerCase();
+      return target === "all" || target === nameLower;
+    }
+    if (String(event.agent_id || "") === agent.id) return false;
+    const target = String(event.metadata.target || "").toLowerCase();
+    if (!target) return false;
+    return target === nameLower || target === String(agent.id).toLowerCase();
+  }
+
+  deliverDirectedMessages(agentId) {
+    const agent = this.getAgent(agentId);
+    if (agent.status === "disconnected") return [];
+    const rooms = this.#memberTaskIds(agentId);
+    if (!rooms.length) return [];
+    const roomPlaceholders = rooms.map(() => "?").join(", ");
+    const candidates = this.db.prepare(`
+      SELECT e.id, e.task_id, e.agent_id, e.type, e.message, e.metadata, e.created_at
+      FROM events e
+      WHERE (e.type = 'human.message' OR e.type LIKE 'agent.%')
+        AND e.task_id IN (${roomPlaceholders})
+        AND e.created_at >= ?
+        AND NOT EXISTS (
+          SELECT 1 FROM message_receipts r
+          WHERE r.event_id = e.id AND r.agent_id = ? AND r.delivered_at IS NOT NULL
+        )
+      ORDER BY e.id ASC
+      LIMIT 50
+    `).all(...rooms, agent.connected_at, agentId).map((row) => ({ ...row, metadata: fromJson(row.metadata, {}) }));
+    const mine = candidates.filter((event) => this.#messageIsForAgent(event, agent));
+    if (!mine.length) return [];
+    const stamp = now();
+    const taskIds = new Set();
+    this.#transaction(() => {
+      for (const event of mine) {
+        this.db.prepare(`
+          INSERT INTO message_receipts (event_id, agent_id, delivered_at)
+          VALUES (?, ?, ?)
+          ON CONFLICT(event_id, agent_id) DO UPDATE SET delivered_at = COALESCE(message_receipts.delivered_at, excluded.delivered_at)
+        `).run(event.id, agentId, stamp);
+        taskIds.add(event.task_id);
+      }
+      this.db.prepare("UPDATE agents SET last_seen = ? WHERE id = ?").run(stamp, agentId);
+    });
+    for (const taskId of taskIds) this.#changed("message.delivered", taskId);
+    return mine.map((event) => ({
+      id: event.id,
+      taskId: event.task_id,
+      message: event.message,
+      from: event.type === "human.message" ? "human" : (event.metadata.senderName || "a teammate"),
+      target: event.metadata.targetLabel || (event.type === "human.message" ? "all agents" : agent.name),
+      broadcast: event.type === "human.message" && String(event.metadata.target || "all").toLowerCase() === "all",
+      at: event.created_at,
+    }));
+  }
+
+  // Mark every delivered-but-unacknowledged message for this agent as seen. Called
+  // when the agent takes any follow-up action, so the human sees a real acknowledgement.
+  markMessagesSeen(agentId) {
+    const changed = this.db.prepare(`
+      UPDATE message_receipts SET seen_at = ?
+      WHERE agent_id = ? AND delivered_at IS NOT NULL AND seen_at IS NULL
+    `).run(now(), agentId).changes;
+    if (changed) this.#changed("message.seen");
+    return changed;
+  }
+
+  // Role checklists a planner can attach to review work so the team systematically
+  // covers the usual blind spots instead of eyeballing a diff. Attached automatically
+  // to review/security/test assignments unless the caller overrides them.
+  static CHECKLIST_TEMPLATES = {
+    "security-reviewer": [
+      "Authentication: no broken/missing auth on protected paths",
+      "Session handling: fixation, regeneration, secure/httponly cookies",
+      "Authorization: object-level and function-level access checks",
+      "Input validation and injection (SQL/command/template/XSS)",
+      "Secrets: none logged, committed, or returned in responses",
+      "Rate limiting / abuse protection on sensitive endpoints",
+      "Error handling does not leak stack traces or internals",
+      "Dependencies: no known-vulnerable or unpinned additions",
+    ],
+    reviewer: [
+      "Correctness: does it do what the task asked?",
+      "Edge cases and boundary conditions handled",
+      "Error and failure paths are handled, not swallowed",
+      "No dead code, debug logs, or leftover TODOs",
+      "Readable and consistent with the surrounding code",
+      "Tests cover the change and actually run",
+    ],
+    tester: [
+      "Happy path verified end to end",
+      "Edge cases and invalid input covered",
+      "Failure modes and error states exercised",
+      "Regression: existing behaviour still passes",
+      "Checks are reproducible and named in the report",
+    ],
+  };
+
+  checklistTemplates() {
+    return DevTeamStore.CHECKLIST_TEMPLATES;
+  }
+
+  #resolveChecklist(role, provided) {
+    if (Array.isArray(provided)) return provided.map((item) => String(item).trim()).filter(Boolean).slice(0, 40);
+    return DevTeamStore.CHECKLIST_TEMPLATES[String(role || "").toLowerCase()] || null;
+  }
+
+  #storeChecklist(assignmentId, items) {
+    if (!items || !items.length) return;
+    this.db.prepare("INSERT OR REPLACE INTO assignment_checklists (assignment_id, items) VALUES (?, ?)").run(assignmentId, json(items));
+  }
+
+  #checklistFor(assignmentId) {
+    return fromJson(this.db.prepare("SELECT items FROM assignment_checklists WHERE assignment_id = ?").get(assignmentId)?.items, []);
+  }
+
+  // --- Role negotiation: agents (and the human) propose role/handoff/plan changes,
+  // teammates vote, and on agreement the change is adopted and real work is reassigned. ---
+
+  static PROPOSAL_KINDS = ["role", "handoff", "plan", "decision"];
+
+  createProposal({ agentId = null, taskId, kind = "role", summary, details = {} }) {
+    const task = this.getTask(taskId);
+    if (!task) throw new Error("Task not found.");
+    if (["accepted", "blocked", "cancelled"].includes(task.status)) throw new Error(`Task is already ${task.status}.`);
+    if (!DevTeamStore.PROPOSAL_KINDS.includes(kind)) throw new Error(`Unknown proposal kind: ${kind}.`);
+    const proposer = agentId ? this.getAgent(agentId) : null;
+    const proposerName = proposer ? proposer.name : "You";
+    if (kind === "handoff" && !details?.assignmentId) throw new Error("A handoff proposal needs details.assignmentId.");
+    if (kind === "role" && !String(details?.role || "").trim()) throw new Error("A role proposal needs details.role.");
+    const id = randomUUID();
+    const stamp = now();
+    this.#transaction(() => {
+      this.db.prepare(`
+        INSERT INTO proposals (id, task_id, proposer_id, proposer_name, kind, summary, details, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)
+      `).run(id, taskId, agentId, proposerName, kind, summary.trim(), json(details), stamp);
+      // The proposer implicitly agrees to their own proposal.
+      this.db.prepare(`
+        INSERT INTO proposal_votes (proposal_id, voter_id, voter_name, vote, comment, created_at)
+        VALUES (?, ?, ?, 'agree', NULL, ?)
+      `).run(id, agentId || "human", proposerName, stamp);
+      this.#event(taskId, agentId, "proposal.created", summary.trim(), { proposalId: id, kind, details });
+    });
+    this.#changed("proposal.created", taskId);
+    return this.getProposal(id);
+  }
+
+  getProposal(proposalId) {
+    const row = this.db.prepare("SELECT * FROM proposals WHERE id = ?").get(proposalId);
+    if (!row) return null;
+    const votes = this.db.prepare("SELECT voter_id, voter_name, vote, comment, created_at FROM proposal_votes WHERE proposal_id = ? ORDER BY created_at ASC").all(proposalId);
+    return { ...row, details: fromJson(row.details, {}), votes };
+  }
+
+  voteProposal({ agentId = null, proposalId, vote = "agree", comment = null }) {
+    if (!["agree", "object"].includes(vote)) throw new Error("Vote must be 'agree' or 'object'.");
+    const voter = agentId ? this.getAgent(agentId) : null;
+    const voterName = voter ? voter.name : "You";
+    let outcome;
+    this.#transaction(() => {
+      const proposal = this.db.prepare("SELECT * FROM proposals WHERE id = ?").get(proposalId);
+      if (!proposal) throw new Error("Proposal not found.");
+      if (proposal.status !== "open") { outcome = { proposalId, status: proposal.status, alreadyResolved: true }; return; }
+      const stamp = now();
+      this.db.prepare(`
+        INSERT INTO proposal_votes (proposal_id, voter_id, voter_name, vote, comment, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(proposal_id, voter_id) DO UPDATE SET vote = excluded.vote, comment = excluded.comment, created_at = excluded.created_at
+      `).run(proposalId, agentId || "human", voterName, vote, comment?.trim() || null, stamp);
+      this.#event(proposal.task_id, agentId, "proposal.vote", `${voterName} ${vote === "agree" ? "agreed to" : "objected to"}: ${proposal.summary}`, { proposalId, vote, comment: comment?.trim() || null });
+      outcome = this.#evaluateProposal(proposal, stamp);
+    });
+    this.markMessagesSeen(agentId || "");
+    this.#changed(outcome?.status === "adopted" ? "proposal.adopted" : outcome?.status === "declined" ? "proposal.declined" : "proposal.vote", outcome?.taskId);
+    return outcome;
+  }
+
+  // Decide whether an open proposal is now adopted (all required teammates agreed) or
+  // declined (someone objected). Runs inside the caller's transaction.
+  #evaluateProposal(proposal, stamp) {
+    const votes = this.db.prepare("SELECT voter_id, vote FROM proposal_votes WHERE proposal_id = ?").all(proposal.id);
+    const objection = votes.find((v) => v.vote === "object");
+    if (objection) {
+      this.db.prepare("UPDATE proposals SET status = 'declined', resolved_at = ? WHERE id = ?").run(stamp, proposal.id);
+      this.#event(proposal.task_id, null, "proposal.declined", `Proposal declined: ${proposal.summary}`, { proposalId: proposal.id });
+      return { proposalId: proposal.id, taskId: proposal.task_id, status: "declined" };
+    }
+    // Only connected members of *this* task decide it — agents busy in other rooms neither
+    // block nor carry a vote they were never part of.
+    const requiredAgreers = this.#connectedMemberIds(proposal.task_id).filter((id) => id !== proposal.proposer_id);
+    const agreed = new Set(votes.filter((v) => v.vote === "agree").map((v) => v.voter_id));
+    const allTeammatesAgreed = requiredAgreers.length > 0 && requiredAgreers.every((id) => agreed.has(id));
+    const humanDecides = requiredAgreers.length === 0 && agreed.has("human");
+    if (allTeammatesAgreed || humanDecides) {
+      this.#adoptProposal(proposal, stamp);
+      this.db.prepare("UPDATE proposals SET status = 'adopted', resolved_at = ? WHERE id = ?").run(stamp, proposal.id);
+      return { proposalId: proposal.id, taskId: proposal.task_id, status: "adopted" };
+    }
+    return { proposalId: proposal.id, taskId: proposal.task_id, status: "open", agreements: agreed.size, needed: requiredAgreers.length };
+  }
+
+  // Apply an adopted proposal's real effect. Runs inside the caller's transaction.
+  #adoptProposal(proposal, stamp) {
+    const details = fromJson(proposal.details, {});
+    if (proposal.kind === "role") {
+      const assignmentId = randomUUID();
+      const title = (details.title || `${details.role} work`).toString().trim();
+      const description = (details.description || proposal.summary).toString().trim();
+      this.db.prepare(`
+        INSERT INTO assignments (id, task_id, title, description, role, requires_write, target_agent_name, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)
+      `).run(assignmentId, proposal.task_id, title, description, String(details.role).trim(), details.requiresWrite ? 1 : 0, details.targetAgentName?.trim() || null, stamp);
+      const adoptedChecklist = this.#resolveChecklist(details.role, details.checklist);
+      this.#storeChecklist(assignmentId, adoptedChecklist);
+      if (details.requiresWrite && Array.isArray(details.paths) && details.paths.length) {
+        const writePaths = [...new Set(details.paths.map((p) => String(p).trim()).filter(Boolean))].slice(0, 50);
+        if (writePaths.length) this.db.prepare("INSERT OR REPLACE INTO assignment_write_scopes (assignment_id, paths) VALUES (?, ?)").run(assignmentId, json(writePaths));
+      }
+      this.#event(proposal.task_id, proposal.proposer_id, "assignment.created", title, { assignmentId, role: details.role, requiresWrite: Boolean(details.requiresWrite), targetAgentName: details.targetAgentName?.trim() || null, viaProposal: proposal.id, checklist: adoptedChecklist || [] });
+      this.#syncTaskStatus(proposal.task_id, stamp);
+    } else if (proposal.kind === "handoff") {
+      const assignment = this.db.prepare("SELECT * FROM assignments WHERE id = ?").get(details.assignmentId);
+      if (assignment) {
+        const target = details.targetAgentName?.trim() || null;
+        if (assignment.status === "claimed") {
+          this.db.prepare("UPDATE assignments SET target_agent_name = ?, status = 'queued', agent_id = NULL, claimed_at = NULL WHERE id = ?").run(target, assignment.id);
+        } else {
+          this.db.prepare("UPDATE assignments SET target_agent_name = ? WHERE id = ?").run(target, assignment.id);
+        }
+        this.#event(proposal.task_id, proposal.proposer_id, "assignment.reassigned", `Reassigned "${assignment.title}"${target ? ` to ${target}` : ""}.`, { assignmentId: assignment.id, targetAgentName: target, viaProposal: proposal.id });
+        this.#syncTaskStatus(proposal.task_id, stamp);
+      }
+    }
+    this.#event(proposal.task_id, null, "proposal.adopted", `Team adopted: ${proposal.summary}`, { proposalId: proposal.id, kind: proposal.kind });
+  }
+
+  // Open proposals a waiting agent should weigh in on (in its rooms, not its own, not yet voted).
+  openProposalsForAgent(agent) {
+    const rooms = this.#memberTaskIds(agent.id);
+    if (!rooms.length) return [];
+    const roomPlaceholders = rooms.map(() => "?").join(", ");
+    const rows = this.db.prepare(`
+      SELECT p.* FROM proposals p
+      JOIN tasks t ON t.id = p.task_id
+      WHERE p.status = 'open'
+        AND p.task_id IN (${roomPlaceholders})
+        AND t.status NOT IN ('accepted', 'blocked', 'cancelled')
+        AND (p.proposer_id IS NULL OR p.proposer_id != ?)
+        AND NOT EXISTS (SELECT 1 FROM proposal_votes v WHERE v.proposal_id = p.id AND v.voter_id = ?)
+      ORDER BY p.created_at ASC
+      LIMIT 20
+    `).all(...rooms, agent.id, agent.id);
+    return rows.map((row) => ({ id: row.id, taskId: row.task_id, kind: row.kind, summary: row.summary, proposer: row.proposer_name, details: fromJson(row.details, {}) }));
+  }
+
+  proposalsForTask(taskId) {
+    const rows = this.db.prepare("SELECT * FROM proposals WHERE task_id = ? ORDER BY created_at ASC").all(taskId);
+    return rows.map((row) => ({
+      ...row,
+      details: fromJson(row.details, {}),
+      votes: this.db.prepare("SELECT voter_id, voter_name, vote, comment, created_at FROM proposal_votes WHERE proposal_id = ? ORDER BY created_at ASC").all(row.id),
+    }));
+  }
+
+  close() {
+    this.db.close();
+  }
+
+  ensureProject(name, root) {
+    const normalizedRoot = path.resolve(root);
+    const existing = this.db.prepare("SELECT * FROM projects WHERE root = ?").get(normalizedRoot);
+    if (existing) return existing;
+    const project = { id: randomUUID(), name: name.trim(), root: normalizedRoot, created_at: now() };
+    this.db.prepare("INSERT INTO projects (id, name, root, created_at) VALUES (?, ?, ?, ?)")
+      .run(project.id, project.name, project.root, project.created_at);
+    this.#changed("project.created");
+    return project;
+  }
+
+  listProjects() {
+    return this.db.prepare(`
+      SELECT p.*,
+        COUNT(DISTINCT t.id) AS task_count,
+        SUM(CASE WHEN t.status NOT IN ('accepted', 'blocked', 'cancelled') THEN 1 ELSE 0 END) AS active_task_count
+      FROM projects p
+      LEFT JOIN tasks t ON t.project_id = p.id
+      GROUP BY p.id
+      ORDER BY p.created_at ASC
+    `).all();
+  }
+
+  createTask({ projectId, title, description, requiredApprovals = 2 }) {
+    const project = this.db.prepare("SELECT * FROM projects WHERE id = ?").get(projectId);
+    if (!project) throw new Error("Project not found.");
+    const taskId = randomUUID();
+    const stamp = now();
+    const approvals = Math.max(1, Math.min(8, Number(requiredApprovals) || 2));
+    this.#transaction(() => {
+      this.db.prepare(`
+        INSERT INTO tasks (id, project_id, title, description, status, version, required_approvals, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 'planning', 1, ?, ?, ?)
+      `).run(taskId, projectId, title.trim(), description.trim(), approvals, stamp, stamp);
+      this.db.prepare(`
+        INSERT INTO assignments (id, task_id, title, description, role, requires_write, status, created_at)
+        VALUES (?, ?, ?, ?, 'planner', 0, 'queued', ?)
+      `).run(randomUUID(), taskId, "Create the implementation plan", "Inspect the project, propose a concrete plan, then assign implementation and review work to the team.", stamp);
+      this.#event(taskId, null, "task.created", `Task created: ${title.trim()}`, { projectId, requiredApprovals: approvals });
+    });
+    this.#changed("task.created", taskId);
+    return this.getTask(taskId);
+  }
+
+  getTask(taskId) {
+    return this.db.prepare(`
+      SELECT t.*, p.name AS project_name, p.root AS project_root
+      FROM tasks t JOIN projects p ON p.id = t.project_id
+      WHERE t.id = ?
+    `).get(taskId);
+  }
+
+  listTasks(projectId = null) {
+    const rows = projectId
+      ? this.db.prepare(`
+          SELECT t.*, p.name AS project_name,
+            (SELECT COUNT(*) FROM assignments a WHERE a.task_id = t.id AND a.status IN ('queued', 'claimed')) AS open_assignments,
+            (SELECT COUNT(*) FROM approvals ap WHERE ap.task_id = t.id AND ap.version = t.version) AS approval_count
+          FROM tasks t JOIN projects p ON p.id = t.project_id
+          WHERE t.project_id = ? ORDER BY t.updated_at DESC
+        `).all(projectId)
+      : this.db.prepare(`
+          SELECT t.*, p.name AS project_name,
+            (SELECT COUNT(*) FROM assignments a WHERE a.task_id = t.id AND a.status IN ('queued', 'claimed')) AS open_assignments,
+            (SELECT COUNT(*) FROM approvals ap WHERE ap.task_id = t.id AND ap.version = t.version) AS approval_count
+          FROM tasks t JOIN projects p ON p.id = t.project_id
+          ORDER BY t.updated_at DESC
+        `).all();
+    return rows;
+  }
+
+  deleteProject(projectId, confirmName) {
+    this.#reapStaleAgents();
+    this.#recoverOrphanedClaims();
+    const project = this.db.prepare("SELECT * FROM projects WHERE id = ?").get(projectId);
+    if (!project) throw new Error("Project not found.");
+    if (confirmName !== project.name) throw new Error("Project name confirmation does not match.");
+    const connectedAgents = Number(this.db.prepare(`
+      SELECT COUNT(*) AS count FROM agents
+      WHERE status != 'disconnected' AND current_task_id IN (SELECT id FROM tasks WHERE project_id = ?)
+    `).get(projectId).count);
+    if (connectedAgents) throw new Error("Disconnect agents working on this project before deleting it.");
+    const taskCount = Number(this.db.prepare("SELECT COUNT(*) AS count FROM tasks WHERE project_id = ?").get(projectId).count);
+    this.#transaction(() => {
+      this.db.prepare(`
+        UPDATE agents SET current_task_id = NULL
+        WHERE current_task_id IN (SELECT id FROM tasks WHERE project_id = ?)
+      `).run(projectId);
+      this.db.prepare("DELETE FROM projects WHERE id = ?").run(projectId);
+    });
+    this.#changed("project.deleted");
+    return { deleted: true, projectId, projectName: project.name, taskCount, filesDeleted: false };
+  }
+
+  deleteTask(taskId, confirmTaskId) {
+    this.#reapStaleAgents();
+    this.#recoverOrphanedClaims();
+    const task = this.getTask(taskId);
+    if (!task) throw new Error("Task not found.");
+    if (confirmTaskId !== taskId) throw new Error("Task confirmation does not match.");
+    const connectedAgents = Number(this.db.prepare(`
+      SELECT COUNT(*) AS count FROM agents WHERE status != 'disconnected' AND current_task_id = ?
+    `).get(taskId).count);
+    if (connectedAgents) throw new Error("Disconnect agents working on this task before deleting its history.");
+    this.#transaction(() => {
+      this.db.prepare("UPDATE agents SET current_task_id = NULL WHERE current_task_id = ?").run(taskId);
+      this.db.prepare("DELETE FROM tasks WHERE id = ?").run(taskId);
+    });
+    this.#changed("task.deleted", taskId);
+    return { deleted: true, taskId, title: task.title, filesDeleted: false };
+  }
+
+  connectAgent({ name, provider, capabilities = [] }) {
+    const cleanName = name.trim();
+    const cleanProvider = provider.trim();
+    if (!cleanName || !cleanProvider) throw new Error("Agent name and provider are required.");
+    const id = randomUUID();
+    const stamp = now();
+    this.#transaction(() => {
+      const previousSessions = this.db.prepare(`
+        SELECT * FROM agents
+        WHERE lower(name) = lower(?) AND lower(provider) = lower(?) AND status != 'disconnected'
+      `).all(cleanName, cleanProvider);
+      for (const session of previousSessions) {
+        this.#releaseAgentClaims(session, stamp, "Replaced by a new session for the same agent and provider.");
+      }
+      this.db.prepare(`
+        INSERT INTO agents (id, name, provider, capabilities, status, connected_at, last_seen)
+        VALUES (?, ?, ?, ?, 'waiting', ?, ?)
+      `).run(id, cleanName, cleanProvider, json(capabilities), stamp, stamp);
+    });
+    this.#changed("agent.connected");
+    return this.getAgent(id);
+  }
+
+  getAgent(agentId) {
+    const row = this.db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId);
+    if (!row) throw new Error("Agent session not found. Connect to DevTeam again.");
+    return { ...row, capabilities: fromJson(row.capabilities, []) };
+  }
+
+  // --- Task rooms: work, messages, and governance are scoped to the tasks an agent belongs
+  // to, so an agent invoked for one task/project can't claim another's work or see its chatter. ---
+
+  // The tasks an agent is a member of. Explicit joins win; if the agent has joined nothing and
+  // there is exactly one active task in the whole store, it is implicitly in that sole room
+  // (keeps the common single-task workflow zero-config while isolating multi-task servers).
+  #memberTaskIds(agentId) {
+    const explicit = this.db.prepare("SELECT task_id FROM task_members WHERE agent_id = ?").all(agentId).map((row) => row.task_id);
+    if (explicit.length) return explicit;
+    const active = this.db.prepare(`
+      SELECT id FROM tasks WHERE status NOT IN ('accepted', 'blocked', 'cancelled')
+    `).all().map((row) => row.id);
+    return active.length === 1 ? active : [];
+  }
+
+  // Connected agents that belong to a given task (used to scope proposal consensus).
+  #connectedMemberIds(taskId) {
+    const connected = this.db.prepare("SELECT id FROM agents WHERE status != 'disconnected'").all().map((row) => row.id);
+    return connected.filter((id) => this.#memberTaskIds(id).includes(taskId));
+  }
+
+  joinTask(agentId, taskId, role = "contributor") {
+    const agent = this.getAgent(agentId);
+    if (agent.status === "disconnected") throw new Error("Agent is disconnected. Connect again.");
+    const task = this.getTask(taskId);
+    if (!task) throw new Error("Task not found.");
+    const cleanRole = ["contributor", "observer"].includes(role) ? role : "contributor";
+    const stamp = now();
+    const isNew = !this.db.prepare("SELECT 1 FROM task_members WHERE task_id = ? AND agent_id = ?").get(taskId, agentId);
+    this.#transaction(() => {
+      this.db.prepare(`
+        INSERT INTO task_members (task_id, agent_id, role, joined_at) VALUES (?, ?, ?, ?)
+        ON CONFLICT(task_id, agent_id) DO UPDATE SET role = excluded.role
+      `).run(taskId, agentId, cleanRole, stamp);
+      this.db.prepare("UPDATE agents SET last_seen = ? WHERE id = ?").run(stamp, agentId);
+      if (isNew) {
+        this.#event(taskId, agentId, "agent.joined", `${agent.name} joined the task room${cleanRole === "observer" ? " as observer" : ""}.`, { role: cleanRole });
+      }
+    });
+    if (isNew) this.#changed("agent.joined", taskId);
+    return { joined: true, taskId, agentId, role: cleanRole };
+  }
+
+  listAgents() {
+    this.#reapStaleAgents();
+    this.#recoverOrphanedClaims();
+    return this.db.prepare(`
+      SELECT a.*, t.title AS current_task_title, t.version AS current_task_version,
+        ca.title AS current_assignment_title, ca.role AS current_assignment_role
+      FROM agents a
+      LEFT JOIN tasks t ON t.id = a.current_task_id
+      LEFT JOIN assignments ca ON ca.agent_id = a.id AND ca.status = 'claimed'
+      ORDER BY CASE a.status WHEN 'busy' THEN 0 WHEN 'waiting' THEN 1 ELSE 2 END, a.last_seen DESC
+      LIMIT 50
+    `).all().map((row) => ({
+      ...row,
+      capabilities: fromJson(row.capabilities, []),
+      pending_messages: row.status === "disconnected" ? 0 : this.#pendingMessageCount(row),
+    }));
+  }
+
+  // How many directed/broadcast messages (from the human or a teammate) this agent has not yet
+  // received. Powers the per-agent unread badge in the dashboard.
+  #pendingMessageCount(agent) {
+    const rooms = this.#memberTaskIds(agent.id);
+    if (!rooms.length) return 0;
+    const roomPlaceholders = rooms.map(() => "?").join(", ");
+    const candidates = this.db.prepare(`
+      SELECT e.agent_id, e.type, e.metadata FROM events e
+      WHERE (e.type = 'human.message' OR e.type LIKE 'agent.%')
+        AND e.task_id IN (${roomPlaceholders})
+        AND e.created_at >= ?
+        AND NOT EXISTS (
+          SELECT 1 FROM message_receipts r
+          WHERE r.event_id = e.id AND r.agent_id = ? AND r.delivered_at IS NOT NULL
+        )
+    `).all(...rooms, agent.connected_at, agent.id);
+    return candidates.filter((row) => this.#messageIsForAgent({ ...row, metadata: fromJson(row.metadata, {}) }, agent)).length;
+  }
+
+  heartbeat(agentId, status = null) {
+    const agent = this.getAgent(agentId);
+    if (agent.status === "disconnected") throw new Error("Agent is disconnected. Connect again to receive work.");
+    const nextStatus = status || agent.status;
+    this.db.prepare("UPDATE agents SET last_seen = ?, status = ? WHERE id = ?").run(now(), nextStatus, agentId);
+    return this.getAgent(agentId);
+  }
+
+  disconnectAgent(agentId, summary = "") {
+    const agent = this.getAgent(agentId);
+    const stamp = now();
+    const affectedTaskIds = this.#transaction(() => this.#releaseAgentClaims(agent, stamp, summary || "Agent disconnected normally."));
+    this.#changed("agent.disconnected", agent.current_task_id);
+    for (const taskId of affectedTaskIds) this.#changed("assignment.released", taskId);
+    return { disconnected: true, agentId, summary };
+  }
+
+  // A confirmed MCP transport close is strong evidence the client is truly gone (unlike mere
+  // silence), so it is safe to release the agent's claims right away instead of waiting for a
+  // timeout. Best-effort: ignore an agent that is unknown or already disconnected.
+  handleTransportClose(agentId) {
+    let agent;
+    try { agent = this.getAgent(agentId); } catch { return { disconnected: false }; }
+    if (agent.status === "disconnected") return { disconnected: false };
+    return this.disconnectAgent(agentId, "MCP transport closed.");
+  }
+
+  // Human-driven recovery for a stuck claim — e.g. a crashed writer whose write lease will
+  // never be released by silence alone. Requires the exact assignment title as confirmation so
+  // a write lease is never handed off by accident while the original agent might still be running.
+  forceReleaseAssignment({ assignmentId, confirmTitle = null, reason = "Human force-released the assignment." }) {
+    const assignment = this.db.prepare("SELECT * FROM assignments WHERE id = ?").get(assignmentId);
+    if (!assignment) throw new Error("Assignment not found.");
+    if (assignment.status !== "claimed") throw new Error("Only a claimed assignment can be force-released.");
+    if (confirmTitle !== null && confirmTitle.trim().toLowerCase() !== assignment.title.trim().toLowerCase()) {
+      throw new Error("Force release requires the exact assignment title as confirmation.");
+    }
+    const stamp = now();
+    this.#transaction(() => {
+      this.db.prepare("UPDATE assignments SET status = 'queued', agent_id = NULL, claimed_at = NULL WHERE id = ?").run(assignmentId);
+      this.#event(assignment.task_id, assignment.agent_id, "assignment.released", reason, { assignmentId, reason: "force-release", requiresWrite: Boolean(assignment.requires_write) });
+      this.#syncTaskStatus(assignment.task_id, stamp);
+    });
+    this.#changed("assignment.released", assignment.task_id);
+    return { released: true, assignmentId, taskId: assignment.task_id, requiresWrite: Boolean(assignment.requires_write) };
+  }
+
+  createAssignment({ agentId = null, taskId, title, description, role = "implementer", requiresWrite = false, targetAgentName = null, checklist = undefined, paths = undefined }) {
+    const task = this.getTask(taskId);
+    if (!task) throw new Error("Task not found.");
+    if (["accepted", "blocked", "cancelled"].includes(task.status)) throw new Error(`Task is already ${task.status}.`);
+    if (agentId) this.getAgent(agentId);
+    const assignment = {
+      id: randomUUID(), taskId, title: title.trim(), description: description.trim(), role: role.trim(),
+      requiresWrite: requiresWrite ? 1 : 0, targetAgentName: targetAgentName?.trim() || null, createdAt: now(),
+    };
+    const resolvedChecklist = this.#resolveChecklist(assignment.role, checklist);
+    // A write assignment may declare the paths it will touch, enabling non-overlapping writers
+    // to run in parallel; omitting them keeps the conservative whole-project lease.
+    const writePaths = assignment.requiresWrite && Array.isArray(paths)
+      ? [...new Set(paths.map((p) => String(p).trim()).filter(Boolean))].slice(0, 50)
+      : [];
+    this.#transaction(() => {
+      this.db.prepare(`
+        INSERT INTO assignments (id, task_id, title, description, role, requires_write, target_agent_name, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)
+      `).run(assignment.id, taskId, assignment.title, assignment.description, assignment.role, assignment.requiresWrite, assignment.targetAgentName, assignment.createdAt);
+      this.#storeChecklist(assignment.id, resolvedChecklist);
+      if (writePaths.length) this.db.prepare("INSERT OR REPLACE INTO assignment_write_scopes (assignment_id, paths) VALUES (?, ?)").run(assignment.id, json(writePaths));
+      this.#syncTaskStatus(taskId);
+      this.#event(taskId, agentId, "assignment.created", assignment.title, {
+        assignmentId: assignment.id,
+        role: assignment.role,
+        requiresWrite: Boolean(assignment.requiresWrite),
+        targetAgentName: assignment.targetAgentName,
+        checklist: resolvedChecklist || [],
+        writePaths,
+      });
+    });
+    this.#changed("assignment.created", taskId);
+    return { ...this.db.prepare("SELECT * FROM assignments WHERE id = ?").get(assignment.id), checklist: resolvedChecklist || [], writePaths };
+  }
+
+  claimNextAssignment(agentId) {
+    this.#reapStaleAgents();
+    this.#recoverOrphanedClaims();
+    const agent = this.getAgent(agentId);
+    if (agent.status === "disconnected") throw new Error("Agent is disconnected. Connect again.");
+    // An agent only claims work inside task rooms it belongs to. This prevents an agent
+    // invoked for one project/task from silently claiming another's work.
+    const rooms = this.#memberTaskIds(agentId);
+    if (!rooms.length) {
+      this.db.prepare("UPDATE agents SET status = CASE WHEN status = 'busy' THEN status ELSE 'waiting' END, last_seen = ? WHERE id = ?").run(now(), agentId);
+      return null;
+    }
+    const roomPlaceholders = rooms.map(() => "?").join(", ");
+    const assignment = this.#transaction(() => {
+      // Fetch the eligible queue (membership + targeting + review gating). The write lease is
+      // no longer project-wide: we resolve it per path below so non-overlapping writers run
+      // in parallel.
+      const candidates = this.db.prepare(`
+        SELECT a.*, t.project_id, t.title AS task_title, t.description AS task_description,
+          t.version AS task_version, t.required_approvals, p.root AS project_root, p.name AS project_name
+        FROM assignments a
+        JOIN tasks t ON t.id = a.task_id
+        JOIN projects p ON p.id = t.project_id
+        WHERE a.status = 'queued'
+          AND a.task_id IN (${roomPlaceholders})
+          AND t.status NOT IN ('accepted', 'blocked', 'cancelled')
+          AND (a.target_agent_name IS NULL OR lower(a.target_agent_name) = lower(?))
+          AND (
+            lower(a.role) NOT IN ('reviewer', 'security-reviewer', 'tester') OR NOT EXISTS (
+              SELECT 1 FROM assignments pending_write
+              WHERE pending_write.task_id = a.task_id
+                AND pending_write.requires_write = 1
+                AND pending_write.status IN ('queued', 'claimed')
+            )
+          )
+        ORDER BY CASE WHEN a.target_agent_name IS NOT NULL THEN 0 ELSE 1 END, a.created_at ASC
+        LIMIT 20
+      `).all(...rooms, agent.name);
+      if (!candidates.length) {
+        this.db.prepare("UPDATE agents SET status = 'waiting', last_seen = ? WHERE id = ?").run(now(), agentId);
+        return null;
+      }
+      const heldLeases = this.#heldWriteLeases();
+      const stamp = now();
+      for (const candidate of candidates) {
+        // A write assignment is claimable only if its declared paths don't overlap a write
+        // lease already held by another agent in the same project. Undeclared paths mean the
+        // whole project, which conflicts with everything (backward-compatible single lease).
+        if (candidate.requires_write) {
+          const scopes = this.#writeScopeFor(candidate.id);
+          const conflict = heldLeases.some((lease) => lease.projectId === candidate.project_id
+            && lease.scopes.some((held) => scopes.some((want) => this.#scopesOverlap(held, want))));
+          if (conflict) continue;
+        }
+        const result = this.db.prepare(`
+          UPDATE assignments SET status = 'claimed', agent_id = ?, claimed_at = ? WHERE id = ? AND status = 'queued'
+        `).run(agentId, stamp, candidate.id);
+        if (!result.changes) continue;
+        this.db.prepare("UPDATE agents SET status = 'busy', current_task_id = ?, last_seen = ? WHERE id = ?")
+          .run(candidate.task_id, stamp, agentId);
+        this.#syncTaskStatus(candidate.task_id, stamp);
+        const writeScope = candidate.requires_write ? this.#writeScopeFor(candidate.id) : [];
+        this.#event(candidate.task_id, agentId, "assignment.claimed", `${agent.name} claimed: ${candidate.title}`, {
+          assignmentId: candidate.id,
+          role: candidate.role,
+          requiresWrite: Boolean(candidate.requires_write),
+          writeScope,
+        });
+        return { ...candidate, agent_id: agentId, status: "claimed", claimed_at: stamp, checklist: this.#checklistFor(candidate.id), writeScope };
+      }
+      this.db.prepare("UPDATE agents SET status = 'waiting', last_seen = ? WHERE id = ?").run(now(), agentId);
+      return null;
+    });
+    if (assignment) this.#changed("assignment.claimed", assignment.task_id);
+    return assignment;
+  }
+
+  // Currently-held write leases (claimed write assignments owned by a live agent on a live task),
+  // with their normalized path scopes, for per-path conflict resolution.
+  #heldWriteLeases() {
+    return this.db.prepare(`
+      SELECT a.id, t.project_id AS projectId
+      FROM assignments a
+      JOIN tasks t ON t.id = a.task_id
+      JOIN agents ag ON ag.id = a.agent_id
+      WHERE a.status = 'claimed' AND a.requires_write = 1
+        AND ag.status != 'disconnected'
+        AND t.status NOT IN ('accepted', 'blocked', 'cancelled')
+    `).all().map((row) => ({ projectId: row.projectId, scopes: this.#writeScopeFor(row.id) }));
+  }
+
+  // Normalize a declared write path to a comparable prefix. Trailing globs/slashes are stripped;
+  // "" means "the whole project".
+  #normalizeScope(value) {
+    let scope = String(value ?? "").trim().replace(/\\/g, "/");
+    scope = scope.replace(/^\.\//, "").replace(/^\/+/, "");
+    scope = scope.replace(/\/?\*+$/, "").replace(/\/+$/, "");
+    return scope;
+  }
+
+  // Two path scopes overlap if they are equal or one contains the other (segment-aware).
+  #scopesOverlap(a, b) {
+    if (a === "" || b === "") return true;
+    if (a === b) return true;
+    return a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+  }
+
+  // The normalized write scope for an assignment. No declared paths => whole-project lease.
+  #writeScopeFor(assignmentId) {
+    const row = this.db.prepare("SELECT paths FROM assignment_write_scopes WHERE assignment_id = ?").get(assignmentId);
+    const declared = fromJson(row?.paths, []);
+    const normalized = Array.isArray(declared) ? [...new Set(declared.map((p) => this.#normalizeScope(p)))] : [];
+    return normalized.length ? normalized : [""];
+  }
+
+  postMessage({ agentId, taskId, message, type = "agent.message", metadata = {} }) {
+    const agent = this.getAgent(agentId);
+    const task = this.getTask(taskId);
+    if (!task) throw new Error("Task not found.");
+    // A message can be aimed at a specific teammate. A directed agent message is pushed to that
+    // teammate (returned by their next devteam_wait / tool call); an undirected one is a
+    // timeline note anyone can read via devteam_state.
+    const enriched = { ...metadata };
+    let directedTo = null;
+    if (metadata.target && String(metadata.target).trim()) {
+      enriched.targetLabel = metadata.targetLabel || String(metadata.target).trim();
+      enriched.target = String(metadata.target).trim().toLowerCase();
+      enriched.senderName = agent.name;
+      directedTo = enriched.targetLabel;
+    }
+    this.#transaction(() => {
+      this.#event(taskId, agentId, type, message.trim(), enriched);
+      this.db.prepare("UPDATE agents SET last_seen = ? WHERE id = ?").run(now(), agentId);
+      this.db.prepare("UPDATE tasks SET updated_at = ? WHERE id = ?").run(now(), taskId);
+    });
+    this.markMessagesSeen(agentId);
+    this.#changed(type, taskId);
+    return { posted: true, agent: agent.name, taskId, directedTo };
+  }
+
+  completeAssignment({ agentId, assignmentId, message, status = "done", changedFiles = [], checks = [], nextStatus = "waiting" }) {
+    const agent = this.getAgent(agentId);
+    const assignment = this.db.prepare("SELECT * FROM assignments WHERE id = ?").get(assignmentId);
+    if (!assignment) throw new Error("Assignment not found.");
+    if (assignment.agent_id !== agentId || assignment.status !== "claimed") throw new Error("This assignment is not currently claimed by this agent.");
+    const cleanChanged = [...new Set(changedFiles.map((item) => String(item).trim()).filter(Boolean))].slice(0, 200);
+    const cleanChecks = checks.map((item) => String(item).trim()).filter(Boolean).slice(0, 100);
+    this.markMessagesSeen(agentId);
+    let version;
+    this.#transaction(() => {
+      const stamp = now();
+      this.db.prepare("UPDATE assignments SET status = ?, completed_at = ? WHERE id = ?")
+        .run(status === "blocked" ? "blocked" : "done", stamp, assignmentId);
+      if (cleanChanged.length) {
+        this.db.prepare("UPDATE tasks SET version = version + 1, updated_at = ? WHERE id = ?").run(stamp, assignment.task_id);
+        this.db.prepare("DELETE FROM approvals WHERE task_id = ?").run(assignment.task_id);
+      } else {
+        this.db.prepare("UPDATE tasks SET updated_at = ? WHERE id = ?").run(stamp, assignment.task_id);
+      }
+      version = this.db.prepare("SELECT version FROM tasks WHERE id = ?").get(assignment.task_id).version;
+      this.#event(assignment.task_id, agentId, status === "blocked" ? "assignment.blocked" : "assignment.completed", message.trim(), {
+        assignmentId,
+        role: assignment.role,
+        changedFiles: cleanChanged,
+        checks: cleanChecks,
+        version,
+      });
+      if (status === "blocked") {
+        this.db.prepare("UPDATE tasks SET status = 'blocked', updated_at = ? WHERE id = ?").run(stamp, assignment.task_id);
+        this.db.prepare(`
+          UPDATE assignments SET status = 'blocked', completed_at = COALESCE(completed_at, ?)
+          WHERE task_id = ? AND status IN ('queued', 'claimed')
+        `).run(stamp, assignment.task_id);
+        this.db.prepare(`
+          UPDATE agents SET status = 'disconnected', current_task_id = NULL, disconnected_at = ?, last_seen = ?
+          WHERE current_task_id = ?
+        `).run(stamp, stamp, assignment.task_id);
+      } else {
+        const disconnect = nextStatus === "disconnected";
+        this.db.prepare("UPDATE agents SET status = ?, current_task_id = NULL, last_seen = ?, disconnected_at = ? WHERE id = ?")
+          .run(disconnect ? "disconnected" : "waiting", stamp, disconnect ? stamp : null, agentId);
+        this.#syncTaskStatus(assignment.task_id, stamp);
+      }
+    });
+    this.#changed(status === "blocked" ? "task.blocked" : "assignment.completed", assignment.task_id);
+    return { completed: true, taskId: assignment.task_id, assignmentId, status, version, changedFiles: cleanChanged, checks: cleanChecks, agent: agent.name };
+  }
+
+  // No dead-ends: a task can never require more independent approvals than the number
+  // of distinct agents that actually took part (completed work or approved). A solo run
+  // can finish; a two-agent run still needs two independent reviews.
+  #effectiveRequiredApprovals(taskId, configured) {
+    const participants = Number(this.db.prepare(`
+      SELECT COUNT(*) AS count FROM (
+        SELECT agent_id FROM approvals WHERE task_id = ? AND agent_id IS NOT NULL
+        UNION
+        SELECT agent_id FROM events WHERE task_id = ? AND type = 'assignment.completed' AND agent_id IS NOT NULL
+      )
+    `).get(taskId, taskId).count);
+    return Math.max(1, Math.min(configured, participants || 1));
+  }
+
+  approveTask({ agentId, taskId, summary }) {
+    const agent = this.getAgent(agentId);
+    const task = this.getTask(taskId);
+    if (!task) throw new Error("Task not found.");
+    if (["blocked", "cancelled"].includes(task.status)) throw new Error(`Cannot approve a ${task.status} task.`);
+    if (task.status === "accepted") {
+      return { accepted: true, approvalCount: task.required_approvals, requiredApprovals: task.required_approvals, openAssignments: 0, version: task.version };
+    }
+    const reviewEvidence = this.db.prepare(`
+      SELECT metadata FROM events
+      WHERE task_id = ? AND agent_id = ? AND type = 'assignment.completed'
+      ORDER BY id DESC
+    `).all(taskId, agentId).some((event) => {
+      const metadata = fromJson(event.metadata, {});
+      return metadata.version === task.version
+        && ["reviewer", "tester", "security-reviewer"].includes(String(metadata.role || "").toLowerCase())
+        && (!Array.isArray(metadata.changedFiles) || metadata.changedFiles.length === 0);
+    });
+    if (!reviewEvidence) throw new Error("Approval requires a completed, read-only reviewer or tester assignment on the current task version.");
+    let outcome;
+    this.#transaction(() => {
+      const stamp = now();
+      this.db.prepare(`
+        INSERT INTO approvals (task_id, agent_id, version, summary, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(task_id, agent_id, version) DO UPDATE SET summary = excluded.summary, created_at = excluded.created_at
+      `).run(taskId, agentId, task.version, summary.trim(), stamp);
+      this.#event(taskId, agentId, "task.approved", `${agent.name} approved version ${task.version}.`, { summary: summary.trim(), version: task.version });
+      const approvalCount = Number(this.db.prepare("SELECT COUNT(*) AS count FROM approvals WHERE task_id = ? AND version = ?").get(taskId, task.version).count);
+      const openAssignments = Number(this.db.prepare("SELECT COUNT(*) AS count FROM assignments WHERE task_id = ? AND status IN ('queued', 'claimed')").get(taskId).count);
+      const effectiveRequired = this.#effectiveRequiredApprovals(taskId, task.required_approvals);
+      const accepted = approvalCount >= effectiveRequired && openAssignments === 0;
+      if (accepted) {
+        this.db.prepare("UPDATE tasks SET status = 'accepted', updated_at = ? WHERE id = ?").run(stamp, taskId);
+        this.#event(taskId, null, "task.accepted", `Consensus reached for version ${task.version}.`, { approvalCount, requiredApprovals: effectiveRequired });
+        this.db.prepare(`
+          UPDATE agents SET status = 'disconnected', current_task_id = NULL, disconnected_at = ?, last_seen = ?
+          WHERE current_task_id = ? OR id IN (SELECT agent_id FROM approvals WHERE task_id = ?)
+        `).run(stamp, stamp, taskId, taskId);
+      } else {
+        this.db.prepare("UPDATE tasks SET status = 'review', updated_at = ? WHERE id = ?").run(stamp, taskId);
+      }
+      outcome = { accepted, approvalCount, requiredApprovals: effectiveRequired, configuredApprovals: task.required_approvals, openAssignments, version: task.version };
+    });
+    this.#changed(outcome.accepted ? "task.accepted" : "task.approved", taskId);
+    return outcome;
+  }
+
+  blockTask({ agentId = null, taskId, reason }) {
+    if (agentId) this.getAgent(agentId);
+    const task = this.getTask(taskId);
+    if (!task) throw new Error("Task not found.");
+    const stamp = now();
+    this.#transaction(() => {
+      this.db.prepare("UPDATE tasks SET status = 'blocked', updated_at = ? WHERE id = ?").run(stamp, taskId);
+      this.db.prepare(`
+        UPDATE assignments SET status = 'blocked', completed_at = COALESCE(completed_at, ?)
+        WHERE task_id = ? AND status IN ('queued', 'claimed')
+      `).run(stamp, taskId);
+      this.#event(taskId, agentId, "task.blocked", reason.trim(), {});
+      this.db.prepare(`
+        UPDATE agents SET status = 'disconnected', current_task_id = NULL, disconnected_at = ?, last_seen = ?
+        WHERE current_task_id = ?
+      `).run(stamp, stamp, taskId);
+    });
+    this.#changed("task.blocked", taskId);
+    return { blocked: true, taskId, reason: reason.trim() };
+  }
+
+  humanMessage(taskId, message, target = "all", replyTo = null) {
+    const task = this.getTask(taskId);
+    if (!task) throw new Error("Task not found.");
+    const normalized = String(target || "all").trim() || "all";
+    const targetKey = normalized.toLowerCase();
+    let eventId;
+    this.#transaction(() => {
+      eventId = this.#event(taskId, null, "human.message", message.trim(), {
+        target: targetKey,
+        targetLabel: targetKey === "all" ? "all agents" : normalized,
+        ...(replyTo ? { replyTo: Number(replyTo) } : {}),
+      });
+      this.db.prepare("UPDATE tasks SET updated_at = ? WHERE id = ?").run(now(), taskId);
+    });
+    this.#changed("human.message", taskId);
+    return { posted: true, eventId, target: targetKey };
+  }
+
+  taskDetail(taskId) {
+    const task = this.getTask(taskId);
+    if (!task) return null;
+    const assignments = this.db.prepare(`
+      SELECT a.*, ag.name AS agent_name, ag.provider AS agent_provider
+      FROM assignments a LEFT JOIN agents ag ON ag.id = a.agent_id
+      WHERE a.task_id = ? ORDER BY a.created_at ASC
+    `).all(taskId).map((assignment) => ({ ...assignment, checklist: this.#checklistFor(assignment.id) }));
+    const approvals = this.db.prepare(`
+      SELECT ap.*, ag.name AS agent_name, ag.provider AS agent_provider
+      FROM approvals ap JOIN agents ag ON ag.id = ap.agent_id
+      WHERE ap.task_id = ? AND ap.version = ? ORDER BY ap.created_at ASC
+    `).all(taskId, task.version);
+    const events = this.db.prepare(`
+      SELECT recent.*, ag.name AS agent_name, ag.provider AS agent_provider
+      FROM (
+        SELECT * FROM events WHERE task_id = ? ORDER BY id DESC LIMIT 500
+      ) recent
+      LEFT JOIN agents ag ON ag.id = recent.agent_id
+      ORDER BY recent.id ASC
+    `).all(taskId).map((event) => ({ ...event, metadata: fromJson(event.metadata, {}) }));
+    const receipts = this.db.prepare(`
+      SELECT r.event_id, r.delivered_at, r.seen_at, ag.name AS agent_name, ag.provider AS agent_provider
+      FROM message_receipts r
+      JOIN agents ag ON ag.id = r.agent_id
+      WHERE r.event_id IN (SELECT id FROM events WHERE task_id = ? AND type = 'human.message')
+      ORDER BY r.delivered_at ASC
+    `).all(taskId);
+    const receiptsByEvent = new Map();
+    for (const receipt of receipts) {
+      if (!receiptsByEvent.has(receipt.event_id)) receiptsByEvent.set(receipt.event_id, []);
+      receiptsByEvent.get(receipt.event_id).push(receipt);
+    }
+    for (const event of events) {
+      if (event.type === "human.message") event.receipts = receiptsByEvent.get(event.id) || [];
+    }
+    const proposals = this.proposalsForTask(taskId);
+    return { ...task, assignments, approvals, events, proposals };
+  }
+
+  snapshot(taskId = undefined) {
+    const tasks = this.listTasks();
+    const selectedId = taskId === undefined ? tasks[0]?.id || null : taskId;
+    return {
+      serverTime: now(),
+      projects: this.listProjects(),
+      agents: this.listAgents(),
+      tasks,
+      selectedTask: selectedId ? this.taskDetail(selectedId) : null,
+    };
+  }
+}

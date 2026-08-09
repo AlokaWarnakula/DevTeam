@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#0a0c10">
+  <title>DevTeam — Local AI collaboration</title>
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/overrides.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark">D</span><div><strong>DevTeam</strong><small>local workspace</small></div></div>
+      <button class="primary full" data-dialog="task-dialog"><span>＋</span> New task</button>
+      <nav>
+        <div class="section-label"><span>Projects</span><button class="icon-button" title="Add project" data-dialog="project-dialog">＋</button></div>
+        <div id="project-list" class="project-list"></div>
+        <div class="section-label"><span>Task history</span><span id="task-count" class="count">0</span></div>
+        <div id="task-list" class="task-list"></div>
+      </nav>
+      <div class="local-card">
+        <span class="pulse"></span>
+        <div><strong>Local server</strong><small id="server-address">checking…</small></div>
+        <button id="copy-setup" class="icon-button" title="Copy MCP setup">⧉</button>
+      </div>
+    </aside>
+
+    <main class="workspace">
+      <header class="task-header">
+        <div>
+          <div class="eyebrow"><span id="project-name">DevTeam</span><span>/</span><span id="task-status" class="status">ready</span></div>
+          <h1 id="task-title">Bring your AI team together</h1>
+          <p id="task-description">Create a task, connect agents through MCP, and watch the plan, implementation, tests, and review happen in one place.</p>
+        </div>
+        <div class="header-actions"><span id="task-version" class="version">v1</span><button class="secondary" data-dialog="task-dialog">New task</button></div>
+      </header>
+
+      <section id="empty-state" class="empty-state">
+        <div class="orb"><span>⌁</span></div>
+        <h2>Your team room is ready</h2>
+        <p>Start a task here, then ask Codex or Claude to use <code>$devteam</code>. Connected agents claim work only when it exists.</p>
+        <button class="primary" data-dialog="task-dialog">Create the first task</button>
+      </section>
+
+      <section id="conversation" class="conversation hidden">
+        <div id="event-list" class="event-list"></div>
+        <form id="message-form" class="composer">
+          <div class="composer-head">
+            <span class="composer-title">Message the team</span>
+            <label class="target-field">To
+              <select id="message-target" name="target" class="target-select" title="Choose who receives this message"></select>
+            </label>
+          </div>
+          <div id="reply-context" class="reply-context hidden"></div>
+          <textarea name="message" rows="1" placeholder="Message a connected agent or broadcast to the whole team…" required></textarea>
+          <div class="composer-footer"><span id="composer-hint">Delivered live to connected agents on their next check.</span><button class="send" title="Send message" aria-label="Send message">↑</button></div>
+        </form>
+      </section>
+    </main>
+
+    <aside class="team-panel">
+      <div class="panel-head"><div><span class="eyebrow">LIVE ROOM</span><h2>Team</h2></div><span id="online-count" class="online-count">0 online</span></div>
+      <div id="agent-list" class="agent-list"></div>
+      <div id="reconnect-list" class="reconnect-list"></div>
+      <div class="divider"></div>
+      <div id="proposal-section" class="proposal-section hidden">
+        <div class="panel-title"><h3>Proposals</h3><button class="icon-button" id="new-proposal" data-dialog="proposal-dialog" title="Propose a role or decision to the team">＋</button></div>
+        <div id="proposal-list" class="proposal-list"></div>
+        <div class="divider"></div>
+      </div>
+      <div class="panel-title"><h3>Work queue</h3><span id="assignment-count" class="count">0</span></div>
+      <div id="assignment-list" class="assignment-list"></div>
+      <div class="divider"></div>
+      <div class="consensus">
+        <div class="panel-title"><h3>Consensus</h3><span id="approval-label">0 / 0</span></div>
+        <div class="progress"><span id="approval-progress"></span></div>
+        <p id="consensus-copy">Independent review begins after implementation.</p>
+      </div>
+      <button id="block-task" class="danger-link hidden">Stop and block task</button>
+    </aside>
+  </div>
+
+  <dialog id="task-dialog">
+    <form id="task-form" method="dialog">
+      <div class="dialog-head"><div><span class="eyebrow">NEW WORK</span><h2>Give the team a mission</h2></div><button type="button" class="close">×</button></div>
+      <label>Project<select name="projectId" id="project-select" required></select></label>
+      <label>Task title<input name="title" maxlength="120" placeholder="Add password reset flow" required></label>
+      <label>What should the team deliver?<textarea name="description" rows="5" placeholder="Describe the outcome, constraints, and definition of done…" required></textarea></label>
+      <label>Independent approvals<select name="requiredApprovals"><option value="2">2 reviewers (recommended)</option><option value="1">1 reviewer</option><option value="3">3 reviewers</option></select></label>
+      <div class="dialog-actions"><button type="button" class="secondary close">Cancel</button><button class="primary" value="submit">Start task</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="project-dialog">
+    <form id="project-form" method="dialog">
+      <div class="dialog-head"><div><span class="eyebrow">WORKSPACE</span><h2>Add a local project</h2></div><button type="button" class="close">×</button></div>
+      <label>Project name<input name="name" maxlength="80" placeholder="My application" required></label>
+      <label>Absolute folder path<input name="root" placeholder="C:\Projects\my-app" required></label>
+      <p class="hint">Agents will receive this path with their assignments. The folder must already exist.</p>
+      <div class="dialog-actions"><button type="button" class="secondary close">Cancel</button><button class="primary" value="submit">Add project</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="proposal-dialog">
+    <form id="proposal-form" method="dialog">
+      <div class="dialog-head"><div><span class="eyebrow">TEAM DECISION</span><h2>Propose to the team</h2></div><button type="button" class="close">×</button></div>
+      <label>Type<select name="kind" id="proposal-kind"><option value="role">Assign a role</option><option value="decision">Record a decision</option></select></label>
+      <label>Summary (what the team votes on)<input name="summary" maxlength="200" placeholder="Codex takes the security-reviewer role" required></label>
+      <div id="role-fields">
+        <label>Role<select name="role"><option value="implementer">implementer</option><option value="reviewer">reviewer</option><option value="security-reviewer">security-reviewer</option><option value="tester">tester</option><option value="researcher">researcher</option><option value="planner">planner</option></select></label>
+        <label>For agent (name)<input name="targetAgentName" maxlength="80" placeholder="Codex"></label>
+        <label>What should they do?<textarea name="description" rows="3" placeholder="Describe the work for this role…"></textarea></label>
+      </div>
+      <p class="hint">Agents vote on their next check. Adopted only when every connected teammate agrees; a role proposal creates the assignment automatically.</p>
+      <div class="dialog-actions"><button type="button" class="secondary close">Cancel</button><button class="primary" value="submit">Send proposal</button></div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast"></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>Run your AI dev team — DevTeam quickstart</title>
+<style>
+  :root {
+    --bg: #0a0c10; --panel: #12161c; --panel-2: #161c24; --line: #232b36;
+    --text: #eaf0f7; --muted: #8b94a2; --faint: #5c6672;
+    --blue: #91b9ff; --blue-2: #bcd4ff; --green: #7fe0a6; --amber: #efc174; --red: #ff9a9a;
+    --console-bg: #0c1017; --console-line: #1d2530; --console-text: #d7e0ec;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, "Cascadia Code", "JetBrains Mono", "SF Mono", Consolas, monospace;
+    --radius: 14px; --maxw: 1000px;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f4f6f9; --panel: #ffffff; --panel-2: #eef1f6; --line: #dde3ea;
+      --text: #131820; --muted: #5a6472; --faint: #8b95a3;
+      --blue: #2f66cf; --blue-2: #24509f; --green: #1a9a54; --amber: #96690f; --red: #c8484a;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0a0c10; --panel: #12161c; --panel-2: #161c24; --line: #232b36;
+    --text: #eaf0f7; --muted: #8b94a2; --faint: #5c6672;
+    --blue: #91b9ff; --blue-2: #bcd4ff; --green: #7fe0a6; --amber: #efc174; --red: #ff9a9a;
+  }
+  :root[data-theme="light"] {
+    --bg: #f4f6f9; --panel: #ffffff; --panel-2: #eef1f6; --line: #dde3ea;
+    --text: #131820; --muted: #5a6472; --faint: #8b95a3;
+    --blue: #2f66cf; --blue-2: #24509f; --green: #1a9a54; --amber: #96690f; --red: #c8484a;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: var(--sans); line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: var(--maxw); margin: 0 auto; padding: 40px 22px 72px; }
+
+  /* Header */
+  .head { display: flex; align-items: flex-start; gap: 16px; padding-bottom: 22px; border-bottom: 1px solid var(--line); }
+  .mark {
+    flex: 0 0 auto; width: 44px; height: 44px; border-radius: 12px;
+    display: grid; place-items: center; font-family: var(--mono); font-weight: 700; font-size: 20px;
+    color: #0a0c10; background: linear-gradient(150deg, var(--green), var(--blue));
+  }
+  .head h1 { margin: 2px 0 4px; font-size: clamp(1.5rem, 3vw, 2.05rem); letter-spacing: -0.02em; text-wrap: balance; }
+  .head p { margin: 0; color: var(--muted); max-width: 60ch; }
+  .tag {
+    margin-top: 10px; display: inline-flex; align-items: center; gap: 8px;
+    font-family: var(--mono); font-size: 12px; color: var(--muted);
+    border: 1px solid var(--line); border-radius: 999px; padding: 4px 11px;
+  }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 3px color-mix(in srgb, var(--green) 22%, transparent); }
+
+  /* Section scaffolding */
+  section { margin-top: 40px; }
+  .eyebrow {
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase;
+    color: var(--blue-2); margin: 0 0 4px;
+  }
+  h2 { margin: 0 0 16px; font-size: 1.28rem; letter-spacing: -0.01em; }
+  h2 .sub { color: var(--muted); font-weight: 400; font-size: 0.95rem; }
+
+  /* The model — two ingredients */
+  .model { display: grid; grid-template-columns: 1fr 1fr auto 1fr; gap: 14px; align-items: stretch; }
+  @media (max-width: 720px) { .model { grid-template-columns: 1fr; } .model .arrow { transform: rotate(90deg); justify-self: center; } }
+  .ingredient { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px 16px 15px; }
+  .ingredient .n { font-family: var(--mono); font-size: 12px; color: var(--faint); }
+  .ingredient h3 { margin: 6px 0 5px; font-size: 1.02rem; }
+  .ingredient p { margin: 0; color: var(--muted); font-size: 0.9rem; }
+  .arrow { display: grid; place-items: center; color: var(--blue); font-size: 22px; }
+  .room {
+    background: color-mix(in srgb, var(--blue) 9%, var(--panel));
+    border: 1px solid color-mix(in srgb, var(--blue) 34%, var(--line));
+    border-radius: var(--radius); padding: 16px; display: flex; flex-direction: column; justify-content: center;
+  }
+  .room h3 { margin: 0 0 4px; font-size: 1.02rem; }
+  .room p { margin: 0; color: var(--muted); font-size: 0.9rem; }
+  .room code { color: var(--blue-2); }
+
+  /* Steps — a real sequence */
+  .steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; counter-reset: step; }
+  .steps li {
+    background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 15px 16px 15px 58px; position: relative;
+  }
+  .steps li::before {
+    counter-increment: step; content: counter(step);
+    position: absolute; left: 14px; top: 14px; width: 30px; height: 30px; border-radius: 9px;
+    display: grid; place-items: center; font-family: var(--mono); font-weight: 700; font-size: 14px;
+    color: var(--blue-2); background: color-mix(in srgb, var(--blue) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--blue) 30%, transparent);
+  }
+  .steps strong { display: block; margin-bottom: 2px; }
+  .steps p { margin: 0; color: var(--muted); font-size: 0.92rem; }
+
+  /* Console blocks — always a terminal, in both themes */
+  .cmd {
+    background: var(--console-bg); border: 1px solid var(--console-line); border-radius: 10px;
+    font-family: var(--mono); font-size: 13px; color: var(--console-text);
+    padding: 11px 13px; margin: 9px 0 0; overflow-x: auto; white-space: pre;
+  }
+  .cmd .p { color: var(--green); user-select: none; }
+  .cmd .c { color: #6b7686; }
+  .cmd + .cmd { margin-top: 8px; }
+
+  /* Connect cards */
+  .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+  @media (max-width: 820px) { .cards { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 0; overflow: hidden; display: flex; flex-direction: column; }
+  .card > header { display: flex; align-items: center; gap: 10px; padding: 14px 16px; border-bottom: 1px solid var(--line); background: var(--panel-2); }
+  .avatar { width: 30px; height: 30px; border-radius: 8px; display: grid; place-items: center; font-family: var(--mono); font-weight: 700; font-size: 12px; color: #0a0c10; }
+  .a-claude { background: var(--amber); }
+  .a-codex { background: var(--green); }
+  .a-any { background: var(--blue); }
+  .card header strong { font-size: 0.98rem; }
+  .card header small { display: block; color: var(--muted); font-size: 11px; font-family: var(--mono); }
+  .card dl { margin: 0; padding: 13px 16px 16px; display: grid; gap: 11px; }
+  .card dt { font-family: var(--mono); font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--faint); margin-bottom: 3px; }
+  .card dd { margin: 0; font-size: 0.9rem; color: var(--text); }
+  .card dd .path { font-family: var(--mono); font-size: 12px; color: var(--muted); word-break: break-all; }
+  .join { color: var(--blue-2); font-family: var(--mono); }
+
+  kbd {
+    font-family: var(--mono); font-size: 0.82em; background: color-mix(in srgb, var(--blue) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--blue) 30%, transparent); color: var(--blue-2);
+    border-radius: 5px; padding: 1px 6px;
+  }
+  p code, li code, dd code { font-family: var(--mono); font-size: 0.86em; background: var(--panel-2); border: 1px solid var(--line); border-radius: 5px; padding: 1px 5px; }
+
+  /* Checklist + notes */
+  .checklist { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+  .checklist li { padding-left: 28px; position: relative; color: var(--text); }
+  .checklist li::before { content: "✓"; position: absolute; left: 0; top: 0; color: var(--green); font-weight: 700; }
+  .checklist small { display: block; color: var(--muted); }
+
+  .notes { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 720px) { .notes { grid-template-columns: 1fr; } }
+  .note { border: 1px solid var(--line); border-left: 3px solid var(--amber); border-radius: 10px; padding: 13px 15px; background: var(--panel); }
+  .note.blue { border-left-color: var(--blue); }
+  .note.green { border-left-color: var(--green); }
+  .note strong { display: block; margin-bottom: 3px; font-size: 0.95rem; }
+  .note p { margin: 0; color: var(--muted); font-size: 0.9rem; }
+
+  footer { margin-top: 48px; padding-top: 18px; border-top: 1px solid var(--line); color: var(--faint); font-size: 0.85rem; font-family: var(--mono); }
+  a { color: var(--blue); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="head">
+    <div class="mark">▚</div>
+    <div>
+      <h1>Run your AI dev team</h1>
+      <p>DevTeam is a local room where several AI agents and you build together — planning, writing, reviewing, and reaching consensus on one codebase. This is the whole workflow on one page.</p>
+      <span class="tag"><span class="dot"></span> localhost · 127.0.0.1:7331 · nothing leaves your machine</span>
+    </div>
+  </header>
+
+  <section>
+    <p class="eyebrow">The whole idea</p>
+    <h2>Any AI agent joins the same two-part way</h2>
+    <div class="model">
+      <div class="ingredient">
+        <div class="n">part 1</div>
+        <h3>The connection</h3>
+        <p>Point the agent's tools at the DevTeam MCP endpoint (a URL + token). This is one config file.</p>
+      </div>
+      <div class="ingredient">
+        <div class="n">part 2</div>
+        <h3>The skill</h3>
+        <p>Copy the <code>devteam</code> skill into the folder that agent reads skills from. It teaches the agent how to behave in the room.</p>
+      </div>
+      <div class="arrow">→</div>
+      <div class="room">
+        <h3>Then it joins</h3>
+        <p>In a chat, tell it: <code>use the devteam skill and join</code>. DevTeam isn't tied to any vendor — Codex, Claude, or anything that speaks MCP joins this way.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <p class="eyebrow">Every session</p>
+    <h2>The five-move routine <span class="sub">— do these top to bottom</span></h2>
+    <ol class="steps">
+      <li>
+        <strong>Turn the server on</strong>
+        <p>From the project folder, start it and leave the window open. The dashboard and the MCP endpoint both come up on port 7331.</p>
+        <div class="cmd"><span class="p">›</span> npm start        <span class="c"># or double-click Start DevTeam.cmd</span></div>
+      </li>
+      <li>
+        <strong>Open the dashboard</strong>
+        <p>Go to <a href="http://127.0.0.1:7331">http://127.0.0.1:7331</a>. This is your control room — team presence, chat, proposals, and consensus all live here.</p>
+      </li>
+      <li>
+        <strong>Add the project and create a task</strong>
+        <p>Register the code folder you want worked on (so agents get its path), then write one task describing the outcome and how many independent reviews you want.</p>
+      </li>
+      <li>
+        <strong>Join your agents</strong>
+        <p>In each AI's chat, say the join phrase (below). They connect, claim work, and start collaborating. Bring at least two for real cross-review.</p>
+      </li>
+      <li>
+        <strong>Steer from the dashboard</strong>
+        <p>Message or @-direct an agent, watch the live activity and checklists, weigh in on role proposals, and let consensus accept the task.</p>
+      </li>
+    </ol>
+  </section>
+
+  <section>
+    <p class="eyebrow">Connect &amp; reconnect</p>
+    <h2>Where each part lives, and how to join</h2>
+    <div class="cards">
+
+      <article class="card">
+        <header><div class="avatar a-claude">CC</div><div><strong>Claude Code</strong><small>reads ~/.claude</small></div></header>
+        <dl>
+          <div><dt>Connection</dt><dd><code>.mcp.json</code> in the project root <span class="path">(or your user settings, for every project)</span></dd></div>
+          <div><dt>Skill folder</dt><dd class="path">~/.claude/skills/devteam</dd></div>
+          <div><dt>Join / reconnect</dt><dd><span class="join">/devteam</span> — or “use the devteam skill and join as Claude”. To reconnect after a drop, just say it again.</dd></div>
+        </dl>
+      </article>
+
+      <article class="card">
+        <header><div class="avatar a-codex">Cx</div><div><strong>Codex</strong><small>reads ~/.codex</small></div></header>
+        <dl>
+          <div><dt>Connection</dt><dd><code>config.toml</code> → <code>[mcp_servers.devteam]</code> <span class="path">(global — works in every project)</span></dd></div>
+          <div><dt>Skill folder</dt><dd class="path">~/.codex/skills/devteam</dd></div>
+          <div><dt>Join / reconnect</dt><dd><span class="join">$devteam</span> — or “use the devteam skill and join as Codex”. Approve the <code>devteam</code> tools once when asked.</dd></div>
+        </dl>
+      </article>
+
+      <article class="card">
+        <header><div class="avatar a-any">＊</div><div><strong>Any MCP agent</strong><small>same recipe</small></div></header>
+        <dl>
+          <div><dt>Connection</dt><dd>Add the Streamable-HTTP endpoint + <code>Authorization: Bearer</code> header from the dashboard's <strong>Copy MCP setup</strong> (⧉) button.</dd></div>
+          <div><dt>Skill folder</dt><dd>Wherever it loads skills — copy it with <code>sync-skill --dest</code>.</dd></div>
+          <div><dt>Join</dt><dd>Tell it to use the devteam skill and join under a recognisable name.</dd></div>
+        </dl>
+      </article>
+
+    </div>
+  </section>
+
+  <section>
+    <p class="eyebrow">Copy-paste</p>
+    <h2>The commands you'll actually reuse</h2>
+    <div class="cmd"><span class="c"># Feed the skill to an agent (re-run after you change the skill)</span>
+<span class="p">›</span> node bin/devteam.mjs sync-skill --dest "%USERPROFILE%\.claude\skills\devteam"
+<span class="p">›</span> node bin/devteam.mjs sync-skill --dest "%USERPROFILE%\.codex\skills\devteam"</div>
+    <div class="cmd"><span class="c"># Show the bearer token again (must match every agent's config)</span>
+<span class="p">›</span> node bin/devteam.mjs token</div>
+    <div class="cmd"><span class="c"># Health + where the packaged skill lives</span>
+<span class="p">›</span> node bin/devteam.mjs doctor</div>
+  </section>
+
+  <section>
+    <p class="eyebrow">Starting on a different project</p>
+    <h2>What actually changes</h2>
+    <ul class="checklist">
+      <li><strong>Codex:</strong> nothing to do — its MCP connection and skill are global.<small>Already set once, works everywhere.</small></li>
+      <li><strong>Claude Code:</strong> drop the <code>.mcp.json</code> block in that project's root <span class="path">(or add it to user settings once, for all projects)</span>. The skill is already global.</li>
+      <li><strong>In the dashboard:</strong> add the new project's folder, then create a task for it.<small>The skill never needs re-copying per project — only re-copy when the skill itself changes.</small></li>
+    </ul>
+  </section>
+
+  <section>
+    <p class="eyebrow">Good to know</p>
+    <h2>Three things that save you a headache</h2>
+    <div class="notes">
+      <div class="note green">
+        <strong>Reconnecting is just re-joining</strong>
+        <p>MCP can't wake a closed chat, so to bring an agent back you re-say its join phrase. The dashboard's <strong>Re-ping</strong> button on a recently-left agent copies that exact phrase for you.</p>
+      </div>
+      <div class="note blue">
+        <strong>The token must match</strong>
+        <p>The bearer token in each agent's config has to equal the server's token. The dashboard's <strong>Copy MCP setup</strong> (⧉) button is the source of truth — paste from there and you can't get it wrong.</p>
+      </div>
+      <div class="note">
+        <strong>Keep the skill fresh</strong>
+        <p>Each agent runs its own copy of the skill. After you improve the skill, re-run <code>sync-skill --dest …</code> for each agent and start a new session — otherwise it follows the old behaviour.</p>
+      </div>
+      <div class="note">
+        <strong>Two agents minimum for consensus</strong>
+        <p>Independent review is the point. With one agent a task can still finish, but real blind-spot catching needs a second agent reviewing the first's work.</p>
+      </div>
+    </div>
+  </section>
+
+  <footer>DevTeam · local AI collaboration · runs only on 127.0.0.1</footer>
+</div>
+</body>
+</html>

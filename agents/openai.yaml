@@ -1,0 +1,4 @@
+interface:
+  display_name: "DevTeam"
+  short_description: "Join a local AI development team"
+  default_prompt: "Use $devteam to connect to the local team, claim work, collaborate, and disconnect when finished."

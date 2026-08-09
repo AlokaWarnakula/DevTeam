@@ -1,0 +1,479 @@
+.nav-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 27px;
+  gap: 2px;
+  align-items: center;
+}
+
+.nav-row .project-item,
+.nav-row .task-item {
+  min-width: 0;
+  width: 100%;
+}
+
+.nav-row .project-item::before {
+  flex: 0 0 auto;
+}
+
+.nav-row .task-item {
+  grid-template-columns: 7px minmax(0, 1fr);
+}
+
+.nav-row .task-item small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.row-delete {
+  width: 25px;
+  height: 25px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: #65707d;
+  cursor: pointer;
+  opacity: 0;
+  transition: 0.15s;
+  font-size: 16px;
+  line-height: 1;
+}
+
+.nav-row:hover .row-delete,
+.row-delete:focus-visible {
+  opacity: 1;
+}
+
+.row-delete:hover {
+  background: #2a171a;
+  color: var(--red);
+}
+
+.composer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.composer-title {
+  color: #8e99a7;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+}
+
+.target-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: #6f7986;
+}
+
+.target-select {
+  font: 12px inherit;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text);
+  background: #10151c;
+  border: 1px solid #2c343e;
+  border-radius: 7px;
+  padding: 4px 8px;
+  max-width: 220px;
+  cursor: pointer;
+}
+
+.composer-footer {
+  gap: 12px;
+  color: #6f7986;
+  line-height: 1.35;
+}
+
+.event-main {
+  min-width: 0;
+}
+
+/* Distinct treatment for messages from the human operator */
+.event.from-human .avatar.human {
+  background: #243328;
+  color: var(--green);
+}
+
+.kind-badge {
+  font: 9px ui-monospace, monospace;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 2px 6px;
+  border-radius: 5px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+
+.kind-badge.question {
+  color: var(--blue);
+  border-color: color-mix(in srgb, var(--blue) 40%, transparent);
+  background: color-mix(in srgb, var(--blue) 12%, transparent);
+}
+
+.kind-badge.finding {
+  color: var(--amber);
+  border-color: color-mix(in srgb, var(--amber) 40%, transparent);
+  background: color-mix(in srgb, var(--amber) 12%, transparent);
+}
+
+.kind-badge.decision {
+  color: var(--green2);
+  border-color: color-mix(in srgb, var(--green2) 40%, transparent);
+  background: color-mix(in srgb, var(--green2) 12%, transparent);
+}
+
+.delivery {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 7px;
+  font-size: 11px;
+  color: #6f7986;
+}
+
+.delivery-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  background: #545e6b;
+}
+
+.delivery-dot.delivered {
+  background: var(--blue);
+}
+
+.delivery-dot.seen {
+  background: var(--green2);
+}
+
+.delivery-dot.pending {
+  background: transparent;
+  border: 1px solid #545e6b;
+}
+
+/* Team presence: heartbeat freshness on the status dot */
+.agent-info {
+  min-width: 0;
+}
+
+.agent-info small .seen {
+  color: #7f8996;
+}
+
+.agent-info .activity {
+  display: block;
+  margin-top: 2px;
+  font-size: 10px;
+  color: var(--blue);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-status.fresh {
+  box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 22%, transparent);
+  animation: presence-pulse 2.2s ease-in-out infinite;
+}
+
+.agent-status.busy.fresh {
+  color: var(--amber);
+}
+
+.agent-status.waiting.fresh {
+  color: var(--green2);
+}
+
+.agent-status.stale {
+  opacity: 0.7;
+}
+
+.agent-status.cold {
+  opacity: 0.4;
+  background: #6b5560;
+}
+
+@keyframes presence-pulse {
+  0%, 100% { box-shadow: 0 0 0 2px color-mix(in srgb, currentColor 26%, transparent); }
+  50% { box-shadow: 0 0 0 5px color-mix(in srgb, currentColor 6%, transparent); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .agent-status.fresh { animation: none; }
+}
+
+/* Per-agent unread badge */
+.unread-badge {
+  display: inline-grid;
+  place-items: center;
+  min-width: 17px;
+  height: 17px;
+  padding: 0 5px;
+  margin-left: 7px;
+  border-radius: 9px;
+  background: var(--blue);
+  color: #0a0c10;
+  font-size: 10px;
+  font-weight: 800;
+  vertical-align: middle;
+}
+
+/* Recently-left agents with a re-ping affordance */
+.reconnect-list {
+  display: grid;
+  gap: 7px;
+}
+
+.reconnect-list:not(:empty) {
+  margin-top: 10px;
+}
+
+.reconnect-head {
+  color: #6f7986;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.7px;
+  text-transform: uppercase;
+}
+
+.reconnect-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  border: 1px dashed #2c343e;
+  border-radius: 10px;
+  padding: 8px 10px;
+}
+
+.reconnect-row strong {
+  display: block;
+  font-size: 13px;
+}
+
+.reconnect-row small {
+  display: block;
+  font-size: 10px;
+  color: #697483;
+  margin-top: 2px;
+}
+
+.reconnect-btn {
+  border: 1px solid color-mix(in srgb, var(--blue) 45%, transparent);
+  background: color-mix(in srgb, var(--blue) 14%, transparent);
+  color: var(--blue);
+  border-radius: 7px;
+  padding: 5px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.reconnect-btn:hover {
+  background: color-mix(in srgb, var(--blue) 22%, transparent);
+}
+
+/* Message replies / threads */
+.event-top .reply-btn {
+  border: 0;
+  background: transparent;
+  color: #5b6572;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 5px;
+  opacity: 0;
+  transition: 0.12s;
+}
+
+.event:hover .reply-btn,
+.reply-btn:focus-visible {
+  opacity: 1;
+}
+
+.event-top .reply-btn:hover {
+  background: #1a2029;
+  color: var(--blue);
+}
+
+.reply-quote {
+  border-left: 2px solid color-mix(in srgb, var(--blue) 55%, transparent);
+  padding: 2px 0 2px 8px;
+  margin: 0 0 5px;
+  font-size: 11px;
+  color: #8b95a2;
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+.reply-context {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+  padding: 5px 8px;
+  background: #10151c;
+  border: 1px solid #2c343e;
+  border-radius: 8px;
+}
+
+.reply-context .reply-quote {
+  border: 0;
+  padding: 0;
+  margin: 0;
+  flex: 1 1 auto;
+}
+
+.reply-cancel {
+  border: 0;
+  background: transparent;
+  color: #7f8996;
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+  flex: 0 0 auto;
+}
+
+.reply-cancel:hover {
+  color: var(--red);
+}
+
+@media (hover: none) {
+  .event-top .reply-btn { opacity: 1; }
+}
+
+/* Review checklists attached to assignments */
+.checklist {
+  margin-top: 7px;
+}
+
+.checklist summary {
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  color: var(--amber);
+  list-style: none;
+}
+
+.checklist summary::before {
+  content: "☑ ";
+}
+
+.checklist ul {
+  margin: 6px 0 2px;
+  padding-left: 16px;
+  display: grid;
+  gap: 3px;
+}
+
+.checklist li {
+  font-size: 11px;
+  color: #aeb7c2;
+  line-height: 1.4;
+}
+
+/* Team proposals (role negotiation) */
+.proposal-list {
+  display: grid;
+  gap: 8px;
+}
+
+.proposal {
+  border: 1px solid color-mix(in srgb, var(--blue) 35%, var(--line));
+  background: color-mix(in srgb, var(--blue) 7%, transparent);
+  border-radius: 10px;
+  padding: 9px 10px;
+}
+
+.proposal-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.proposal-top strong {
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.proposal-top .role {
+  flex: 0 0 auto;
+  font: 10px ui-monospace, monospace;
+  color: var(--blue);
+  white-space: nowrap;
+}
+
+.proposal-meta {
+  margin: 5px 0 8px;
+  font-size: 11px;
+  color: #7f8996;
+}
+
+.vote-objection {
+  color: var(--red);
+}
+
+.proposal-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.mini {
+  border: 1px solid var(--line);
+  background: #11161c;
+  color: var(--text);
+  border-radius: 7px;
+  padding: 4px 12px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.mini.agree:hover {
+  border-color: color-mix(in srgb, var(--green2) 55%, transparent);
+  background: color-mix(in srgb, var(--green2) 16%, transparent);
+  color: var(--green);
+}
+
+.mini.object:hover {
+  border-color: color-mix(in srgb, var(--red) 55%, transparent);
+  background: color-mix(in srgb, var(--red) 14%, transparent);
+  color: var(--red);
+}
+
+.system-event.proposal-adopted {
+  color: var(--green2);
+}
+
+.system-event.proposal-declined {
+  color: var(--red);
+}
+
+#role-fields.hidden {
+  display: none;
+}
+
+@media (hover: none) {
+  .row-delete {
+    opacity: 1;
+  }
+}

@@ -1,0 +1,27 @@
+node bin/devteam.mjs sync-skill
+
+npm install 
+
+npm run
+
+
+ Use $devteam and join as Codex 
+
+
+Use $devteam. Connect as "Codex" using provider "OpenAI Codex Desktop"
+with implementation and testing capabilities. Wait for an assignment,
+complete it in the assigned project folder, report the evidence, and
+disconnect when finished.
+
+
+Use the devteam skill. Connect as "Claude" using provider "Anthropic Claude Code"
+with planning, architecture, and review capabilities. Wait for an assignment,
+complete it in the assigned project folder, report the evidence, and
+disconnect when finished.
+
+
+Use $devteam. Reconnect as Codex, read the current task state and messages,
+then wait for the next assignment.
+
+Use the devteam skill. Reconnect as Claude, read the current task state
+and messages, then wait for the next assignment.
