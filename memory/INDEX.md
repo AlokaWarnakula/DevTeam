@@ -1,5 +1,5 @@
 # Next Session Handoff
-> **Next session:** read `memory/memory_2026-08-09.md` and `HANDOFF-TO-CODEX.md` first. Increments 1–3 are implemented and all 36 tests pass, but the next safety increment must close room-authorization, observer, implicit-membership, multiple-claim, and path-alias gaps before continuing the broader hive-mind roadmap. Do not sync the live skill or touch the running DevTeam data without human approval.
+> **Next session:** DevTeam is fully built and cleaned — read `memory/memory_2026-08-09.md` first (its later "Update —" sections). Tests **51/51 green**, doctor healthy, root md is just README. We also agreed a model strategy: Claude Opus 5 for planning/review, Codex for the heavy coding, Sonnet 5/Haiku 4.5 for tests — reviewer must differ from coder. The ONLY open action is human-approved deployment: run `node bin/devteam.mjs sync-skill --dest ...` for each installed agent. Nothing is committed yet. Do NOT sync the live skill or touch the running server/data without asking.
 
 ---
 # Session Index
@@ -7,7 +7,7 @@ Most recent first.
 
 | Date | File | Summary |
 |------|------|---------|
-| 2026-08-09 | [memory_2026-08-09.md](./memory_2026-08-09.md) | Verified shipped DevTeam increments, recorded remaining collective-mind risks, and prioritized the next safety work. |
+| 2026-08-09 | [memory_2026-08-09.md](./memory_2026-08-09.md) | Shipped the entire hive-mind roadmap + all loose ends (auth, symlink scopes, dashboard membership), cleaned root docs, and agreed a per-role model strategy. 36 → 51 tests green. |
 
 ---
 ## How this works

@@ -28,6 +28,7 @@ function activityLine(agent) {
     const version = agent.current_task_version ? ` · v${agent.current_task_version}` : "";
     return `${verb}: ${agent.current_assignment_title}${version}`;
   }
+  if (agent.status === "unresponsive") return `unresponsive · silent ${relativeTime(agent.last_seen)} (keeps its claim)`;
   if (agent.status === "waiting") return `waiting · ${relativeTime(agent.last_seen)}`;
   return relativeTime(agent.last_seen);
 }
@@ -134,14 +135,22 @@ function renderTask(task) {
   if (replyTo && !eventLookup.has(replyTo.id)) { replyTo = null; }
   renderReplyContext();
   $("#event-list").innerHTML = task.events.map(renderEvent).join("");
+  renderMembers(task);
   renderProposals(task);
   $("#assignment-count").textContent = task.assignments.filter((item) => ["queued", "claimed"].includes(item.status)).length;
   $("#assignment-list").innerHTML = task.assignments.slice().reverse().slice(0, 8).map((item) => {
     const checklist = item.checklist && item.checklist.length
       ? `<details class="checklist"><summary>${item.checklist.length}-point checklist</summary><ul>${item.checklist.map((point) => `<li>${escapeHtml(point)}</li>`).join("")}</ul></details>`
       : "";
-    return `<div class="assignment"><div class="assignment-top"><strong>${escapeHtml(item.title)}</strong><span class="role">${escapeHtml(item.role)}</span></div><p>${escapeHtml(item.agent_name ? `${item.agent_name} · ${item.status}` : item.status)}${item.requires_write ? " · write lease" : ""}</p>${checklist}</div>`;
+    const scope = item.requires_write && item.writeScope && item.writeScope.length
+      ? `<span class="scope" title="Write lease scope">${item.writeScope.map((p) => escapeHtml(p === "" ? "whole project" : p)).join(", ")}</span>`
+      : (item.requires_write ? `<span class="scope">whole project</span>` : "");
+    const release = item.status === "claimed" && item.requires_write
+      ? `<button class="mini release" data-release="${item.id}" data-release-title="${escapeHtml(item.title)}" title="Force-release this stuck write lease (asks you to confirm the title)">Release lease</button>`
+      : "";
+    return `<div class="assignment"><div class="assignment-top"><strong>${escapeHtml(item.title)}</strong><span class="role">${escapeHtml(item.role)}</span></div><p>${escapeHtml(item.agent_name ? `${item.agent_name} · ${item.status}` : item.status)}${item.requires_write ? " · write lease" : ""}</p>${scope}${checklist}${release}</div>`;
   }).join("") || `<p class="hint">Waiting for the plan</p>`;
+  renderBlackboard(task);
   const approvals = task.approvals.length;
   $("#approval-label").textContent = `${approvals} / ${task.required_approvals}`;
   $("#approval-progress").style.width = `${Math.min(100, approvals / task.required_approvals * 100)}%`;
@@ -155,6 +164,34 @@ function renderTask(task) {
   }
   $("#consensus-copy").textContent = consensusCopy;
   if (nearBottom) requestAnimationFrame(() => window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" }));
+}
+
+// Who belongs to this task room and in what role — so the human can see the room's membership,
+// not just who is globally online. Contributors claim work; observers watch and review.
+function renderMembers(task) {
+  const container = $("#room-members");
+  if (!container) return;
+  const members = task.members || [];
+  container.classList.toggle("hidden", members.length === 0);
+  if (!members.length) { container.innerHTML = ""; return; }
+  container.innerHTML = `<div class="members-head">In this room</div>` + members.map((member) => {
+    const dead = member.status === "disconnected";
+    return `<div class="member-row ${dead ? "gone" : ""}"><span class="member-name">${escapeHtml(member.agent_name)}</span><span class="member-role ${member.role === "observer" ? "observer" : ""}">${escapeHtml(member.role)}</span><span class="member-status">${escapeHtml(member.status)}</span></div>`;
+  }).join("");
+}
+
+// The team's shared working memory: versioned keys with provenance. A long value is collapsed.
+function renderBlackboard(task) {
+  const section = $("#blackboard-section");
+  if (!section) return;
+  const notes = task.blackboard || [];
+  section.classList.toggle("hidden", notes.length === 0);
+  $("#blackboard-count").textContent = notes.length;
+  $("#blackboard-list").innerHTML = notes.map((note) => {
+    const value = String(note.value ?? "");
+    const preview = value.length > 240 ? `${value.slice(0, 240)}…` : value;
+    return `<details class="note"><summary><span class="note-key">${escapeHtml(note.key)}</span><span class="note-meta">v${note.version} · ${escapeHtml(note.updatedBy || "?")} · ${relativeTime(note.updatedAt)}</span></summary><pre class="note-body">${escapeHtml(preview)}</pre></details>`;
+  }).join("");
 }
 
 function renderReplyContext() {
@@ -287,6 +324,14 @@ document.addEventListener("click", async (event) => {
     }
     return;
   }
+  const releaseButton = event.target.closest("[data-release]");
+  if (releaseButton) {
+    const title = releaseButton.dataset.releaseTitle;
+    if (!confirm(`Force-release the write lease for “${title}”?\n\nOnly do this if the agent has genuinely crashed or is stuck — a still-running writer would lose its lease. Type nothing; this confirms the exact title for you.`)) return;
+    try { await api(`/api/assignments/${releaseButton.dataset.release}/force-release`, { method: "POST", body: JSON.stringify({ confirmTitle: title }) }); await refresh(); toast("Write lease released back to the queue"); }
+    catch (error) { toast(error.message); }
+    return;
+  }
   const voteButton = event.target.closest("[data-vote-proposal]");
   if (voteButton) {
     try { await api(`/api/proposals/${voteButton.dataset.voteProposal}/vote`, { method: "POST", body: JSON.stringify({ vote: voteButton.dataset.vote }) }); await refresh(); }
@@ -366,8 +411,11 @@ $("#block-task").addEventListener("click", async () => {
 });
 
 $("#copy-setup").addEventListener("click", async () => {
-  const setup = `DevTeam MCP\nURL: ${config.mcpUrl}\nAuthorization: Bearer ${config.token}\n\nCodex config.toml:\n[mcp_servers.devteam]\nurl = "${config.mcpUrl}"\nhttp_headers = { Authorization = "Bearer ${config.token}" }\ntool_timeout_sec = 60\n\nClaude JSON:\n{"mcpServers":{"devteam":{"type":"http","url":"${config.mcpUrl}","headers":{"Authorization":"Bearer ${config.token}"}}}}`;
-  await navigator.clipboard.writeText(setup); toast("Desktop MCP setup copied");
+  try {
+    const { mcpUrl, token } = await api("/api/setup");
+    const setup = `DevTeam MCP\nURL: ${mcpUrl}\nAuthorization: Bearer ${token}\n\nCodex config.toml:\n[mcp_servers.devteam]\nurl = "${mcpUrl}"\nhttp_headers = { Authorization = "Bearer ${token}" }\ntool_timeout_sec = 60\n\nClaude JSON:\n{"mcpServers":{"devteam":{"type":"http","url":"${mcpUrl}","headers":{"Authorization":"Bearer ${token}"}}}}`;
+    await navigator.clipboard.writeText(setup); toast("Desktop MCP setup copied");
+  } catch (error) { toast(error.message); }
 });
 
 async function boot() {

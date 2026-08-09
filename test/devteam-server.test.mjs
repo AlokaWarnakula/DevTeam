@@ -25,7 +25,7 @@ test("dashboard API and authenticated MCP endpoint work together", async (t) => 
 
   const taskResponse = await fetch(`${instance.url}/api/tasks`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", authorization: `Bearer ${instance.store.token}` },
     body: JSON.stringify({ projectId: state.projects[0].id, title: "MCP integration", description: "Claim this through MCP.", requiredApprovals: 1 }),
   });
   assert.equal(taskResponse.status, 201);
@@ -54,13 +54,13 @@ test("dashboard API and authenticated MCP endpoint work together", async (t) => 
 
   const wrongConfirmation = await fetch(`${instance.url}/api/tasks/${createdTask.id}`, {
     method: "DELETE",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", authorization: `Bearer ${instance.store.token}` },
     body: JSON.stringify({ confirmTaskId: "not-the-task" }),
   });
   assert.equal(wrongConfirmation.status, 400);
   const deleteTask = await fetch(`${instance.url}/api/tasks/${createdTask.id}`, {
     method: "DELETE",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", authorization: `Bearer ${instance.store.token}` },
     body: JSON.stringify({ confirmTaskId: createdTask.id }),
   });
   assert.equal(deleteTask.status, 200);
@@ -68,7 +68,7 @@ test("dashboard API and authenticated MCP endpoint work together", async (t) => 
 
   const deleteProject = await fetch(`${instance.url}/api/projects/${state.projects[0].id}`, {
     method: "DELETE",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", authorization: `Bearer ${instance.store.token}` },
     body: JSON.stringify({ confirmName: state.projects[0].name }),
   });
   assert.equal(deleteProject.status, 200);
@@ -83,7 +83,7 @@ test("a human message wakes a waiting agent through MCP and records delivery", a
   const state = await fetch(`${instance.url}/api/state`).then((response) => response.json());
   const task = await fetch(`${instance.url}/api/tasks`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", authorization: `Bearer ${instance.store.token}` },
     body: JSON.stringify({ projectId: state.projects[0].id, title: "Live chat", description: "Talk to a connected agent.", requiredApprovals: 1 }),
   }).then((response) => response.json());
 
@@ -99,7 +99,7 @@ test("a human message wakes a waiting agent through MCP and records delivery", a
 
   await fetch(`${instance.url}/api/tasks/${task.id}/messages`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", authorization: `Bearer ${instance.store.token}` },
     body: JSON.stringify({ message: "Codex, please prioritise security.", target: "Codex" }),
   });
 
@@ -160,12 +160,29 @@ test("mutating API rejects cross-origin and non-local requests", async (t) => {
   });
   assert.equal(crossOrigin.status, 403, "a foreign Origin is blocked");
 
-  const sameOrigin = await fetch(`${instance.url}/api/tasks`, {
+  // Same-origin but without a credential is now also rejected: the control plane needs the
+  // dashboard session cookie or the bearer token, not merely a loopback origin.
+  const noCredential = await fetch(`${instance.url}/api/tasks`, {
     method: "POST",
     headers: { "content-type": "application/json", origin: instance.url },
+    body: JSON.stringify({ projectId: state.projects[0].id, title: "No credential", description: "Rejected." }),
+  });
+  assert.equal(noCredential.status, 401, "a same-origin request without a credential is rejected");
+
+  // The routine config no longer leaks the bearer token; it is only served behind the credential.
+  const config = await fetch(`${instance.url}/api/config`).then((response) => response.json());
+  assert.equal(config.token, undefined, "the config endpoint no longer returns the bearer token");
+  const setupNoAuth = await fetch(`${instance.url}/api/setup`);
+  assert.equal(setupNoAuth.status, 401, "the setup/token endpoint requires a credential");
+  const setup = await fetch(`${instance.url}/api/setup`, { headers: { authorization: `Bearer ${instance.store.token}` } }).then((r) => r.json());
+  assert.equal(setup.token, instance.store.token, "with the bearer token, setup returns the connection details");
+
+  const sameOrigin = await fetch(`${instance.url}/api/tasks`, {
+    method: "POST",
+    headers: { "content-type": "application/json", origin: instance.url, authorization: `Bearer ${instance.store.token}` },
     body: JSON.stringify({ projectId: state.projects[0].id, title: "From the dashboard", description: "Allowed." }),
   });
-  assert.equal(sameOrigin.status, 201, "the same-origin dashboard is allowed");
+  assert.equal(sameOrigin.status, 201, "the same-origin dashboard with a credential is allowed");
 });
 
 test("a busy agent is reached with pending messages on its next action", async (t) => {
@@ -176,7 +193,7 @@ test("a busy agent is reached with pending messages on its next action", async (
   const state = await fetch(`${instance.url}/api/state`).then((response) => response.json());
   const task = await fetch(`${instance.url}/api/tasks`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", authorization: `Bearer ${instance.store.token}` },
     body: JSON.stringify({ projectId: state.projects[0].id, title: "Reach me", description: "Message a busy agent.", requiredApprovals: 1 }),
   }).then((response) => response.json());
 
@@ -195,11 +212,61 @@ test("a busy agent is reached with pending messages on its next action", async (
   // The human reaches the agent while it is busy (not sitting in devteam_wait).
   await fetch(`${instance.url}/api/tasks/${task.id}/messages`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", authorization: `Bearer ${instance.store.token}` },
     body: JSON.stringify({ message: "Please pause and check the spec.", target: "Worker" }),
   });
 
   const inspected = await client.callTool({ name: "devteam_state", arguments: { agentId, taskId: task.id } });
   assert.ok(Array.isArray(inspected.structuredContent.pendingMessages), "an ordinary action carries the agent's inbox");
   assert.match(inspected.structuredContent.pendingMessages[0].message, /check the spec/);
+});
+
+test("shared blackboard round-trips over MCP and a stuck write lease can be force-released via REST", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-hive-"));
+  const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd() });
+  t.after(async () => { await instance.close(); await rm(dataDir, { recursive: true, force: true }); });
+
+  const state = await fetch(`${instance.url}/api/state`).then((r) => r.json());
+  const task = await fetch(`${instance.url}/api/tasks`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${instance.store.token}` },
+    body: JSON.stringify({ projectId: state.projects[0].id, title: "Hive features", description: "Blackboard + force-release.", requiredApprovals: 1 }),
+  }).then((r) => r.json());
+
+  const transport = new StreamableHTTPClientTransport(new URL(instance.mcpUrl), {
+    requestInit: { headers: { Authorization: `Bearer ${instance.store.token}` } },
+  });
+  const client = new Client({ name: "devteam-hive-test", version: "1.0.0" });
+  await client.connect(transport);
+  t.after(() => client.close());
+
+  const connected = await client.callTool({ name: "devteam_connect", arguments: { name: "Worker", provider: "test" } });
+  const agentId = connected.structuredContent.agent.id;
+
+  // Shared memory writes and reads back over MCP with provenance.
+  await client.callTool({ name: "devteam_note_set", arguments: { agentId, taskId: task.id, key: "world", value: "goal: ship it" } });
+  const got = await client.callTool({ name: "devteam_note_get", arguments: { agentId, taskId: task.id, key: "world" } });
+  assert.equal(got.structuredContent.value, "goal: ship it");
+  assert.equal(got.structuredContent.version, 1);
+
+  // Claim the planner assignment, then delegate a write assignment and claim it to hold a lease.
+  await client.callTool({ name: "devteam_wait", arguments: { agentId, timeoutSeconds: 2 } });
+  const plannerId = instance.store.taskDetail(task.id).assignments.find((a) => a.role === "planner").id;
+  await client.callTool({ name: "devteam_report", arguments: { agentId, assignmentId: plannerId, message: "Planned." } });
+  const write = instance.store.createAssignment({ taskId: task.id, title: "Do the write", description: "Edit files.", requiresWrite: true, targetAgentName: "Worker" });
+  const claimed = await client.callTool({ name: "devteam_wait", arguments: { agentId, timeoutSeconds: 2 } });
+  assert.equal(claimed.structuredContent.assignment.id, write.id);
+  assert.ok(claimed.structuredContent.assignment.claimToken, "the claim carries a fencing token");
+
+  // Wrong title is refused; the exact title force-releases the lease back to the queue.
+  const wrong = await fetch(`${instance.url}/api/assignments/${write.id}/force-release`, {
+    method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${instance.store.token}` }, body: JSON.stringify({ confirmTitle: "nope" }),
+  });
+  assert.equal(wrong.status, 400);
+  const released = await fetch(`${instance.url}/api/assignments/${write.id}/force-release`, {
+    method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${instance.store.token}` }, body: JSON.stringify({ confirmTitle: "Do the write" }),
+  });
+  assert.equal(released.status, 200);
+  assert.equal((await released.json()).released, true);
+  assert.equal(instance.store.taskDetail(task.id).assignments.find((a) => a.id === write.id).status, "queued");
 });

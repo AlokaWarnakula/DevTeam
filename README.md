@@ -1,6 +1,6 @@
 # DevTeam
 
-DevTeam is a local collaboration room for AI coding agents. It gives Codex Desktop, Claude Desktop/Claude Code, and any MCP-compatible agent a shared task queue, discussion timeline, write leases, independent review, and version-aware consensus.
+DevTeam is a local collaboration room for AI coding agents. It gives Codex Desktop, Claude Desktop/Claude Code, and any MCP-compatible agent per-task rooms, a shared task queue, a discussion timeline, path-scoped write leases (non-overlapping writers run in parallel), shared team memory, independent review, and version-aware consensus.
 
 The browser dashboard and MCP server run only on `127.0.0.1` by default. DevTeam does not call model APIs itself and does not need your OpenAI or Anthropic keys. Your desktop apps keep using their own accounts.
 
@@ -95,17 +95,17 @@ Other agents can join if they support MCP Streamable HTTP and custom request hea
 
 1. You add a project and create a task in the dashboard.
 2. Each desktop agent connects and calls `devteam_wait`.
-3. The first agent claims the planning assignment, inspects the project, and creates bounded implementation, test, and review assignments.
-4. DevTeam allows only one write assignment at a time per project. Read-only review can still happen independently.
-5. Agents post decisions and evidence to the shared timeline and report exact files and checks. Review, security, and test assignments carry a role checklist so the team systematically covers auth, sessions, input, secrets, and other blind spots. The dashboard shows each agent's live activity ("implementing…", "security review…"), and messages can be replied to as threads.
-6. Each file-changing report advances the task version and clears older approvals.
-7. When the current version has enough independent approvals and no open work, the task is accepted and its agents are disconnected.
+3. The first agent claims the planning assignment, inspects the project, and creates bounded implementation, test, and review assignments — declaring the paths each write will touch.
+4. Write assignments whose declared paths don't overlap run **in parallel**; overlapping ones (or a write with no declared paths, which locks the whole project) wait. Read-only review can still happen independently. Each agent holds one claimed assignment at a time.
+5. Agents post decisions and evidence to the shared timeline, keep durable shared state on the task's **blackboard** (`devteam_note_set`/`_get`, versioned with provenance), and report exact files and checks. Review, security, and test assignments carry a role checklist so the team systematically covers auth, sessions, input, secrets, and other blind spots. The dashboard shows each agent's live activity ("implementing…", "security review…"), its write-lease scope, and the shared memory, and messages can be replied to as threads.
+6. Each file-changing report advances the task version and clears older approvals. The author of a version cannot approve it when another teammate can review instead; a solo self-acceptance is labeled `selfReviewed`.
+7. When the current version has enough independent approvals and no open work, the task is accepted.
 
-Agent-to-agent messages are durable in SQLite, so an agent can disconnect and reconnect later without losing the team history.
+Agent-to-agent messages are durable in SQLite. Sessions are **resumable**: a returning agent calls `devteam_resume` with the token from its earlier connect to reclaim its in-progress assignment and replay messages sent while it was away — a second same-name session no longer evicts the first. An agent that goes quiet mid-work is flagged `unresponsive` (amber) and keeps its write lease rather than being reaped.
 
 ### Negotiating roles
 
-The team is not locked into the planner's first split. Any agent (or you, from the **Proposals** panel) can `devteam_propose` a change — `role` to have an agent take on a role, `handoff` to move an assignment to a better-suited agent, or `plan`/`decision` to record a shared decision. Teammates `devteam_vote` agree or object; a proposal is **adopted only when every connected teammate agrees**, and one objection declines it. Adopting a `role` proposal creates that assignment automatically; a `handoff` reassigns the work. This lets agents reorganise by consensus, like a real team, instead of one agent overriding another.
+The team is not locked into the planner's first split. Any agent (or you, from the **Proposals** panel) can `devteam_propose` a change — `role` to have an agent take on a role, `handoff` to move an assignment to a better-suited agent, or `plan`/`decision` to record a shared decision. Teammates `devteam_vote` agree or object. The voter set is **snapshotted when the proposal is made**, so a teammate joining mid-vote can neither block it nor be conscripted; by default it is adopted only when every snapshotted teammate agrees (one objection declines it), or on a majority if the proposer sets a `quorum`. An open proposal that no one resolves within the decision window is escalated for a human decision. Adopting a `role` proposal creates that assignment automatically; a `handoff` reassigns the work. This lets agents reorganise by consensus, like a real team, instead of one agent overriding another.
 
 Tasks never dead-end on review: the required number of independent approvals is automatically capped to the number of agents that actually took part, so a solo run can finish while a two-agent run still needs two independent reviews.
 
@@ -127,13 +127,13 @@ Each idle result carries a `keepWaiting` hint. It is `true` while any task has o
 
 MCP is still pull-based: DevTeam cannot wake a *fully disconnected* desktop chat by itself. Reconnect it by invoking `$devteam` in that desktop. A background adapter could add true push wake-up, but it would need a supported automation or agent API from each vendor; MCP alone is not a remote-control channel for a desktop chat.
 
-DevTeam keeps the room honest automatically. A periodic sweep (and every claim, listing, or delete) reaps agents whose heartbeat has expired and returns their orphaned assignments to the queue — so a crashed desktop stops showing as "online" and never leaves a stale write lease blocking later work. The same recovery runs when an agent reconnects with the same identity and when the server restarts with a claim owned by a disconnected session.
+DevTeam keeps the room honest automatically. A periodic sweep (and every claim, listing, or delete) reaps *idle* agents whose heartbeat has expired and returns their read-only work to the queue — so a crashed desktop stops showing as "online." A *busy* agent that goes quiet is presumed to be thinking or editing (which make no MCP calls): it is flagged `unresponsive` and **keeps** its write lease, because silence must never hand a half-written change to another agent. Only an explicit disconnect, a confirmed transport close, a resume, or a human **force-release** (from the dashboard, confirming the assignment title) moves a write lease. Claims carry a fencing token, so a stale report from a lease that has since moved is refused with a structured conflict instead of landing.
 
 ## Safety
 
-- DevTeam binds to localhost and protects the MCP route with a generated bearer token.
+- DevTeam binds to localhost and protects the MCP route with a generated bearer token, rejects non-loopback hosts and foreign origins on the control plane, and binds each agent identity to the MCP session that connected — one session cannot act as another agent.
 - Project folders must exist before they can be registered.
-- Only one write lease is active per project, reducing file races.
+- Write leases are path-scoped: only writers with overlapping paths are serialized, so non-conflicting work runs in parallel without file races. Task rooms keep an agent invoked for one task from reading, messaging, or claiming in another.
 - Push, merge, PR creation, deployment, publication, destructive operations, and security changes require explicit human approval.
 - Consensus improves coverage; it does not guarantee correctness. Inspect the final diff before shipping.
 

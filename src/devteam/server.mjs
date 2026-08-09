@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -40,8 +40,20 @@ export async function startDevTeamServer({
 
   const app = createMcpExpressApp({ host });
   const transports = new Map();
+  // A per-run secret for the browser dashboard's own session, so control-plane mutations require a
+  // real credential (this cookie, issued only to a loopback page load) or the MCP bearer token —
+  // not merely a same-origin request. Kept out of every routine API response.
+  const dashSecret = randomBytes(24).toString("base64url");
+  const parseCookies = (req) => Object.fromEntries(
+    String(req.headers.cookie || "").split(";").map((part) => part.trim()).filter(Boolean).map((part) => {
+      const eq = part.indexOf("=");
+      return eq === -1 ? [part, ""] : [part.slice(0, eq), decodeURIComponent(part.slice(eq + 1))];
+    }),
+  );
+  const hasDashSession = (req) => parseCookies(req).devteam_dash === dashSecret;
+  const hasBearer = (req) => req.get("authorization") === `Bearer ${store.token}`;
   const mcpAuth = (req, res, next) => {
-    if (req.get("authorization") !== `Bearer ${store.token}`) {
+    if (!hasBearer(req)) {
       return res.status(401).json({ error: "Invalid DevTeam token." });
     }
     next();
@@ -71,7 +83,23 @@ export async function startDevTeamServer({
     }
     next();
   };
+  // Hand the browser a dashboard session cookie on its (loopback) page load, so its later
+  // control-plane calls carry a credential without ever exposing the MCP bearer token in the page.
+  app.use((req, res, next) => {
+    if (req.method === "GET" && LOCAL_HOSTS.has(hostnameOf(req.headers.host)) && !hasDashSession(req)) {
+      res.setHeader("Set-Cookie", `devteam_dash=${dashSecret}; HttpOnly; SameSite=Strict; Path=/`);
+    }
+    next();
+  });
   app.use("/api", apiGuard);
+  // Every state-changing control-plane call must present the dashboard session or the bearer token.
+  // Read-only GETs stay open to the loopback dashboard (already origin/host-guarded above).
+  const MUTATING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+  const requireControlAuth = (req, res, next) => {
+    if (hasDashSession(req) || hasBearer(req)) return next();
+    return res.status(401).json({ error: "This action requires the DevTeam dashboard session or bearer token." });
+  };
+  app.use("/api", (req, res, next) => (MUTATING_METHODS.has(req.method) ? requireControlAuth(req, res, next) : next()));
 
   const mcpPost = asyncRoute(async (req, res) => {
     const sessionId = req.get("mcp-session-id");
@@ -113,9 +141,14 @@ export async function startDevTeamServer({
     version: "0.2.0",
     localOnly: host === "127.0.0.1" || host === "localhost",
     mcpUrl: `${req.protocol}://${req.get("host")}/mcp`,
-    token: store.token,
     idleWaitSeconds: 45,
     liveness: store.liveness,
+  }));
+  // The bearer token lives behind the dashboard session (or the token itself), never in the routine
+  // config that drives polling — so a stray GET can't harvest it.
+  app.get("/api/setup", requireControlAuth, (req, res) => res.json({
+    mcpUrl: `${req.protocol}://${req.get("host")}/mcp`,
+    token: store.token,
   }));
   app.get("/api/state", (req, res) => {
     const taskId = Object.hasOwn(req.query, "taskId") ? req.query.taskId || null : undefined;
@@ -153,6 +186,10 @@ export async function startDevTeamServer({
   app.post("/api/tasks/:taskId/block", (req, res) => {
     requireFields(req.body, ["reason"]);
     res.json(store.blockTask({ taskId: req.params.taskId, reason: req.body.reason }));
+  });
+  app.post("/api/assignments/:assignmentId/force-release", (req, res) => {
+    requireFields(req.body, ["confirmTitle"]);
+    res.json(store.forceReleaseAssignment({ assignmentId: req.params.assignmentId, confirmTitle: req.body.confirmTitle }));
   });
   app.post("/api/tasks/:taskId/proposals", (req, res) => {
     requireFields(req.body, ["summary"]);

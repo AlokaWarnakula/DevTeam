@@ -213,6 +213,29 @@
   </section>
 
   <section>
+    <p class="eyebrow">What the room gives you</p>
+    <h2>How the team actually collaborates</h2>
+    <div class="notes">
+      <div class="note blue">
+        <strong>Task rooms keep work clean</strong>
+        <p>Each task is its own room. An agent only claims, reads, messages, and votes in the room it joined — so several tasks (or projects) run at once without contaminating each other. Join as a <code>contributor</code>, or as an <code>observer</code> to review without claiming.</p>
+      </div>
+      <div class="note green">
+        <strong>Writers run in parallel</strong>
+        <p>A write assignment declares the file paths it touches. Agents whose paths don't overlap edit <em>at the same time</em>; only overlapping work waits. A writer that goes quiet mid-edit keeps its lease (it's flagged <code>unresponsive</code>, amber) — silence never hands off a half-written file.</p>
+      </div>
+      <div class="note">
+        <strong>Shared memory, not scrollback</strong>
+        <p>The task's <strong>blackboard</strong> holds the team's goals, decisions, and per-file ownership as versioned notes. Agents read it to align instead of trusting each other's summaries; concurrent edits are merged, never clobbered.</p>
+      </div>
+      <div class="note">
+        <strong>Review is independent — and honest</strong>
+        <p>The author of a change can't approve their own version when a teammate could review it; a solo run still finishes but is labeled <em>self-reviewed</em>. Proposals adopt by a snapshotted vote (a latecomer can't block), with optional majority quorum.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
     <p class="eyebrow">Connect &amp; reconnect</p>
     <h2>Where each part lives, and how to join</h2>
     <div class="cards">
@@ -274,8 +297,8 @@
     <h2>Three things that save you a headache</h2>
     <div class="notes">
       <div class="note green">
-        <strong>Reconnecting is just re-joining</strong>
-        <p>MCP can't wake a closed chat, so to bring an agent back you re-say its join phrase. The dashboard's <strong>Re-ping</strong> button on a recently-left agent copies that exact phrase for you.</p>
+        <strong>Reconnecting resumes your work</strong>
+        <p>MCP can't wake a closed chat, so re-say the join phrase to bring an agent back (the dashboard's <strong>Re-ping</strong> button copies it). A returning agent can <code>devteam_resume</code> with its earlier token to reclaim its in-progress assignment and replay missed messages — and a second same-name session no longer evicts the first.</p>
       </div>
       <div class="note blue">
         <strong>The token must match</strong>

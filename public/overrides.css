@@ -477,3 +477,115 @@
     opacity: 1;
   }
 }
+
+/* Unresponsive: present but silently busy — distinct from busy(amber) and waiting(green). */
+.agent-status.unresponsive {
+  color: #d98c3a;
+  background: #d98c3a;
+}
+.agent-status.unresponsive.fresh,
+.agent-status.unresponsive.stale {
+  opacity: 0.85;
+}
+
+/* Write-lease scope chip on assignments */
+.assignment .scope {
+  display: inline-block;
+  margin-top: 4px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-size: 10.5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--amber);
+  background: color-mix(in srgb, var(--amber) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--amber) 30%, transparent);
+}
+
+.mini.release {
+  margin-top: 8px;
+}
+.mini.release:hover {
+  border-color: color-mix(in srgb, var(--red) 55%, transparent);
+  background: color-mix(in srgb, var(--red) 14%, transparent);
+  color: var(--red);
+}
+
+/* Task-room membership */
+.room-members {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 8px;
+}
+.room-members .members-head {
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted, #8a94a6);
+  margin-bottom: 2px;
+}
+.member-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+}
+.member-row.gone { opacity: 0.5; }
+.member-name { font-weight: 600; }
+.member-role {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 5px;
+  color: var(--green, #7fe0a6);
+  background: color-mix(in srgb, var(--green, #7fe0a6) 14%, transparent);
+}
+.member-role.observer {
+  color: var(--blue, #91b9ff);
+  background: color-mix(in srgb, var(--blue, #91b9ff) 14%, transparent);
+}
+.member-status {
+  margin-left: auto;
+  font-size: 10.5px;
+  color: var(--muted, #8a94a6);
+}
+
+/* Shared blackboard */
+.blackboard-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.blackboard-list .note {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #10141a;
+  padding: 6px 10px;
+}
+.blackboard-list .note summary {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  cursor: pointer;
+  list-style: none;
+}
+.blackboard-list .note-key {
+  font-weight: 600;
+  color: var(--blue);
+}
+.blackboard-list .note-meta {
+  font-size: 10.5px;
+  color: var(--muted, #8a94a6);
+}
+.blackboard-list .note-body {
+  margin: 8px 0 2px;
+  padding: 8px;
+  border-radius: 6px;
+  background: #0b0e13;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11.5px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 220px;
+  overflow: auto;
+}

@@ -60,12 +60,26 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
     if (taskId) {
       try { room = store.joinTask(agent.id, taskId); } catch (error) { room = { joined: false, error: error.message }; }
     }
+    const { resumeToken, ...agentInfo } = agent;
     return {
       connected: true,
-      agent,
+      agent: agentInfo,
       room,
-      next: "Call devteam_wait with this agentId. If the server hosts more than one task, call devteam_join first so you only claim work in your task room.",
+      resumeToken,
+      next: "Call devteam_wait with this agentId. If the server hosts more than one task, call devteam_join first so you only claim work in your task room. Keep resumeToken privately: if this session drops and you reconnect, pass it to devteam_resume to reclaim this session's work and missed messages.",
     };
+  }));
+
+  server.registerTool("devteam_resume", {
+    title: "Resume a previous DevTeam session",
+    description: "After reconnecting, reclaim the work, task room, and missed messages of an earlier session using the resumeToken it returned. Use this when the same agent (e.g. the same desktop chat) comes back, instead of leaving its claimed assignment stuck.",
+    inputSchema: {
+      agentId: z.string().uuid().describe("The agentId from your *current* devteam_connect"),
+      resumeToken: z.string().min(1).max(200).describe("The resumeToken returned by the earlier session's devteam_connect"),
+    },
+  }, safe(async ({ agentId, resumeToken }) => {
+    requireIdentity(agentId);
+    return withInbox(agentId, store.resumeAgent({ agentId, resumeToken }));
   }));
 
   server.registerTool("devteam_join", {
@@ -118,13 +132,13 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
           status: "assigned",
           assignment,
           keepWaiting: true,
-          instructions: "Inspect the current project state before acting. Complete this bounded assignment, then call devteam_report. Use devteam_assign to delegate follow-up implementation, testing, or independent review.",
+          instructions: "Inspect the current project state before acting. Complete this bounded assignment, then call devteam_report — pass back assignment.claimToken so a stale report is fenced if your lease moved. Use devteam_assign to delegate follow-up implementation, testing, or independent review.",
         };
       }
       store.heartbeat(agentId, "waiting");
       await sleep(Math.min(750, Math.max(0, deadline - Date.now())));
     } while (Date.now() < deadline);
-    const activity = store.teamActivity();
+    const activity = store.teamActivityForAgent(agentId);
     return {
       status: "idle",
       keepWaiting: activity.active,
@@ -145,7 +159,8 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
   }, safe(async ({ agentId, taskId }) => {
     requireIdentity(agentId);
     store.heartbeat(agentId);
-    return withInbox(agentId, taskId ? store.taskDetail(taskId) : store.snapshot());
+    if (taskId) store.assertMembership(agentId, taskId);
+    return withInbox(agentId, taskId ? store.taskDetail(taskId) : store.snapshotForAgent(agentId));
   }));
 
   server.registerTool("devteam_message", {
@@ -199,6 +214,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
         description: z.string().max(4000).optional(),
         requiresWrite: z.boolean().optional(),
         assignmentId: z.string().uuid().optional().describe("For kind 'handoff': the assignment to move"),
+        quorum: z.number().min(0).max(1).optional().describe("Adoption threshold over the voters present when proposed: 1 (default) = unanimity, 0.5 = simple majority, e.g. 0.67 = two-thirds"),
       }).default({}),
     },
   }, safe(async ({ agentId, taskId, kind, summary, details }) => {
@@ -221,6 +237,39 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
     return withInbox(agentId, store.voteProposal({ agentId, proposalId, vote, comment }));
   }));
 
+  server.registerTool("devteam_note_set", {
+    title: "Write shared team memory",
+    description: "Write or update a key on the task's shared blackboard — the team's working memory for goals, decisions, facts, open questions, or per-file ownership. Read the current value first and pass its version as expectedVersion for a safe concurrent write; on a version mismatch the write is refused so you re-read and merge instead of clobbering a teammate. A structured world model is just JSON stored under one key (e.g. 'world').",
+    inputSchema: {
+      agentId: z.string().uuid(),
+      taskId: z.string().uuid(),
+      key: z.string().min(1).max(120).describe("e.g. 'world', 'decisions', 'open-questions', 'ownership'"),
+      value: z.string().min(0).max(100000).describe("The new content (plain text or a JSON string)"),
+      expectedVersion: z.number().int().min(0).optional().describe("The version you last read; omit only for a first write you know is uncontended"),
+    },
+  }, safe(async ({ agentId, taskId, key, value, expectedVersion }) => {
+    requireIdentity(agentId);
+    return withInbox(agentId, store.noteSet({ agentId, taskId, key, value, expectedVersion: expectedVersion ?? null }));
+  }));
+
+  server.registerTool("devteam_note_get", {
+    title: "Read shared team memory",
+    description: "Read the task's shared blackboard. Omit key to list every key with its version; pass a key to get its full value and version. Read shared memory at the start of your work instead of re-deriving context from scrollback.",
+    inputSchema: {
+      agentId: z.string().uuid(),
+      taskId: z.string().uuid(),
+      key: z.string().max(120).optional(),
+    },
+  }, safe(async ({ agentId, taskId, key }) => {
+    requireIdentity(agentId);
+    store.assertMembership(agentId, taskId);
+    if (key) {
+      const note = store.noteGet(taskId, key);
+      return withInbox(agentId, note || { key, value: null, version: 0, missing: true });
+    }
+    return withInbox(agentId, { keys: store.noteList(taskId) });
+  }));
+
   server.registerTool("devteam_report", {
     title: "Report completed work",
     description: "Complete the currently claimed assignment with evidence. Report exact files and checks; changed files advance the task version and invalidate prior approvals.",
@@ -232,6 +281,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
       changedFiles: z.array(z.string().max(500)).max(200).default([]),
       checks: z.array(z.string().max(500)).max(100).default([]),
       disconnectAfter: z.boolean().default(false),
+      claimToken: z.string().max(200).optional().describe("The claimToken from the assignment you claimed (or from devteam_resume). Lets the server fence a stale report if your lease has since moved."),
     },
   }, safe(async ({ disconnectAfter, ...args }) => {
     requireIdentity(args.agentId);
