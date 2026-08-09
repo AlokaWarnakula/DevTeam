@@ -33,7 +33,7 @@
           <h1 id="task-title">Bring your AI team together</h1>
           <p id="task-description">Create a task, connect agents through MCP, and watch the plan, implementation, tests, and review happen in one place.</p>
         </div>
-        <div class="header-actions"><span id="task-version" class="version">v1</span><button class="secondary" data-dialog="task-dialog">New task</button></div>
+        <div class="header-actions"><span id="task-version" class="version">v1</span><button id="toggle-description" class="secondary hidden" type="button" aria-expanded="false">More</button><button id="copy-task-invite" class="secondary" title="Copy a task-specific agent prompt">Invite agent</button><button class="secondary" data-dialog="task-dialog">New task</button></div>
       </header>
 
       <section id="empty-state" class="empty-state">
@@ -53,8 +53,10 @@
             </label>
           </div>
           <div id="reply-context" class="reply-context hidden"></div>
-          <textarea name="message" rows="1" placeholder="Message a connected agent or broadcast to the whole team…" required></textarea>
-          <div class="composer-footer"><span id="composer-hint">Delivered live to connected agents on their next check.</span><button class="send" title="Send message" aria-label="Send message">↑</button></div>
+          <button id="continue-work" type="button" class="continue-work hidden" aria-pressed="false"><span>↻</span><span><strong>Continue with new work</strong><small>Reopen this conversation and add a fresh planning assignment</small></span></button>
+          <textarea name="message" rows="1" placeholder="Message the team, or paste/drop an image or PDF…"></textarea>
+          <div id="attachment-preview" class="attachment-preview hidden" aria-live="polite"></div>
+          <div class="composer-footer"><span id="composer-hint">Delivered live to connected agents on their next check.</span><div class="composer-actions"><label class="attach-button" title="Attach images or PDFs"><span aria-hidden="true">＋</span><span class="sr-only">Attach images or PDFs</span><input id="attachment-input" type="file" accept="image/png,image/jpeg,image/gif,image/webp,application/pdf" multiple></label><button class="send" title="Send message" aria-label="Send message">↑</button></div></div>
         </form>
       </section>
     </main>
@@ -67,7 +69,7 @@
       <div class="divider"></div>
       <div id="proposal-section" class="proposal-section hidden">
         <div class="panel-title"><h3>Proposals</h3><button class="icon-button" id="new-proposal" data-dialog="proposal-dialog" title="Propose a role or decision to the team">＋</button></div>
-        <div id="proposal-list" class="proposal-list"></div>
+        <div id="proposal-list" class="proposal-list" aria-live="polite"></div>
         <div class="divider"></div>
       </div>
       <div class="panel-title"><h3>Work queue</h3><span id="assignment-count" class="count">0</span></div>

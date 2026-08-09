@@ -34,6 +34,7 @@ export class DevTeamStore extends EventEmitter {
       presenceMs: 120_000,        // quiet longer than this: a waiting agent is gone, a busy one is 'unresponsive'
       staleWorkMs: 900_000,       // quiet longer than this: a read-only claim may be safely recovered
       proposalTimeoutMs: 600_000, // open longer than this: escalate the proposal for a human decision
+      continuationWindowMs: 180_000, // after acceptance, keep the room "active" this long so members stay assembled for a same-conversation follow-up
       ...liveness,
     };
     this.#recoverOrphanedClaims("Recovered an orphaned assignment during server startup.");
@@ -412,7 +413,15 @@ export class DevTeamStore extends EventEmitter {
     `).get(...(scoped ? roomIds : [])).count);
     const busyAgents = Number(this.db.prepare(`SELECT COUNT(*) AS count FROM agents WHERE status = 'busy' ${busyFilter}`).get(...(scoped ? roomIds : [])).count);
     const waitingAgents = Number(this.db.prepare("SELECT COUNT(*) AS count FROM agents WHERE status = 'waiting'").get().count);
-    return { active: openWork > 0 || busyAgents > 0, openWork, busyAgents, waitingAgents };
+    // A task accepted moments ago keeps the room "active" for a short window, so its members stay
+    // assembled long enough to catch a same-conversation follow-up instead of being told to leave the
+    // instant consensus lands (which is what made "continue in the same chat" impossible before).
+    const continuationSince = new Date(Date.now() - this.liveness.continuationWindowMs).toISOString();
+    const acceptedFilter = scoped ? `AND id IN (${roomIds.map(() => "?").join(", ")})` : "";
+    const continuing = Number(this.db.prepare(`
+      SELECT COUNT(*) AS count FROM tasks WHERE status = 'accepted' AND updated_at >= ? ${acceptedFilter}
+    `).get(continuationSince, ...(scoped ? roomIds : [])).count);
+    return { active: openWork > 0 || busyAgents > 0 || continuing > 0, openWork, busyAgents, waitingAgents, continuing };
   }
 
   // Activity as seen from one agent's rooms, so a member of a quiet task isn't kept assembled by
@@ -580,11 +589,15 @@ export class DevTeamStore extends EventEmitter {
       for (const voterId of snapshotVoters) {
         this.db.prepare("INSERT OR IGNORE INTO proposal_voters (proposal_id, voter_id) VALUES (?, ?)").run(id, voterId);
       }
-      // The proposer implicitly agrees to their own proposal.
-      this.db.prepare(`
-        INSERT INTO proposal_votes (proposal_id, voter_id, voter_name, vote, comment, created_at)
-        VALUES (?, ?, ?, 'agree', NULL, ?)
-      `).run(id, agentId || "human", proposerName, stamp);
+      // An AGENT proposer implicitly agrees to its own proposal. A human proposer gets no implicit
+      // vote: the human decides with an explicit dashboard Agree/Object, and pre-seeding a "human
+      // agree" here would make that later click an idempotent no-op that never resolves the proposal.
+      if (agentId) {
+        this.db.prepare(`
+          INSERT INTO proposal_votes (proposal_id, voter_id, voter_name, vote, comment, created_at)
+          VALUES (?, ?, ?, 'agree', NULL, ?)
+        `).run(id, agentId, proposerName, stamp);
+      }
       this.#event(taskId, agentId, "proposal.created", summary.trim(), { proposalId: id, kind, details, requiredVoters: snapshotVoters.length, quorum: ratio });
     });
     this.#changed("proposal.created", taskId);
@@ -610,18 +623,33 @@ export class DevTeamStore extends EventEmitter {
     this.#transaction(() => {
       const proposal = this.db.prepare("SELECT * FROM proposals WHERE id = ?").get(proposalId);
       if (!proposal) throw new Error("Proposal not found.");
-      if (proposal.status !== "open") { outcome = { proposalId, status: proposal.status, alreadyResolved: true }; return; }
+      if (proposal.status !== "open") { outcome = { proposalId, taskId: proposal.task_id, status: proposal.status, alreadyResolved: true }; return; }
+      const voterId = agentId || "human";
       const stamp = now();
+      // Re-casting the identical vote records nothing new and emits no vote event, but we still
+      // re-evaluate: a decisive vote already on record — e.g. a legacy proposal pre-seeded with the
+      // human's implicit agree — must resolve exactly once instead of being frozen by a no-op. A vote
+      // that leaves it open is marked unchanged so it doesn't spam duplicate "vote" change signals.
+      const existing = this.db.prepare("SELECT vote FROM proposal_votes WHERE proposal_id = ? AND voter_id = ?").get(proposalId, voterId);
+      if (existing && existing.vote === vote) {
+        outcome = this.#evaluateProposal(proposal, stamp);
+        if (outcome.status === "open") outcome.unchanged = true;
+        return;
+      }
       this.db.prepare(`
         INSERT INTO proposal_votes (proposal_id, voter_id, voter_name, vote, comment, created_at)
         VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(proposal_id, voter_id) DO UPDATE SET vote = excluded.vote, comment = excluded.comment, created_at = excluded.created_at
-      `).run(proposalId, agentId || "human", voterName, vote, comment?.trim() || null, stamp);
+      `).run(proposalId, voterId, voterName, vote, comment?.trim() || null, stamp);
       this.#event(proposal.task_id, agentId, "proposal.vote", `${voterName} ${vote === "agree" ? "agreed to" : "objected to"}: ${proposal.summary}`, { proposalId, vote, comment: comment?.trim() || null });
       outcome = this.#evaluateProposal(proposal, stamp);
     });
     this.markMessagesSeen(agentId || "");
-    this.#changed(outcome?.status === "adopted" ? "proposal.adopted" : outcome?.status === "declined" ? "proposal.declined" : "proposal.vote", outcome?.taskId);
+    // A resolution always signals (even when reached by re-evaluating an identical decisive vote); a
+    // vote that merely stays open signals once, and a true no-op stays silent.
+    if (outcome?.status === "adopted") this.#changed("proposal.adopted", outcome.taskId);
+    else if (outcome?.status === "declined") this.#changed("proposal.declined", outcome.taskId);
+    else if (!outcome?.unchanged && !outcome?.alreadyResolved) this.#changed("proposal.vote", outcome?.taskId);
     return outcome;
   }
 
@@ -631,6 +659,20 @@ export class DevTeamStore extends EventEmitter {
     const votes = this.db.prepare("SELECT voter_id, vote FROM proposal_votes WHERE proposal_id = ?").all(proposal.id);
     // Decide against the voter set snapshotted at creation, not whoever is connected right now.
     const snapshot = this.db.prepare("SELECT voter_id FROM proposal_voters WHERE proposal_id = ?").all(proposal.id).map((r) => r.voter_id);
+    // The human is the room's owner: an explicit human vote is decisive and overrides agent consensus,
+    // so a dashboard Agree/Object actually resolves the proposal (agree adopts, object declines) rather
+    // than waiting on agent votes that may never come.
+    const humanVote = votes.find((v) => v.voter_id === "human");
+    if (humanVote && humanVote.vote === "agree") {
+      this.#adoptProposal(proposal, stamp);
+      this.db.prepare("UPDATE proposals SET status = 'adopted', resolved_at = ? WHERE id = ?").run(stamp, proposal.id);
+      return { proposalId: proposal.id, taskId: proposal.task_id, status: "adopted" };
+    }
+    if (humanVote && humanVote.vote === "object") {
+      this.db.prepare("UPDATE proposals SET status = 'declined', resolved_at = ? WHERE id = ?").run(stamp, proposal.id);
+      this.#event(proposal.task_id, null, "proposal.declined", `Proposal declined: ${proposal.summary}`, { proposalId: proposal.id });
+      return { proposalId: proposal.id, taskId: proposal.task_id, status: "declined" };
+    }
     const authoritative = new Set([...snapshot, "human"]); // late joiners can neither block nor carry a vote
     const objection = votes.find((v) => v.vote === "object" && authoritative.has(v.voter_id));
     if (objection) {
@@ -661,7 +703,13 @@ export class DevTeamStore extends EventEmitter {
       this.db.prepare("UPDATE proposals SET status = 'adopted', resolved_at = ? WHERE id = ?").run(stamp, proposal.id);
       return { proposalId: proposal.id, taskId: proposal.task_id, status: "adopted" };
     }
-    return { proposalId: proposal.id, taskId: proposal.task_id, status: "open", agreements, needed: ratio >= 1 ? snapshot.length : Math.max(1, Math.ceil(ratio * snapshot.length)) };
+    // Report what adoption actually needs *now*: for unanimity that is the snapshot voters still able
+    // to vote (a disconnected/unresponsive snapshot voter no longer counts), matching the adopt rule
+    // above — so the dashboard never shows "need 2" when only one reachable voter remains.
+    const needed = ratio >= 1
+      ? snapshot.filter((id) => this.#canVoteNow(id)).length
+      : Math.max(1, Math.ceil(ratio * snapshot.length));
+    return { proposalId: proposal.id, taskId: proposal.task_id, status: "open", agreements, needed };
   }
 
   // An agent can cast a vote right now only if it is connected and actually responsive — an
@@ -865,11 +913,26 @@ export class DevTeamStore extends EventEmitter {
     // work. A returning agent reclaims its old claim explicitly via resumeAgent (with the resume
     // token issued below); a truly gone session is cleaned up by transport-close or the reaper.
     const resumeToken = randomBytes(24).toString("base64url");
+    // A returning identity that reconnects within this window inherits its prior session's read floor
+    // (below) so it still sees what it missed while away; older sessions are left as history.
+    const RECONNECT_REPLAY_MS = 6 * 60 * 60 * 1000;
     this.#transaction(() => {
       this.db.prepare(`
         INSERT INTO agents (id, name, provider, capabilities, status, connected_at, last_seen, resume_token_hash)
         VALUES (?, ?, ?, ?, 'waiting', ?, ?, ?)
       `).run(id, cleanName, cleanProvider, json(capabilities), stamp, stamp, this.#hashToken(resumeToken));
+      // A returning identity (same name+provider) that recently disconnected should still see what it
+      // missed while away, even on a plain reconnect that carries no resume token. Inherit that prior
+      // session's read floor — never its claim or write lease — so the backlog of directed/broadcast
+      // messages replays on this session's next inbox check instead of being silently lost.
+      const prior = this.db.prepare(`
+        SELECT connected_at, message_floor, disconnected_at FROM agents
+        WHERE name = ? AND provider = ? AND id != ? AND status = 'disconnected' AND disconnected_at IS NOT NULL
+        ORDER BY disconnected_at DESC LIMIT 1
+      `).get(cleanName, cleanProvider, id);
+      if (prior && Date.parse(prior.disconnected_at) >= Date.now() - RECONNECT_REPLAY_MS) {
+        this.db.prepare("UPDATE agents SET message_floor = ? WHERE id = ?").run(prior.message_floor || prior.connected_at, id);
+      }
       // Pin implicit single-task membership now, while it is unambiguous, so a later second
       // task can't silently orphan this agent out of its room.
       const activeTasks = this.db.prepare(`
@@ -1143,12 +1206,32 @@ export class DevTeamStore extends EventEmitter {
     // An agent only claims work inside task rooms it belongs to *as a contributor* (observers
     // never claim). This prevents an agent invoked for one project/task from silently claiming
     // another's work, and stops an observer from taking on execution it only joined to watch.
-    const rooms = this.#claimableTaskIds(agentId);
-    if (!rooms.length) {
+    // Rooms this agent may claim in: its own contributor rooms, plus any active task where a queued
+    // assignment explicitly names it. A targeted assignment is an *invitation* — it lets the planner
+    // (or human) pull a specific agent into a new task's room without the agent having to devteam_join
+    // first, which is what makes a second task get picked up promptly instead of stalling until every
+    // other task is deleted. Untargeted work stays strictly room-scoped, so an agent invoked for one
+    // task is never silently conscripted into another it was not invited to.
+    const memberRooms = this.#claimableTaskIds(agentId);
+    const invitedRooms = this.db.prepare(`
+      SELECT DISTINCT a.task_id FROM assignments a
+      JOIN tasks t ON t.id = a.task_id
+      WHERE a.status = 'queued' AND a.target_agent_name IS NOT NULL
+        AND lower(a.target_agent_name) = lower(?)
+        AND t.status NOT IN ('accepted', 'blocked', 'cancelled')
+    `).all(agent.name).map((row) => row.task_id);
+    const claimRooms = [...new Set([...memberRooms, ...invitedRooms])];
+    if (!claimRooms.length) {
       this.db.prepare("UPDATE agents SET status = CASE WHEN status = 'busy' THEN status ELSE 'waiting' END, last_seen = ? WHERE id = ?").run(now(), agentId);
       return null;
     }
-    const roomPlaceholders = rooms.map(() => "?").join(", ");
+    const claimPlaceholders = claimRooms.map(() => "?").join(", ");
+    // In a room the agent already belongs to it may take targeted-or-untargeted work; in a room it
+    // only reached by invitation, it may take *only* the assignment(s) addressed to it by name.
+    const memberScopeClause = memberRooms.length
+      ? `(a.task_id IN (${memberRooms.map(() => "?").join(", ")}) OR lower(a.target_agent_name) = lower(?))`
+      : "lower(a.target_agent_name) = lower(?)";
+    const memberScopeParams = memberRooms.length ? [...memberRooms, agent.name] : [agent.name];
     const assignment = this.#transaction(() => {
       // Fetch the eligible queue (membership + targeting + review gating). The write lease is
       // no longer project-wide: we resolve it per path below so non-overlapping writers run
@@ -1160,9 +1243,10 @@ export class DevTeamStore extends EventEmitter {
         JOIN tasks t ON t.id = a.task_id
         JOIN projects p ON p.id = t.project_id
         WHERE a.status = 'queued'
-          AND a.task_id IN (${roomPlaceholders})
+          AND a.task_id IN (${claimPlaceholders})
           AND t.status NOT IN ('accepted', 'blocked', 'cancelled')
           AND (a.target_agent_name IS NULL OR lower(a.target_agent_name) = lower(?))
+          AND ${memberScopeClause}
           AND (
             lower(a.role) NOT IN ('reviewer', 'security-reviewer', 'tester') OR NOT EXISTS (
               SELECT 1 FROM assignments pending_write
@@ -1173,7 +1257,7 @@ export class DevTeamStore extends EventEmitter {
           )
         ORDER BY CASE WHEN a.target_agent_name IS NOT NULL THEN 0 ELSE 1 END, a.created_at ASC
         LIMIT 20
-      `).all(...rooms, agent.name);
+      `).all(...claimRooms, agent.name, ...memberScopeParams);
       if (!candidates.length) {
         this.db.prepare("UPDATE agents SET status = 'waiting', last_seen = ? WHERE id = ?").run(now(), agentId);
         return null;
@@ -1506,10 +1590,14 @@ export class DevTeamStore extends EventEmitter {
       if (accepted) {
         this.db.prepare("UPDATE tasks SET status = 'accepted', updated_at = ? WHERE id = ?").run(stamp, taskId);
         this.#event(taskId, null, "task.accepted", `${selfReviewed ? "Self-reviewed acceptance" : "Consensus reached"} for version ${task.version}.`, { approvalCount, requiredApprovals: effectiveRequired, selfReviewed });
+        // Keep the room's agents assembled (status 'waiting', membership intact) rather than force-
+        // disconnecting them on acceptance, so the human can send a same-conversation follow-up that
+        // continueTask reopens and the still-waiting agents pick up without restarting their sessions.
+        // The continuation window in teamActivity keeps them from idling out before that follow-up.
         this.db.prepare(`
-          UPDATE agents SET status = 'disconnected', current_task_id = NULL, disconnected_at = ?, last_seen = ?
-          WHERE current_task_id = ? OR id IN (SELECT agent_id FROM approvals WHERE task_id = ?)
-        `).run(stamp, stamp, taskId, taskId);
+          UPDATE agents SET status = 'waiting', current_task_id = NULL, last_seen = ?
+          WHERE (current_task_id = ? OR id IN (SELECT agent_id FROM approvals WHERE task_id = ?)) AND status != 'disconnected'
+        `).run(stamp, taskId, taskId);
       } else {
         this.db.prepare("UPDATE tasks SET status = 'review', updated_at = ? WHERE id = ?").run(stamp, taskId);
       }
@@ -1568,6 +1656,56 @@ export class DevTeamStore extends EventEmitter {
     });
     this.#changed("human.message", taskId);
     return { posted: true, eventId, target: targetKey };
+  }
+
+  // Same-conversation continuation: the human sends a follow-up into an existing task's chat and the
+  // work queue picks it up without anyone starting a new session. Posts the message, reopens an
+  // already-accepted task (new version, prior approvals cleared so a stale sign-off can't auto-accept
+  // the new work), and queues a planner assignment tied to the follow-up so the team re-splits. A
+  // blocked/cancelled task is not auto-reopened — that needs an explicit human unblock.
+  continueTask({ taskId, message, target = "all", replyTo = null, byAgentId = null }) {
+    if (byAgentId) this.assertMembership(byAgentId, taskId);
+    const task = this.getTask(taskId);
+    if (!task) throw new Error("Task not found.");
+    if (["blocked", "cancelled"].includes(task.status)) throw new Error(`Task is ${task.status}; unblock it before continuing.`);
+    const cleanMessage = String(message || "").trim();
+    if (!cleanMessage) throw new Error("A continuation message is required.");
+    const normalized = String(target || "all").trim() || "all";
+    const targetKey = normalized.toLowerCase();
+    const firstLine = cleanMessage.split("\n")[0].slice(0, 120) || "new request";
+    const stamp = now();
+    let result;
+    this.#transaction(() => {
+      const eventId = this.#event(taskId, null, "human.message", cleanMessage, {
+        target: targetKey,
+        targetLabel: targetKey === "all" ? "all agents" : normalized,
+        continuation: true,
+        ...(replyTo ? { replyTo: Number(replyTo) } : {}),
+      });
+      // A follow-up added once the work is settled (accepted, or under review awaiting sign-off) is
+      // new work: advance the version and drop that version's approvals so a stale approval can't
+      // carry over — even if the follow-up produces no changed-file report. Work still in flight
+      // ('active'/'planning') stays on the current version and just gains the new planning item.
+      const reopened = ["accepted", "review"].includes(task.status);
+      if (reopened) {
+        this.db.prepare("UPDATE tasks SET status = 'active', version = version + 1, updated_at = ? WHERE id = ?").run(stamp, taskId);
+        this.db.prepare("DELETE FROM approvals WHERE task_id = ?").run(taskId);
+      } else {
+        this.db.prepare("UPDATE tasks SET updated_at = ? WHERE id = ?").run(stamp, taskId);
+      }
+      const assignmentId = randomUUID();
+      const title = `Plan follow-up: ${firstLine}`;
+      this.db.prepare(`
+        INSERT INTO assignments (id, task_id, title, description, role, requires_write, target_agent_name, status, created_at)
+        VALUES (?, ?, ?, ?, 'planner', 0, NULL, 'queued', ?)
+      `).run(assignmentId, taskId, title, `Plan the follow-up requested in chat: "${firstLine}". Split it into implementation and review work as needed.`, stamp);
+      this.#event(taskId, byAgentId, "assignment.created", title, { assignmentId, role: "planner", requiresWrite: false, targetAgentName: null, continuesEvent: eventId });
+      this.#syncTaskStatus(taskId, stamp);
+      const version = this.db.prepare("SELECT version FROM tasks WHERE id = ?").get(taskId).version;
+      result = { taskId, eventId, reopened, version, assignmentId };
+    });
+    this.#changed("task.continued", taskId);
+    return result;
   }
 
   // --- Shared blackboard: a task-scoped, versioned key/document store that is the team's working

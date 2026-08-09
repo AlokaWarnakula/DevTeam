@@ -38,6 +38,15 @@ let selectedProjectId = null;
 let config = null;
 let eventLookup = new Map();
 let replyTo = null;
+let refreshGeneration = 0;
+let pendingAttachments = [];
+let proposalTaskId = null;
+let proposalStatuses = new Map();
+let renderedTaskId = null;
+let continuationMode = false;
+let descriptionExpanded = false;
+const ATTACHMENT_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf"]);
+const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 
 function syncTaskUrl() {
   const url = new URL(location.href);
@@ -59,10 +68,13 @@ function toast(message) {
 }
 
 async function refresh() {
+  const generation = ++refreshGeneration;
   const taskQuery = selectedTaskId
     ? `?taskId=${encodeURIComponent(selectedTaskId)}`
     : selectedProjectId ? "?taskId=" : "";
-  state = await api(`/api/state${taskQuery}`);
+  const nextState = await api(`/api/state${taskQuery}`);
+  if (generation !== refreshGeneration) return;
+  state = nextState;
   if (state.selectedTask) {
     selectedTaskId = state.selectedTask.id;
     selectedProjectId = state.selectedTask.project_id;
@@ -84,8 +96,10 @@ function render() {
 
   $("#empty-state").classList.toggle("hidden", Boolean(task));
   $("#conversation").classList.toggle("hidden", !task);
+  $("#copy-task-invite").classList.toggle("hidden", !task);
   $("#block-task").classList.toggle("hidden", !task || ["accepted", "blocked", "cancelled"].includes(task.status));
   if (task) renderTask(task);
+  else document.title = "DevTeam — Local AI collaboration";
   renderAgents();
 }
 
@@ -104,6 +118,7 @@ function deliveryLine(event) {
 const SYSTEM_EVENTS = ["task.created", "assignment.created", "task.accepted", "assignment.reassigned", "proposal.created", "proposal.adopted", "proposal.declined"];
 
 function renderEvent(event) {
+  if (event.type === "proposal.vote") return "";
   if (SYSTEM_EVENTS.includes(event.type)) {
     const icon = event.type === "proposal.adopted" ? "✓ " : event.type === "proposal.declined" ? "✕ " : event.type.startsWith("proposal") ? "⇄ " : "";
     return `<div class="system-event ${event.type.replace(".", "-")}">${icon}${escapeHtml(event.message)} <span class="provider">· ${time(event.created_at)}</span></div>`;
@@ -121,23 +136,54 @@ function renderEvent(event) {
   const quote = parent
     ? `<div class="reply-quote">↳ ${escapeHtml(parent.agent_id ? (parent.agent_name || "Agent") : "You")}: ${escapeHtml((parent.message || "").slice(0, 100))}</div>`
     : "";
-  return `<article class="event ${human ? "from-human" : ""}"><div class="avatar ${human ? "human" : ""}">${initials(name)}</div><div class="event-main"><div class="event-top"><span class="event-name">${escapeHtml(name)}</span><span class="provider">${escapeHtml(human ? "you" : event.agent_provider || event.type)}</span>${badge}<span class="event-time">${time(event.created_at)}</span><button class="reply-btn" data-reply="${event.id}" title="Reply to this message" aria-label="Reply">↩</button></div>${quote}<div class="event-body">${escapeHtml(event.message)}</div>${meta.length ? `<div class="event-meta">${meta.map((item) => `<span class="chip">${escapeHtml(item)}</span>`).join("")}</div>` : ""}${human ? deliveryLine(event) : ""}</div></article>`;
+  const parsed = parseAttachmentMarkers(event.message);
+  const body = parsed.message ? `<div class="event-body">${escapeHtml(parsed.message)}</div>` : "";
+  const attachments = parsed.attachments.length ? `<div class="message-attachments">${parsed.attachments.map(renderMessageAttachment).join("")}</div>` : "";
+  return `<article class="event ${human ? "from-human" : ""}"><div class="avatar ${human ? "human" : ""}">${initials(name)}</div><div class="event-main"><div class="event-top"><span class="event-name">${escapeHtml(name)}</span><span class="provider">${escapeHtml(human ? "you" : event.agent_provider || event.type)}</span>${badge}<span class="event-time">${time(event.created_at)}</span><button class="reply-btn" data-reply="${event.id}" title="Reply to this message" aria-label="Reply">↩</button></div>${quote}${body}${attachments}${meta.length ? `<div class="event-meta">${meta.map((item) => `<span class="chip">${escapeHtml(item)}</span>`).join("")}</div>` : ""}${human ? deliveryLine(event) : ""}</div></article>`;
+}
+
+function parseAttachmentMarkers(message) {
+  const attachments = [];
+  const visible = String(message || "").replace(/^\[\[devteam-attachment (.+)\]\]\s*$/gm, (line, payload) => {
+    try {
+      const attachment = JSON.parse(payload);
+      if (attachment && typeof attachment.path === "string" && typeof attachment.name === "string") attachments.push(attachment);
+    } catch { return line; }
+    return "";
+  }).trim();
+  return { message: visible, attachments };
+}
+
+function renderMessageAttachment(attachment) {
+  const previewUrl = String(attachment.previewUrl || "");
+  const localPreview = /^\/api\/tasks\/[0-9a-f-]+\/attachments\/[0-9a-f-]+\.(?:png|jpg|gif|webp|pdf)$/.test(previewUrl);
+  const image = String(attachment.mime || "").startsWith("image/") && localPreview
+    ? `<img src="${escapeHtml(previewUrl)}" alt="${escapeHtml(attachment.name)}" loading="lazy">`
+    : `<span class="attachment-type">PDF</span>`;
+  const open = localPreview ? `<a href="${escapeHtml(previewUrl)}" target="_blank" rel="noopener">Open</a>` : "";
+  return `<div class="message-attachment">${image}<div><strong>${escapeHtml(attachment.name)}</strong><code title="${escapeHtml(attachment.path)}">${escapeHtml(attachment.path)}</code>${open}</div></div>`;
 }
 
 function renderTask(task) {
+  const taskChanged = renderedTaskId !== task.id;
+  if (taskChanged) { continuationMode = false; descriptionExpanded = false; }
   $("#project-name").textContent = task.project_name;
   $("#task-status").textContent = task.status;
   $("#task-title").textContent = task.title;
-  $("#task-description").textContent = task.description;
+  renderTaskDescription(task.description);
   $("#task-version").textContent = `v${task.version}`;
-  const nearBottom = window.innerHeight + window.scrollY >= document.body.scrollHeight - 220;
+  const eventList = $("#event-list");
+  const nearBottom = taskChanged || eventList.scrollHeight - eventList.scrollTop - eventList.clientHeight < 220;
+  renderedTaskId = task.id;
   eventLookup = new Map(task.events.map((event) => [event.id, event]));
   if (replyTo && !eventLookup.has(replyTo.id)) { replyTo = null; }
   renderReplyContext();
-  $("#event-list").innerHTML = task.events.map(renderEvent).join("");
+  eventList.innerHTML = task.events.map(renderEvent).join("");
   renderMembers(task);
   renderProposals(task);
-  $("#assignment-count").textContent = task.assignments.filter((item) => ["queued", "claimed"].includes(item.status)).length;
+  const openAssignments = task.assignments.filter((item) => ["queued", "claimed"].includes(item.status)).length;
+  renderContinuationControl(task, openAssignments);
+  $("#assignment-count").textContent = openAssignments;
   $("#assignment-list").innerHTML = task.assignments.slice().reverse().slice(0, 8).map((item) => {
     const checklist = item.checklist && item.checklist.length
       ? `<details class="checklist"><summary>${item.checklist.length}-point checklist</summary><ul>${item.checklist.map((point) => `<li>${escapeHtml(point)}</li>`).join("")}</ul></details>`
@@ -163,7 +209,31 @@ function renderTask(task) {
     consensusCopy += ` Only ${connectedCount} agent${connectedCount === 1 ? "" : "s"} connected — connect ${remaining - connectedCount} more (each agent approves once) to reach consensus.`;
   }
   $("#consensus-copy").textContent = consensusCopy;
-  if (nearBottom) requestAnimationFrame(() => window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" }));
+  if (nearBottom) requestAnimationFrame(() => eventList.scrollTo({ top: eventList.scrollHeight, behavior: "smooth" }));
+}
+
+function renderTaskDescription(description) {
+  const element = $("#task-description");
+  const button = $("#toggle-description");
+  const long = String(description || "").length > 220 || String(description || "").split("\n").length > 3;
+  element.textContent = description;
+  element.classList.toggle("collapsed", long && !descriptionExpanded);
+  button.classList.toggle("hidden", !long);
+  button.textContent = descriptionExpanded ? "Less" : "More";
+  button.setAttribute("aria-expanded", String(descriptionExpanded));
+}
+
+function renderContinuationControl(task, openAssignments) {
+  const button = $("#continue-work");
+  const eligible = openAssignments === 0 && ["review", "accepted"].includes(task.status);
+  if (!eligible) continuationMode = false;
+  button.classList.toggle("hidden", !eligible);
+  button.classList.toggle("active", continuationMode);
+  button.setAttribute("aria-pressed", String(continuationMode));
+  const field = $("#message-form").elements.message;
+  field.placeholder = continuationMode
+    ? "Describe the next work for this same task conversation…"
+    : "Message the team, or paste/drop an image or PDF…";
 }
 
 // Who belongs to this task room and in what role — so the human can see the room's membership,
@@ -212,17 +282,42 @@ function renderProposals(task) {
   const section = $("#proposal-section");
   const active = !["accepted", "blocked", "cancelled"].includes(task.status);
   section.classList.toggle("hidden", !active);
-  if (!active) return;
+  if (!active) {
+    document.title = `DevTeam — ${task.title}`;
+    proposalTaskId = task.id;
+    proposalStatuses = new Map((task.proposals || []).map((proposal) => [proposal.id, proposal.status]));
+    return;
+  }
   const open = (task.proposals || []).filter((proposal) => proposal.status === "open");
+  const sameTask = proposalTaskId === task.id;
+  const newlyOpen = sameTask ? open.filter((proposal) => !proposalStatuses.has(proposal.id)) : [];
+  const newlyAdopted = sameTask ? (task.proposals || []).filter((proposal) => proposal.status === "adopted" && proposalStatuses.get(proposal.id) === "open") : [];
+  proposalTaskId = task.id;
+  proposalStatuses = new Map((task.proposals || []).map((proposal) => [proposal.id, proposal.status]));
   const connectedNames = state.agents.filter((agent) => agent.status !== "disconnected").map((agent) => agent.name);
   $("#proposal-list").innerHTML = open.length
     ? open.map((proposal) => renderProposal(proposal, connectedNames)).join("")
     : `<p class="hint">No open proposals. Use ＋ to propose a role or decision.</p>`;
+  document.title = open.length ? `(${open.length}) DevTeam — ${task.title}` : `DevTeam — ${task.title}`;
+  if (newlyOpen.length) {
+    section.classList.add("attention");
+    navigator.vibrate?.([90, 45, 90]);
+    toast(`${newlyOpen.length} new proposal${newlyOpen.length === 1 ? "" : "s"} needs attention`);
+    setTimeout(() => section.classList.remove("attention"), 1800);
+  }
+  if (newlyAdopted.length) {
+    navigator.vibrate?.(70);
+    toast(`Accepted: ${newlyAdopted[0].summary}`);
+  }
 }
 
 function renderProposal(proposal, connectedNames) {
   const agreers = proposal.votes.filter((vote) => vote.vote === "agree").map((vote) => vote.voter_name);
   const objectors = proposal.votes.filter((vote) => vote.vote === "object");
+  // A dashboard-created proposal historically stored the human proposer's implicit agreement as
+  // voter_id=human. That is not an explicit button vote, so keep actions available for those legacy
+  // rows; agent-created proposals may still show the human's explicit pending vote.
+  const humanVote = proposal.proposer_id ? proposal.votes.find((vote) => vote.voter_id === "human") : null;
   const stillNeeded = connectedNames.filter((name) => name !== proposal.proposer_name && !agreers.includes(name));
   const tally = objectors.length
     ? `<span class="vote-objection">objected: ${escapeHtml(objectors[0].voter_name)}</span>`
@@ -230,7 +325,10 @@ function renderProposal(proposal, connectedNames) {
   const label = proposal.kind === "role" && proposal.details.role
     ? `${escapeHtml(proposal.details.role)}${proposal.details.targetAgentName ? ` → ${escapeHtml(proposal.details.targetAgentName)}` : ""}`
     : escapeHtml(proposal.kind);
-  return `<div class="proposal"><div class="proposal-top"><strong>${escapeHtml(proposal.summary)}</strong><span class="role">${label}</span></div><div class="proposal-meta">from ${escapeHtml(proposal.proposer_name)} · ${tally}</div><div class="proposal-actions"><button class="mini agree" data-vote-proposal="${proposal.id}" data-vote="agree">Agree</button><button class="mini object" data-vote-proposal="${proposal.id}" data-vote="object">Object</button></div></div>`;
+  const actions = humanVote
+    ? `<div class="proposal-human-vote">Your vote: ${humanVote.vote === "agree" ? "Agree" : "Object"} · waiting for resolution</div>`
+    : `<div class="proposal-actions"><button class="mini agree" data-vote-proposal="${proposal.id}" data-vote="agree">Agree</button><button class="mini object" data-vote-proposal="${proposal.id}" data-vote="object">Object</button></div>`;
+  return `<div class="proposal"><div class="proposal-top"><strong>${escapeHtml(proposal.summary)}</strong><span class="role">${label}</span></div><div class="proposal-meta">from ${escapeHtml(proposal.proposer_name)} · ${tally}</div>${actions}</div>`;
 }
 
 // Presence + unread badges + re-ping list. Split out so a lightweight timer can
@@ -261,6 +359,45 @@ function renderReconnectList() {
     : "";
 }
 
+function agentInvite(name = "your agent") {
+  const task = state?.selectedTask;
+  if (!task) return "Use $devteam to join the local DevTeam.";
+  return `Use $devteam as ${name} and join task "${task.title}" with taskId ${task.id}. If this is a returning session, resume the prior DevTeam session so missed messages replay before claiming work.`;
+}
+
+function addAttachments(files) {
+  for (const file of files) {
+    if (!ATTACHMENT_TYPES.has(file.type)) { toast(`${file.name}: unsupported file type`); continue; }
+    if (!file.size || file.size > MAX_ATTACHMENT_BYTES) { toast(`${file.name}: file must be 10 MB or smaller`); continue; }
+    if (pendingAttachments.length >= 6) { toast("Attach up to 6 files per message"); break; }
+    pendingAttachments.push({ id: crypto.randomUUID(), file, objectUrl: file.type.startsWith("image/") ? URL.createObjectURL(file) : null });
+  }
+  renderPendingAttachments();
+}
+
+function renderPendingAttachments() {
+  const container = $("#attachment-preview");
+  container.classList.toggle("hidden", pendingAttachments.length === 0);
+  container.innerHTML = pendingAttachments.map((item) => `<div class="pending-attachment">${item.objectUrl ? `<img src="${escapeHtml(item.objectUrl)}" alt="">` : `<span>PDF</span>`}<strong title="${escapeHtml(item.file.name)}">${escapeHtml(item.file.name)}</strong><button type="button" data-remove-attachment="${item.id}" aria-label="Remove ${escapeHtml(item.file.name)}">×</button></div>`).join("");
+}
+
+function clearPendingAttachments() {
+  for (const item of pendingAttachments) if (item.objectUrl) URL.revokeObjectURL(item.objectUrl);
+  pendingAttachments = [];
+  renderPendingAttachments();
+}
+
+async function uploadAttachment(file, taskId) {
+  const response = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/attachments`, {
+    method: "POST",
+    headers: { "Content-Type": "application/octet-stream", "X-File-Name": encodeURIComponent(file.name), "X-File-Type": file.type },
+    body: file,
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body.error || `Attachment upload failed (${response.status})`);
+  return body;
+}
+
 function populateMessageTargets(connected) {
   const select = $("#message-target");
   if (select) {
@@ -277,6 +414,16 @@ function populateMessageTargets(connected) {
 }
 
 document.addEventListener("click", async (event) => {
+  const removeAttachment = event.target.closest("[data-remove-attachment]");
+  if (removeAttachment) {
+    const index = pendingAttachments.findIndex((item) => item.id === removeAttachment.dataset.removeAttachment);
+    if (index >= 0) {
+      const [removed] = pendingAttachments.splice(index, 1);
+      if (removed.objectUrl) URL.revokeObjectURL(removed.objectUrl);
+      renderPendingAttachments();
+    }
+    return;
+  }
   const dialogButton = event.target.closest("[data-dialog]");
   if (dialogButton) $("#" + dialogButton.dataset.dialog).showModal();
   if (event.target.closest(".close")) event.target.closest("dialog").close();
@@ -334,22 +481,24 @@ document.addEventListener("click", async (event) => {
   }
   const voteButton = event.target.closest("[data-vote-proposal]");
   if (voteButton) {
+    const actions = voteButton.closest(".proposal-actions");
+    for (const button of actions.querySelectorAll("button")) button.disabled = true;
     try { await api(`/api/proposals/${voteButton.dataset.voteProposal}/vote`, { method: "POST", body: JSON.stringify({ vote: voteButton.dataset.vote }) }); await refresh(); }
-    catch (error) { toast(error.message); }
+    catch (error) { for (const button of actions.querySelectorAll("button")) button.disabled = false; toast(error.message); }
     return;
   }
   const reconnectButton = event.target.closest("[data-reconnect]");
   if (reconnectButton) {
     const name = reconnectButton.dataset.reconnect;
-    const promptText = `Use $devteam and rejoin as ${name}.`;
+    const promptText = agentInvite(name);
     try { await navigator.clipboard.writeText(promptText); toast(`Copied — paste into ${name}'s desktop to reconnect`); }
     catch { toast(`Paste into ${name}'s desktop: ${promptText}`); }
     return;
   }
   const taskButton = event.target.closest("[data-task]");
-  if (taskButton) { selectedTaskId = taskButton.dataset.task; syncTaskUrl(); await refresh(); }
+  if (taskButton) { clearPendingAttachments(); selectedTaskId = taskButton.dataset.task; syncTaskUrl(); await refresh(); }
   const projectButton = event.target.closest("[data-project]");
-  if (projectButton) { selectedProjectId = projectButton.dataset.project; const first = state.tasks.find((task) => task.project_id === selectedProjectId); selectedTaskId = first?.id || null; syncTaskUrl(); await refresh(); }
+  if (projectButton) { clearPendingAttachments(); selectedProjectId = projectButton.dataset.project; const first = state.tasks.find((task) => task.project_id === selectedProjectId); selectedTaskId = first?.id || null; syncTaskUrl(); await refresh(); }
 });
 
 $("#task-form").addEventListener("submit", async (event) => {
@@ -357,7 +506,7 @@ $("#task-form").addEventListener("submit", async (event) => {
   try {
     const values = Object.fromEntries(new FormData(event.target)); values.requiredApprovals = Number(values.requiredApprovals);
     const task = await api("/api/tasks", { method: "POST", body: JSON.stringify(values) });
-    selectedTaskId = task.id; selectedProjectId = task.project_id; event.target.reset(); event.target.closest("dialog").close(); await refresh(); toast("Task sent to the team");
+    selectedTaskId = task.id; selectedProjectId = task.project_id; event.target.reset(); event.target.closest("dialog").close(); await refresh(); toast("Task created — use Invite agent to start its room");
   } catch (error) { toast(error.message); }
 });
 
@@ -373,9 +522,26 @@ $("#message-form").addEventListener("submit", async (event) => {
   event.preventDefault(); if (!selectedTaskId) return;
   const field = event.target.elements.message;
   const target = event.target.elements.target?.value || "all";
-  const body = { message: field.value, target };
-  if (replyTo) body.replyTo = replyTo.id;
-  try { await api(`/api/tasks/${selectedTaskId}/messages`, { method: "POST", body: JSON.stringify(body) }); field.value = ""; replyTo = null; renderReplyContext(); await refresh(); } catch (error) { toast(error.message); }
+  const message = field.value.trim();
+  const taskId = selectedTaskId;
+  if (!message && pendingAttachments.length === 0) { toast("Write a message or attach a file"); return; }
+  const sendButton = event.target.querySelector(".send");
+  sendButton.disabled = true;
+  try {
+    const uploaded = await Promise.all(pendingAttachments.map((item) => uploadAttachment(item.file, taskId)));
+    const markers = uploaded.map((attachment) => `[[devteam-attachment ${JSON.stringify(attachment)}]]`);
+    const body = { message: [message, ...markers].filter(Boolean).join("\n"), target };
+    if (replyTo) body.replyTo = replyTo.id;
+    if (continuationMode) body.continueTask = true;
+    await api(`/api/tasks/${taskId}/messages`, { method: "POST", body: JSON.stringify(body) });
+    field.value = "";
+    clearPendingAttachments();
+    replyTo = null;
+    continuationMode = false;
+    renderReplyContext();
+    await refresh();
+  } catch (error) { toast(error.message); }
+  finally { sendButton.disabled = false; }
 });
 
 $("#message-form").addEventListener("keydown", (event) => {
@@ -384,6 +550,33 @@ $("#message-form").addEventListener("keydown", (event) => {
     event.target.form.requestSubmit();
   }
 });
+
+$("#attachment-input").addEventListener("change", (event) => {
+  addAttachments(event.target.files || []);
+  event.target.value = "";
+});
+
+$("#continue-work").addEventListener("click", () => {
+  continuationMode = !continuationMode;
+  const task = state?.selectedTask;
+  if (task) renderContinuationControl(task, task.assignments.filter((item) => ["queued", "claimed"].includes(item.status)).length);
+  $("#message-form").elements.message.focus();
+});
+
+$("#message-form").addEventListener("paste", (event) => {
+  const files = [...(event.clipboardData?.files || [])];
+  if (files.length) { event.preventDefault(); addAttachments(files); }
+});
+
+for (const type of ["dragenter", "dragover"]) {
+  $("#message-form").addEventListener(type, (event) => { event.preventDefault(); event.currentTarget.classList.add("dragging"); });
+}
+for (const type of ["dragleave", "drop"]) {
+  $("#message-form").addEventListener(type, (event) => {
+    event.preventDefault(); event.currentTarget.classList.remove("dragging");
+    if (type === "drop") addAttachments(event.dataTransfer?.files || []);
+  });
+}
 
 $("#proposal-kind").addEventListener("change", (event) => {
   $("#role-fields").classList.toggle("hidden", event.target.value !== "role");
@@ -416,6 +609,16 @@ $("#copy-setup").addEventListener("click", async () => {
     const setup = `DevTeam MCP\nURL: ${mcpUrl}\nAuthorization: Bearer ${token}\n\nCodex config.toml:\n[mcp_servers.devteam]\nurl = "${mcpUrl}"\nhttp_headers = { Authorization = "Bearer ${token}" }\ntool_timeout_sec = 60\n\nClaude JSON:\n{"mcpServers":{"devteam":{"type":"http","url":"${mcpUrl}","headers":{"Authorization":"Bearer ${token}"}}}}`;
     await navigator.clipboard.writeText(setup); toast("Desktop MCP setup copied");
   } catch (error) { toast(error.message); }
+});
+
+$("#copy-task-invite").addEventListener("click", async () => {
+  try { await navigator.clipboard.writeText(agentInvite()); toast("Task-specific agent invite copied"); }
+  catch { toast(agentInvite()); }
+});
+
+$("#toggle-description").addEventListener("click", () => {
+  descriptionExpanded = !descriptionExpanded;
+  if (state?.selectedTask) renderTaskDescription(state.selectedTask.description);
 });
 
 async function boot() {

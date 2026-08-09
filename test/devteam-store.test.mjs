@@ -44,7 +44,7 @@ test("DevTeam coordinates plan, write lease, review, versioning, and consensus",
   const secondApproval = store.approveTask({ agentId: reviewerB.id, taskId: task.id, summary: "Approved version 2." });
   assert.equal(secondApproval.accepted, true);
   assert.equal(store.getTask(task.id).status, "accepted");
-  assert.equal(store.getAgent(reviewerA.id).status, "disconnected");
+  assert.equal(store.getAgent(reviewerA.id).status, "waiting", "accepted agents stay assembled for a same-conversation follow-up, not force-disconnected");
   assert.equal(store.taskDetail(task.id).events.at(-1).type, "task.accepted");
 });
 
@@ -838,4 +838,215 @@ test("opening an existing database repairs stale nonterminal task status", async
   const reopened = new DevTeamStore(dataDir);
   assert.equal(reopened.getTask(task.id).status, "active");
   reopened.close();
+});
+
+test("a targeted assignment invites an agent into a new task's room across a multi-task server", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-invite-"));
+  const store = new DevTeamStore(dataDir);
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const projectA = store.ensureProject("Project A", process.cwd());
+  const projectB = store.ensureProject("Project B", path.join(os.tmpdir(), "devteam-invite-b"));
+  store.createTask({ projectId: projectA.id, title: "Task A", description: "Work A." });
+  const taskB = store.createTask({ projectId: projectB.id, title: "Task B", description: "Work B." });
+  const claude = store.connectAgent({ name: "Claude", provider: "test" });
+  const bob = store.connectAgent({ name: "Bob", provider: "test" });
+
+  // With two active tasks and no join, neither agent has an implicit room: nothing is claimable.
+  assert.equal(store.claimNextAssignment(claude.id), null, "no invitation, no room, no claim");
+
+  // The human (control plane) targets a Task B assignment at Claude — an explicit invitation.
+  const invited = store.createAssignment({ taskId: taskB.id, title: "Do B", description: "Implement B.", targetAgentName: "Claude" });
+  const claimed = store.claimNextAssignment(claude.id);
+  assert.equal(claimed && claimed.id, invited.id, "the invited agent claims the targeted work across rooms");
+  assert.equal(claimed.task_id, taskB.id);
+  assert.equal(store.taskDetail(taskB.id).members.some((m) => m.agent_name === "Claude"), true, "the invitation auto-joined the room");
+
+  // Untargeted work (Task B's own planner assignment) is not reachable by an uninvited agent.
+  assert.equal(store.claimNextAssignment(bob.id), null, "an uninvited agent still cannot claim on a multi-task server");
+});
+
+test("a plain reconnect replays messages missed while the agent was disconnected", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-reconnect-replay-"));
+  const store = new DevTeamStore(dataDir);
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Reconnect project", process.cwd());
+  const task = store.createTask({ projectId: project.id, title: "Stay in sync", description: "Do not lose messages." });
+  const first = store.connectAgent({ name: "Claude", provider: "Anthropic" });
+  store.deliverDirectedMessages(first.id); // drain anything already waiting
+  store.disconnectAgent(first.id, "Desktop closed.");
+
+  // The human keeps talking to the (now absent) agent.
+  store.humanMessage(task.id, "Please pick this up when you return.", "all");
+
+  // A fresh session for the same identity reconnects — no resume token, plain devteam_connect.
+  const second = store.connectAgent({ name: "Claude", provider: "Anthropic" });
+  const inbox = store.deliverDirectedMessages(second.id);
+  assert.ok(inbox.some((m) => /pick this up/.test(m.message)), "the message sent while away replays on a plain reconnect");
+});
+
+test("an open unanimity vote reports only the voters still able to decide it", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-needed-"));
+  const store = new DevTeamStore(dataDir);
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Needed project", process.cwd());
+  const task = store.createTask({ projectId: project.id, title: "Count the voters", description: "Honest requirements." });
+  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI" });
+  const claude = store.connectAgent({ name: "Claude", provider: "Anthropic" });
+  const dave = store.connectAgent({ name: "Dave", provider: "test" });
+  const erin = store.connectAgent({ name: "Erin", provider: "test" });
+
+  const proposal = store.createProposal({ agentId: codex.id, taskId: task.id, kind: "decision", summary: "Decide together." });
+  // Erin was a snapshot voter but leaves before voting: it must no longer count toward the requirement.
+  store.disconnectAgent(erin.id, "left");
+  const outcome = store.voteProposal({ agentId: claude.id, proposalId: proposal.id, vote: "agree" });
+  assert.equal(outcome.status, "open", "still open until the remaining reachable voter agrees");
+  assert.equal(outcome.needed, 2, "needed counts only the snapshot voters still able to vote (Claude+Dave), not the departed Erin");
+  assert.equal(outcome.agreements, 1);
+  // Once the last reachable voter agrees it adopts — the departed voter cannot deadlock it.
+  assert.equal(store.voteProposal({ agentId: dave.id, proposalId: proposal.id, vote: "agree" }).status, "adopted");
+});
+
+test("continueTask reopens an accepted task, bumps the version, clears approvals, and re-queues planning", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-continue-"));
+  const store = new DevTeamStore(dataDir);
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Continue project", process.cwd());
+  const task = store.createTask({ projectId: project.id, title: "Ship then continue", description: "Same-conversation follow-up.", requiredApprovals: 1 });
+  const solo = store.connectAgent({ name: "Solo", provider: "test" });
+  const plan = store.claimNextAssignment(solo.id);
+  store.createAssignment({ agentId: solo.id, taskId: task.id, title: "Review", description: "Review v1.", role: "reviewer", targetAgentName: "Solo" });
+  store.completeAssignment({ agentId: solo.id, assignmentId: plan.id, message: "Planned." });
+  const review = store.claimNextAssignment(solo.id);
+  store.completeAssignment({ agentId: solo.id, assignmentId: review.id, message: "Reviewed." });
+  assert.equal(store.approveTask({ agentId: solo.id, taskId: task.id, summary: "Good." }).accepted, true);
+  assert.equal(store.getTask(task.id).status, "accepted");
+  assert.equal(store.getAgent(solo.id).status, "waiting", "the agent stays assembled after acceptance");
+  const acceptedVersion = store.getTask(task.id).version;
+
+  // The human continues in the same task's chat.
+  const cont = store.continueTask({ taskId: task.id, message: "Now also add dark mode." });
+  assert.equal(cont.reopened, true);
+  assert.equal(cont.version, acceptedVersion + 1, "reopening advances the version");
+  assert.equal(store.taskDetail(task.id).approvals.length, 0, "the accepted version's approvals are cleared");
+  assert.equal(store.getTask(task.id).status, "planning", "a fresh planner assignment reopens planning");
+  // The still-waiting agent claims the follow-up planner work without reconnecting.
+  const followup = store.claimNextAssignment(solo.id);
+  assert.equal(followup && followup.id, cont.assignmentId, "the assembled agent picks up the continuation");
+  assert.equal(followup.role, "planner");
+
+  // A blocked task is not auto-reopened by a continuation.
+  const blocked = store.createTask({ projectId: project.id, title: "Blocked", description: "Needs a human." });
+  store.blockTask({ taskId: blocked.id, reason: "waiting on a human decision" });
+  assert.throws(() => store.continueTask({ taskId: blocked.id, message: "keep going" }), /blocked/);
+});
+
+test("an accepted task keeps the room active within the continuation window, then goes quiet", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-contwindow-"));
+  const store = new DevTeamStore(dataDir, { liveness: { continuationWindowMs: 60_000 } });
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Window project", process.cwd());
+  const task = store.createTask({ projectId: project.id, title: "Stay a moment", description: "Continuation window.", requiredApprovals: 1 });
+  const solo = store.connectAgent({ name: "Solo", provider: "test" });
+  const plan = store.claimNextAssignment(solo.id);
+  store.createAssignment({ agentId: solo.id, taskId: task.id, title: "Review", description: "Review.", role: "reviewer", targetAgentName: "Solo" });
+  store.completeAssignment({ agentId: solo.id, assignmentId: plan.id, message: "Planned." });
+  const review = store.claimNextAssignment(solo.id);
+  store.completeAssignment({ agentId: solo.id, assignmentId: review.id, message: "Reviewed." });
+  store.approveTask({ agentId: solo.id, taskId: task.id, summary: "Good." });
+  assert.equal(store.getTask(task.id).status, "accepted");
+  assert.equal(store.teamActivity().active, true, "a just-accepted room stays assembled for the follow-up window");
+
+  // Push the acceptance outside the window: the room goes quiet.
+  store.db.prepare("UPDATE tasks SET updated_at = '2000-01-01T00:00:00.000Z' WHERE id = ?").run(task.id);
+  assert.equal(store.teamActivity().active, false, "past the window, an accepted task no longer keeps the room active");
+});
+
+test("a human Agree adopts a proposal outright; a human Object declines it", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-humanvote-"));
+  const store = new DevTeamStore(dataDir);
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Human vote project", process.cwd());
+  const task = store.createTask({ projectId: project.id, title: "Owner decides", description: "Human is authoritative." });
+  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI" });
+  const claude = store.connectAgent({ name: "Claude", provider: "Anthropic" });
+
+  // Without the human, adoption would wait on Claude; the human's own click decides it.
+  const p1 = store.createProposal({ agentId: codex.id, taskId: task.id, kind: "decision", summary: "Adopt plan A." });
+  assert.equal(store.voteProposal({ agentId: null, proposalId: p1.id, vote: "agree" }).status, "adopted", "the human's Agree is decisive");
+  const p2 = store.createProposal({ agentId: codex.id, taskId: task.id, kind: "decision", summary: "Adopt plan B." });
+  assert.equal(store.voteProposal({ agentId: null, proposalId: p2.id, vote: "object" }).status, "declined", "the human's Object is decisive");
+  assert.ok(claude, "the other agent never had to vote");
+});
+
+test("re-casting the same vote is idempotent and emits no duplicate events", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-idempotent-vote-"));
+  const store = new DevTeamStore(dataDir);
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Idempotent project", process.cwd());
+  const task = store.createTask({ projectId: project.id, title: "No spam", description: "Repeated clicks are safe." });
+  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI" });
+  const claude = store.connectAgent({ name: "Claude", provider: "Anthropic" });
+  const dave = store.connectAgent({ name: "Dave", provider: "test" });
+  const proposal = store.createProposal({ agentId: codex.id, taskId: task.id, kind: "decision", summary: "Adopt X." });
+  store.voteProposal({ agentId: claude.id, proposalId: proposal.id, vote: "agree" }); // stays open: Dave hasn't voted
+  const voteEvents = () => store.taskDetail(task.id).events.filter((e) => e.type === "proposal.vote" && e.agent_id === claude.id).length;
+  const before = voteEvents();
+  const repeat = store.voteProposal({ agentId: claude.id, proposalId: proposal.id, vote: "agree" });
+  assert.equal(repeat.unchanged, true, "a repeat identical vote is a no-op");
+  assert.equal(voteEvents(), before, "no duplicate vote event is recorded");
+  assert.ok(dave, "a third snapshot voter keeps the proposal open for the repeat");
+});
+
+test("a dashboard-created proposal has no implicit vote and is adopted once by an explicit human Agree", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-humanpropose-"));
+  const store = new DevTeamStore(dataDir);
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Human propose project", process.cwd());
+  const task = store.createTask({ projectId: project.id, title: "Human proposes", description: "Owner-authored proposal." });
+  store.connectAgent({ name: "Codex", provider: "OpenAI" }); // a teammate is present in the room
+  const proposal = store.createProposal({ agentId: null, taskId: task.id, kind: "decision", summary: "Human decision." });
+  assert.equal(store.getProposal(proposal.id).votes.length, 0, "a human-created proposal starts with no implicit vote");
+  assert.equal(store.voteProposal({ agentId: null, proposalId: proposal.id, vote: "agree" }).status, "adopted", "one explicit human Agree adopts it");
+  assert.equal(store.voteProposal({ agentId: null, proposalId: proposal.id, vote: "agree" }).alreadyResolved, true, "a repeat click after resolution is idempotent");
+});
+
+test("a legacy proposal already carrying the human's agree adopts on the next identical human Agree", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-legacy-humanvote-"));
+  const store = new DevTeamStore(dataDir);
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Legacy vote project", process.cwd());
+  const task = store.createTask({ projectId: project.id, title: "Legacy adopt", description: "Pre-seeded human vote." });
+  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI" });
+  const proposal = store.createProposal({ agentId: codex.id, taskId: task.id, kind: "decision", summary: "Legacy decision." });
+  // Simulate a legacy pre-seeded human agree recorded without triggering evaluation; still open.
+  store.db.prepare("INSERT OR REPLACE INTO proposal_votes (proposal_id, voter_id, voter_name, vote, comment, created_at) VALUES (?, 'human', 'You', 'agree', NULL, ?)").run(proposal.id, new Date().toISOString());
+  assert.equal(store.getProposal(proposal.id).status, "open", "the pre-seeded vote never resolved it");
+  assert.equal(store.voteProposal({ agentId: null, proposalId: proposal.id, vote: "agree" }).status, "adopted", "an identical human Agree re-evaluates and adopts the stuck proposal once");
+});
+
+test("continueTask during review advances the version and clears the in-progress approvals", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-continue-review-"));
+  const store = new DevTeamStore(dataDir);
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Continue-review project", process.cwd());
+  const task = store.createTask({ projectId: project.id, title: "Review then continue", description: "Follow-up mid-review.", requiredApprovals: 2 });
+  const planner = store.connectAgent({ name: "Planner", provider: "Codex" });
+  const reviewer = store.connectAgent({ name: "Reviewer", provider: "Claude" });
+  const plan = store.claimNextAssignment(planner.id);
+  store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Write", description: "Change a file.", role: "implementer", requiresWrite: true, targetAgentName: "Planner" });
+  store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Review", description: "Review.", role: "reviewer", targetAgentName: "Reviewer" });
+  store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Planned." });
+  const write = store.claimNextAssignment(planner.id);
+  store.completeAssignment({ agentId: planner.id, assignmentId: write.id, message: "Wrote it.", changedFiles: ["src/x.js"] });
+  const review = store.claimNextAssignment(reviewer.id);
+  store.completeAssignment({ agentId: reviewer.id, assignmentId: review.id, message: "Reviewed." });
+  assert.equal(store.approveTask({ agentId: reviewer.id, taskId: task.id, summary: "One of two." }).accepted, false);
+  assert.equal(store.getTask(task.id).status, "review");
+  assert.equal(store.taskDetail(task.id).approvals.length, 1, "a partial approval exists during review");
+  const versionBefore = store.getTask(task.id).version;
+
+  const cont = store.continueTask({ taskId: task.id, message: "Tweak the copy too." });
+  assert.equal(cont.reopened, true, "a follow-up during review reopens as new work");
+  assert.equal(cont.version, versionBefore + 1, "the version advances so the partial approval can't carry over");
+  assert.equal(store.taskDetail(task.id).approvals.length, 0, "the in-progress approval is cleared");
 });

@@ -1,5 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import express from "express";
@@ -11,6 +12,14 @@ import { createDevTeamMcpServer } from "./mcp.mjs";
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.resolve(moduleDir, "../../public");
+const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+const ATTACHMENT_TYPES = new Map([
+  ["image/png", { extension: ".png", matches: (body) => body.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) }],
+  ["image/jpeg", { extension: ".jpg", matches: (body) => body[0] === 0xff && body[1] === 0xd8 && body[2] === 0xff }],
+  ["image/gif", { extension: ".gif", matches: (body) => ["GIF87a", "GIF89a"].includes(body.subarray(0, 6).toString("ascii")) }],
+  ["image/webp", { extension: ".webp", matches: (body) => body.subarray(0, 4).toString("ascii") === "RIFF" && body.subarray(8, 12).toString("ascii") === "WEBP" }],
+  ["application/pdf", { extension: ".pdf", matches: (body) => body.subarray(0, 5).toString("ascii") === "%PDF-" }],
+]);
 
 const asyncRoute = (handler) => (req, res, next) => Promise.resolve(handler(req, res)).catch(next);
 
@@ -35,6 +44,7 @@ export async function startDevTeamServer({
 } = {}) {
   if (!dataDir) throw new Error("dataDir is required.");
   const store = new DevTeamStore(dataDir, { liveness });
+  const attachmentRoot = path.resolve(dataDir, "attachments");
   const root = requireDirectory(workspaceRoot);
   store.ensureProject(path.basename(root), root);
 
@@ -181,7 +191,49 @@ export async function startDevTeamServer({
   });
   app.post("/api/tasks/:taskId/messages", (req, res) => {
     requireFields(req.body, ["message"]);
-    res.status(201).json(store.humanMessage(req.params.taskId, req.body.message, req.body.target || "all", req.body.replyTo || null));
+    const input = { taskId: req.params.taskId, message: req.body.message, target: req.body.target || "all", replyTo: req.body.replyTo || null };
+    res.status(201).json(req.body.continueTask === true
+      ? store.continueTask(input)
+      : store.humanMessage(input.taskId, input.message, input.target, input.replyTo));
+  });
+  app.post("/api/tasks/:taskId/attachments", express.raw({ type: () => true, limit: MAX_ATTACHMENT_BYTES }), asyncRoute(async (req, res) => {
+    const task = store.getTask(req.params.taskId);
+    if (!task) return res.status(404).json({ error: "Task not found." });
+    const body = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+    if (!body.length) throw new Error("Attachment is empty.");
+    const declaredType = String(req.get("x-file-type") || "").toLowerCase();
+    const type = ATTACHMENT_TYPES.get(declaredType);
+    if (!type || !type.matches(body)) throw new Error("Only valid PNG, JPEG, GIF, WebP, and PDF files are accepted.");
+    let originalName = "attachment";
+    try { originalName = decodeURIComponent(req.get("x-file-name") || originalName); } catch { throw new Error("Attachment filename is invalid."); }
+    originalName = path.basename(originalName).replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, 160) || `attachment${type.extension}`;
+    const fileName = `${randomUUID()}${type.extension}`;
+    const taskDir = path.resolve(attachmentRoot, task.id);
+    if (path.dirname(taskDir) !== attachmentRoot) throw new Error("Attachment path is invalid.");
+    await mkdir(taskDir, { recursive: true });
+    const filePath = path.resolve(taskDir, fileName);
+    if (path.dirname(filePath) !== taskDir) throw new Error("Attachment path is invalid.");
+    await writeFile(filePath, body, { flag: "wx" });
+    res.status(201).json({
+      name: originalName,
+      mime: declaredType,
+      size: body.length,
+      path: filePath,
+      previewUrl: `/api/tasks/${task.id}/attachments/${fileName}`,
+    });
+  }));
+  app.get("/api/tasks/:taskId/attachments/:fileName", (req, res) => {
+    const task = store.getTask(req.params.taskId);
+    if (!task) return res.status(404).json({ error: "Task not found." });
+    const fileName = String(req.params.fileName || "");
+    if (!/^[0-9a-f-]+\.(?:png|jpg|gif|webp|pdf)$/.test(fileName)) return res.status(404).json({ error: "Attachment not found." });
+    const filePath = path.resolve(attachmentRoot, task.id, fileName);
+    const taskDir = path.resolve(attachmentRoot, task.id);
+    if (path.dirname(filePath) !== taskDir) return res.status(404).json({ error: "Attachment not found." });
+    res.set({ "X-Content-Type-Options": "nosniff", "Content-Security-Policy": "sandbox; default-src 'none'" });
+    res.sendFile(filePath, { dotfiles: "deny" }, (error) => {
+      if (error && !res.headersSent) res.status(error.statusCode || 404).json({ error: "Attachment not found." });
+    });
   });
   app.post("/api/tasks/:taskId/block", (req, res) => {
     requireFields(req.body, ["reason"]);

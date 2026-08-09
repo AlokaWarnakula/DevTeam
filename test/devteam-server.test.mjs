@@ -270,3 +270,75 @@ test("shared blackboard round-trips over MCP and a stuck write lease can be forc
   assert.equal((await released.json()).released, true);
   assert.equal(instance.store.taskDetail(task.id).assignments.find((a) => a.id === write.id).status, "queued");
 });
+
+test("task attachments validate content, size, paths, and serve safe previews", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-attachments-"));
+  const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd() });
+  t.after(async () => { await instance.close(); await rm(dataDir, { recursive: true, force: true }); });
+
+  const state = await fetch(`${instance.url}/api/state`).then((response) => response.json());
+  const auth = { authorization: `Bearer ${instance.store.token}` };
+  const task = await fetch(`${instance.url}/api/tasks`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...auth },
+    body: JSON.stringify({ projectId: state.projects[0].id, title: "Attach evidence", description: "Share an image safely." }),
+  }).then((response) => response.json());
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]);
+
+  const noCredential = await fetch(`${instance.url}/api/tasks/${task.id}/attachments`, {
+    method: "POST", headers: { "content-type": "application/octet-stream", "x-file-type": "image/png", "x-file-name": "image.png" }, body: png,
+  });
+  assert.equal(noCredential.status, 401);
+
+  const uploaded = await fetch(`${instance.url}/api/tasks/${task.id}/attachments`, {
+    method: "POST",
+    headers: { "content-type": "application/octet-stream", "x-file-type": "image/png", "x-file-name": encodeURIComponent("../evidence.png"), ...auth },
+    body: png,
+  });
+  assert.equal(uploaded.status, 201);
+  const attachment = await uploaded.json();
+  assert.equal(attachment.name, "evidence.png", "display names cannot retain traversal segments");
+  assert.equal(path.relative(path.join(dataDir, "attachments", task.id), attachment.path).startsWith(".."), false, "stored files stay in the task directory");
+  const preview = await fetch(`${instance.url}${attachment.previewUrl}`);
+  assert.equal(preview.status, 200);
+  assert.equal(preview.headers.get("x-content-type-options"), "nosniff");
+  assert.deepEqual(Buffer.from(await preview.arrayBuffer()), png);
+
+  const spoofed = await fetch(`${instance.url}/api/tasks/${task.id}/attachments`, {
+    method: "POST", headers: { "content-type": "application/octet-stream", "x-file-type": "application/pdf", "x-file-name": "fake.pdf", ...auth }, body: png,
+  });
+  assert.equal(spoofed.status, 400, "declared MIME must match the file signature");
+
+  const oversized = await fetch(`${instance.url}/api/tasks/${task.id}/attachments`, {
+    method: "POST", headers: { "content-type": "application/octet-stream", "x-file-type": "image/png", "x-file-name": "huge.png", ...auth }, body: Buffer.alloc(10 * 1024 * 1024 + 1, 0x89),
+  });
+  assert.equal(oversized.status, 400, "the per-file upload limit is enforced");
+});
+
+test("dashboard can continue completed work inside the same task conversation", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-continue-api-"));
+  const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd() });
+  t.after(async () => { await instance.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const state = await fetch(`${instance.url}/api/state`).then((response) => response.json());
+  const auth = { authorization: `Bearer ${instance.store.token}`, "content-type": "application/json" };
+  const task = await fetch(`${instance.url}/api/tasks`, {
+    method: "POST", headers: auth,
+    body: JSON.stringify({ projectId: state.projects[0].id, title: "Continue here", description: "Keep one conversation." }),
+  }).then((response) => response.json());
+  instance.store.db.prepare("UPDATE assignments SET status = 'done' WHERE task_id = ?").run(task.id);
+  instance.store.db.prepare("UPDATE tasks SET status = 'accepted' WHERE id = ?").run(task.id);
+
+  const response = await fetch(`${instance.url}/api/tasks/${task.id}/messages`, {
+    method: "POST", headers: auth,
+    body: JSON.stringify({ message: "Now add export support.", target: "all", continueTask: true }),
+  });
+  assert.equal(response.status, 201);
+  const continued = await response.json();
+  assert.equal(continued.taskId, task.id);
+  assert.equal(continued.reopened, true);
+  const detail = await fetch(`${instance.url}/api/tasks/${task.id}`).then((result) => result.json());
+  assert.equal(detail.status, "planning");
+  assert.equal(detail.version, 2);
+  assert.ok(detail.events.some((event) => event.message === "Now add export support."));
+  assert.ok(detail.assignments.some((assignment) => assignment.status === "queued" && assignment.role === "planner" && /follow-up/i.test(assignment.title)));
+});

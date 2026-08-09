@@ -40,8 +40,18 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
   // instead of only when it next goes idle.
   const withInbox = (agentId, result) => {
     let pendingMessages = [];
+    let pendingProposals = [];
     try { pendingMessages = store.deliverDirectedMessages(agentId); } catch { pendingMessages = []; }
-    return pendingMessages.length ? { ...result, pendingMessages } : result;
+    // Surface open proposals the same way, so a *busy* agent (not sitting in devteam_wait) is asked to
+    // vote on any call it makes instead of a unanimity decision silently stalling until it next goes
+    // idle. Only proposals in its rooms that it has not yet voted on are returned.
+    try { pendingProposals = store.openProposalsForAgent(store.getAgent(agentId)); } catch { pendingProposals = []; }
+    if (!pendingMessages.length && !pendingProposals.length) return result;
+    return {
+      ...result,
+      ...(pendingMessages.length ? { pendingMessages } : {}),
+      ...(pendingProposals.length ? { pendingProposals } : {}),
+    };
   };
 
   server.registerTool("devteam_connect", {
@@ -294,7 +304,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
 
   server.registerTool("devteam_approve", {
     title: "Approve current task version",
-    description: "Approve only after completing an independent read-only reviewer or tester assignment on the current version. Consensus accepts the task and disconnects its agents.",
+    description: "Approve only after completing an independent read-only reviewer or tester assignment on the current version. Consensus accepts the task and keeps its agents assembled briefly for a same-conversation follow-up instead of disconnecting them.",
     inputSchema: {
       agentId: z.string().uuid(),
       taskId: z.string().uuid(),
