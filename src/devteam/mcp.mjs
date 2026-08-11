@@ -71,12 +71,17 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
       try { room = store.joinTask(agent.id, taskId); } catch (error) { room = { joined: false, error: error.message }; }
     }
     const { resumeToken, ...agentInfo } = agent;
+    const roomStatus = store.roomStatusForAgent(agent.id);
+    const roomRequired = roomStatus.joinedTaskIds.length === 0 && roomStatus.activeTasks.length > 0;
     return {
       connected: true,
       agent: agentInfo,
       room,
+      ...(roomRequired ? { roomRequired: true, availableTasks: roomStatus.activeTasks } : {}),
       resumeToken,
-      next: "Call devteam_wait with this agentId. If the server hosts more than one task, call devteam_join first so you only claim work in your task room. Keep resumeToken privately: if this session drops and you reconnect, pass it to devteam_resume to reclaim this session's work and missed messages.",
+      next: roomRequired
+        ? "Choose the intended task from availableTasks and call devteam_join before devteam_wait. Keep resumeToken privately: if this session drops, pass it to devteam_resume."
+        : "Call devteam_wait with this agentId. Keep resumeToken privately: if this session drops and you reconnect, pass it to devteam_resume to reclaim this session's work and missed messages.",
     };
   }));
 
@@ -107,7 +112,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
 
   server.registerTool("devteam_wait", {
     title: "Wait for DevTeam work or messages",
-    description: "Block locally (no model tokens are spent while blocked) until DevTeam has an assignment or a human message for this agent. Returns early with status 'assigned' or 'message'; otherwise returns 'idle' after the timeout. Re-call it while keepWaiting is true to stay responsive; a full call costs only one model turn.",
+    description: "Block locally (no model tokens are spent while blocked) until DevTeam has an assignment or a human message for this agent. Returns 'room_required' immediately when a multi-task server needs an explicit devteam_join; otherwise returns early with status 'assigned' or 'message', or 'idle' after the timeout.",
     inputSchema: {
       agentId: z.string().uuid(),
       timeoutSeconds: z.number().int().min(1).max(50).default(45),
@@ -115,6 +120,16 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
   }, safe(async ({ agentId, timeoutSeconds }) => {
     requireIdentity(agentId);
     store.heartbeat(agentId, "waiting");
+    const initialRoomStatus = store.roomStatusForAgent(agentId);
+    if (initialRoomStatus.joinedTaskIds.length === 0 && initialRoomStatus.activeTasks.length > 0) {
+      return {
+        status: "room_required",
+        keepWaiting: false,
+        availableTasks: initialRoomStatus.activeTasks,
+        message: "This server has active work in multiple task rooms. Choose the intended taskId from availableTasks and call devteam_join before waiting.",
+        next: "Call devteam_join with this agentId, the intended taskId, and role contributor; then call devteam_wait again.",
+      };
+    }
     const deadline = Date.now() + timeoutSeconds * 1000;
     do {
       // Live human messages take priority: the user is actively trying to reach this agent.
@@ -173,6 +188,19 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
     return withInbox(agentId, taskId ? store.taskDetail(taskId) : store.snapshotForAgent(agentId));
   }));
 
+  server.registerTool("devteam_brief", {
+    title: "Read a compact task briefing",
+    description: "Read a bounded, membership-scoped briefing instead of the full task timeline: goal/version/project, your current assignment, open work and dependencies, task/project memory, open proposals, recent decisions/findings, and unresolved questions.",
+    inputSchema: {
+      agentId: z.string().uuid(),
+      taskId: z.string().uuid(),
+    },
+  }, safe(async ({ agentId, taskId }) => {
+    requireIdentity(agentId);
+    store.heartbeat(agentId);
+    return withInbox(agentId, store.taskBrief(agentId, taskId));
+  }));
+
   server.registerTool("devteam_message", {
     title: "Post a team message",
     description: "Post a focused progress note, design decision, review finding, or question. Omit target to post a timeline note the whole room can read; set target to a teammate's name to send a directed message that is pushed to them. Pass replyTo (a timeline event id from devteam_state) to answer a specific message as a thread.",
@@ -203,6 +231,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
       targetAgentName: z.string().max(80).optional(),
       checklist: z.array(z.string().max(300)).max(40).optional().describe("Points the assignee must address; overrides the default checklist for the role"),
       paths: z.array(z.string().max(500)).max(50).optional().describe("For write work: the file paths/prefixes this assignment will modify (e.g. src/ocean/**). Declaring them lets non-overlapping writers run in parallel; omit for an exclusive whole-project lease."),
+      dependsOn: z.array(z.string().uuid()).max(50).optional().describe("Existing same-task assignment IDs that must be done before this assignment can be claimed"),
     },
   }, safe(async (args) => {
     requireIdentity(args.agentId);
@@ -249,45 +278,63 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
 
   server.registerTool("devteam_note_set", {
     title: "Write shared team memory",
-    description: "Write or update a key on the task's shared blackboard — the team's working memory for goals, decisions, facts, open questions, or per-file ownership. Read the current value first and pass its version as expectedVersion for a safe concurrent write; on a version mismatch the write is refused so you re-read and merge instead of clobbering a teammate. A structured world model is just JSON stored under one key (e.g. 'world').",
+    description: "Write versioned shared memory. scope=task (default) belongs to this job; scope=project persists across every task in the same project. Project scope is inferred from the authorized taskId, never an arbitrary projectId. Re-read and merge on a version conflict.",
     inputSchema: {
       agentId: z.string().uuid(),
       taskId: z.string().uuid(),
+      scope: z.enum(["task", "project"]).default("task").describe("task for this job, project for durable memory shared by every task in the project"),
       key: z.string().min(1).max(120).describe("e.g. 'world', 'decisions', 'open-questions', 'ownership'"),
       value: z.string().min(0).max(100000).describe("The new content (plain text or a JSON string)"),
       expectedVersion: z.number().int().min(0).optional().describe("The version you last read; omit only for a first write you know is uncontended"),
     },
-  }, safe(async ({ agentId, taskId, key, value, expectedVersion }) => {
+  }, safe(async ({ agentId, taskId, scope, key, value, expectedVersion }) => {
     requireIdentity(agentId);
-    return withInbox(agentId, store.noteSet({ agentId, taskId, key, value, expectedVersion: expectedVersion ?? null }));
+    return withInbox(agentId, store.noteSet({ agentId, taskId, scope, key, value, expectedVersion: expectedVersion ?? null }));
   }));
 
   server.registerTool("devteam_note_get", {
     title: "Read shared team memory",
-    description: "Read the task's shared blackboard. Omit key to list every key with its version; pass a key to get its full value and version. Read shared memory at the start of your work instead of re-deriving context from scrollback.",
+    description: "Read versioned task or project memory. scope=task (default) is job-specific; scope=project persists across every task in the same project. Omit key to list keys; pass key for its full value and version.",
     inputSchema: {
       agentId: z.string().uuid(),
       taskId: z.string().uuid(),
+      scope: z.enum(["task", "project"]).default("task"),
       key: z.string().max(120).optional(),
     },
-  }, safe(async ({ agentId, taskId, key }) => {
+  }, safe(async ({ agentId, taskId, scope, key }) => {
     requireIdentity(agentId);
     store.assertMembership(agentId, taskId);
     if (key) {
-      const note = store.noteGet(taskId, key);
-      return withInbox(agentId, note || { key, value: null, version: 0, missing: true });
+      const note = store.noteGet(taskId, key, scope, agentId);
+      return withInbox(agentId, note || { scope, key, value: null, version: 0, missing: true });
     }
-    return withInbox(agentId, { keys: store.noteList(taskId) });
+    return withInbox(agentId, { scope, keys: store.noteList(taskId, scope, agentId) });
+  }));
+
+  server.registerTool("devteam_knowledge", {
+    title: "Search durable project knowledge",
+    description: "Search the automatic Obsidian-compatible project vault. DevTeam creates and refreshes it from completed assignments, adopted decisions, blockers, findings, and project memory; agents do not need to maintain it manually.",
+    inputSchema: {
+      agentId: z.string().uuid(),
+      taskId: z.string().uuid(),
+      query: z.string().max(500).default("").describe("Words, file path, component, or decision to find; empty returns the most relevant recent notes"),
+      category: z.enum(["architecture", "decisions", "components", "conventions", "pitfalls", "workflows", "archive"]).optional(),
+      status: z.enum(["verified", "inferred", "disputed", "stale", "archived"]).optional(),
+      limit: z.number().int().min(1).max(50).default(20),
+    },
+  }, safe(async (args) => {
+    requireIdentity(args.agentId);
+    return withInbox(args.agentId, store.knowledgeSearch(args));
   }));
 
   server.registerTool("devteam_report", {
     title: "Report completed work",
-    description: "Complete the currently claimed assignment with evidence. Report exact files and checks; changed files advance the task version and invalidate prior approvals.",
+    description: "Complete the currently claimed assignment with evidence. Report exact files and checks; changed files advance the task version and invalidate prior approvals. status=blocked closes only this assignment and queues planner triage; use devteam_block separately only for a genuine task-wide blocker.",
     inputSchema: {
       agentId: z.string().uuid(),
       assignmentId: z.string().uuid(),
       message: z.string().min(1).max(16000),
-      status: z.enum(["done", "blocked"]).default("done"),
+      status: z.enum(["done", "blocked"]).default("done").describe("blocked applies only to this assignment and queues planner triage; it does not stop the task"),
       changedFiles: z.array(z.string().max(500)).max(200).default([]),
       checks: z.array(z.string().max(500)).max(100).default([]),
       disconnectAfter: z.boolean().default(false),

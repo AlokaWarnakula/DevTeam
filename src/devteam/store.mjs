@@ -3,6 +3,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { mkdirSync, statSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { KnowledgeVault } from "./knowledge.mjs";
 
 const now = () => new Date().toISOString();
 const json = (value) => JSON.stringify(value ?? null);
@@ -15,7 +16,7 @@ const fromJson = (value, fallback = null) => {
 };
 
 export class DevTeamStore extends EventEmitter {
-  constructor(dataDir, { liveness = {} } = {}) {
+  constructor(dataDir, { liveness = {}, knowledge = {} } = {}) {
     super();
     this.dataDir = path.resolve(dataDir);
     mkdirSync(this.dataDir, { recursive: true });
@@ -23,6 +24,8 @@ export class DevTeamStore extends EventEmitter {
     this.db = new DatabaseSync(this.databasePath);
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
     this.#migrate();
+    this.knowledge = new KnowledgeVault(this.db, knowledge);
+    this.knowledgeErrors = new Map();
     this.token = this.#getOrCreateToken();
     // Presence and ownership are different questions. A *busy* agent that goes quiet is
     // presumed to still be working — reasoning and editing make no MCP calls — so it keeps
@@ -168,6 +171,12 @@ export class DevTeamStore extends EventEmitter {
         paths TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS assignment_dependencies (
+        assignment_id TEXT NOT NULL REFERENCES assignments(id) ON DELETE CASCADE,
+        depends_on_assignment_id TEXT NOT NULL REFERENCES assignments(id) ON DELETE CASCADE,
+        PRIMARY KEY (assignment_id, depends_on_assignment_id)
+      );
+
       CREATE TABLE IF NOT EXISTS blackboard (
         task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
         key TEXT NOT NULL,
@@ -177,6 +186,17 @@ export class DevTeamStore extends EventEmitter {
         updated_by_name TEXT,
         updated_at TEXT NOT NULL,
         PRIMARY KEY (task_id, key)
+      );
+
+      CREATE TABLE IF NOT EXISTS project_blackboard (
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        key TEXT NOT NULL,
+        value TEXT NOT NULL,
+        version INTEGER NOT NULL DEFAULT 1,
+        updated_by TEXT,
+        updated_by_name TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (project_id, key)
       );
 
       CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project_id, status);
@@ -244,6 +264,20 @@ export class DevTeamStore extends EventEmitter {
   }
 
   #changed(type, taskId = null) {
+    const knowledgeChanges = new Set([
+      "task.created", "task.continued", "task.accepted", "task.blocked", "task.unblocked",
+      "assignment.created", "assignment.completed", "assignment.blocked",
+      "proposal.adopted", "blackboard.updated", "agent.decision", "agent.finding", "human.message",
+    ]);
+    if (taskId && knowledgeChanges.has(type)) {
+      try {
+        this.knowledge.syncTask(taskId);
+        this.knowledgeErrors.delete(taskId);
+      } catch (error) {
+        this.knowledgeErrors.set(taskId, { message: error.message, at: now() });
+        this.emit("knowledge-error", { taskId, type, error });
+      }
+    }
     this.emit("change", { type, taskId, at: now() });
   }
 
@@ -789,10 +823,16 @@ export class DevTeamStore extends EventEmitter {
   ensureProject(name, root) {
     const normalizedRoot = path.resolve(root);
     const existing = this.db.prepare("SELECT * FROM projects WHERE root = ?").get(normalizedRoot);
-    if (existing) return existing;
+    if (existing) {
+      try { this.knowledge.initializeProject(existing.id); }
+      catch (error) { this.knowledgeErrors.set(`project:${existing.id}`, { message: error.message, at: now() }); }
+      return existing;
+    }
     const project = { id: randomUUID(), name: name.trim(), root: normalizedRoot, created_at: now() };
     this.db.prepare("INSERT INTO projects (id, name, root, created_at) VALUES (?, ?, ?, ?)")
       .run(project.id, project.name, project.root, project.created_at);
+    try { this.knowledge.initializeProject(project.id); }
+    catch (error) { this.knowledgeErrors.set(`project:${project.id}`, { message: error.message, at: now() }); }
     this.#changed("project.created");
     return project;
   }
@@ -1085,11 +1125,33 @@ export class DevTeamStore extends EventEmitter {
       LEFT JOIN assignments ca ON ca.agent_id = a.id AND ca.status = 'claimed'
       ORDER BY CASE a.status WHEN 'busy' THEN 0 WHEN 'waiting' THEN 1 ELSE 2 END, a.last_seen DESC
       LIMIT 50
-    `).all().map((row) => ({
-      ...row,
-      capabilities: fromJson(row.capabilities, []),
-      pending_messages: row.status === "disconnected" ? 0 : this.#pendingMessageCount(row),
-    }));
+    `).all().map((row) => {
+      // The resume token is hashed at rest, but the hash is still an authentication artifact and
+      // has no place in dashboard or MCP snapshots. Keep it inside the store just like getAgent().
+      const { resume_token_hash, ...safe } = row;
+      return {
+        ...safe,
+        capabilities: fromJson(row.capabilities, []),
+        pending_messages: row.status === "disconnected" ? 0 : this.#pendingMessageCount(row),
+      };
+    });
+  }
+
+  roomStatusForAgent(agentId) {
+    this.getAgent(agentId);
+    const joinedTaskIds = this.#memberTaskIds(agentId);
+    const activeTasks = this.listTasks()
+      .filter((task) => !["accepted", "blocked", "cancelled"].includes(task.status))
+      .map((task) => ({
+        id: task.id,
+        title: task.title,
+        projectId: task.project_id,
+        projectName: task.project_name,
+        status: task.status,
+        version: task.version,
+        openAssignments: task.open_assignments,
+      }));
+    return { joinedTaskIds, activeTasks };
   }
 
   // How many directed/broadcast messages (from the human or a teammate) this agent has not yet
@@ -1158,7 +1220,7 @@ export class DevTeamStore extends EventEmitter {
     return { released: true, assignmentId, taskId: assignment.task_id, requiresWrite: Boolean(assignment.requires_write) };
   }
 
-  createAssignment({ agentId = null, taskId, title, description, role = "implementer", requiresWrite = false, targetAgentName = null, checklist = undefined, paths = undefined }) {
+  createAssignment({ agentId = null, taskId, title, description, role = "implementer", requiresWrite = false, targetAgentName = null, checklist = undefined, paths = undefined, dependsOn = undefined }) {
     const task = this.getTask(taskId);
     if (!task) throw new Error("Task not found.");
     if (["accepted", "blocked", "cancelled"].includes(task.status)) throw new Error(`Task is already ${task.status}.`);
@@ -1173,6 +1235,15 @@ export class DevTeamStore extends EventEmitter {
     const writePaths = assignment.requiresWrite && Array.isArray(paths)
       ? [...new Set(paths.map((p) => String(p).trim()).filter(Boolean))].slice(0, 50)
       : [];
+    const dependencyIds = Array.isArray(dependsOn)
+      ? [...new Set(dependsOn.map((id) => String(id).trim()).filter(Boolean))].slice(0, 50)
+      : [];
+    if (dependencyIds.length) {
+      const placeholders = dependencyIds.map(() => "?").join(", ");
+      const dependencies = this.db.prepare(`SELECT id, task_id FROM assignments WHERE id IN (${placeholders})`).all(...dependencyIds);
+      if (dependencies.length !== dependencyIds.length) throw new Error("Every dependency must reference an existing assignment.");
+      if (dependencies.some((dependency) => dependency.task_id !== taskId)) throw new Error("Assignment dependencies must belong to the same task.");
+    }
     this.#transaction(() => {
       this.db.prepare(`
         INSERT INTO assignments (id, task_id, title, description, role, requires_write, target_agent_name, status, created_at)
@@ -1180,6 +1251,10 @@ export class DevTeamStore extends EventEmitter {
       `).run(assignment.id, taskId, assignment.title, assignment.description, assignment.role, assignment.requiresWrite, assignment.targetAgentName, assignment.createdAt);
       this.#storeChecklist(assignment.id, resolvedChecklist);
       if (writePaths.length) this.db.prepare("INSERT OR REPLACE INTO assignment_write_scopes (assignment_id, paths) VALUES (?, ?)").run(assignment.id, json(writePaths));
+      for (const dependencyId of dependencyIds) {
+        this.db.prepare("INSERT INTO assignment_dependencies (assignment_id, depends_on_assignment_id) VALUES (?, ?)")
+          .run(assignment.id, dependencyId);
+      }
       this.#syncTaskStatus(taskId);
       this.#event(taskId, agentId, "assignment.created", assignment.title, {
         assignmentId: assignment.id,
@@ -1188,10 +1263,11 @@ export class DevTeamStore extends EventEmitter {
         targetAgentName: assignment.targetAgentName,
         checklist: resolvedChecklist || [],
         writePaths,
+        dependsOn: dependencyIds,
       });
     });
     this.#changed("assignment.created", taskId);
-    return { ...this.db.prepare("SELECT * FROM assignments WHERE id = ?").get(assignment.id), checklist: resolvedChecklist || [], writePaths };
+    return { ...this.db.prepare("SELECT * FROM assignments WHERE id = ?").get(assignment.id), checklist: resolvedChecklist || [], writePaths, dependsOn: dependencyIds };
   }
 
   claimNextAssignment(agentId) {
@@ -1247,6 +1323,11 @@ export class DevTeamStore extends EventEmitter {
           AND t.status NOT IN ('accepted', 'blocked', 'cancelled')
           AND (a.target_agent_name IS NULL OR lower(a.target_agent_name) = lower(?))
           AND ${memberScopeClause}
+          AND NOT EXISTS (
+            SELECT 1 FROM assignment_dependencies dependency_link
+            JOIN assignments dependency ON dependency.id = dependency_link.depends_on_assignment_id
+            WHERE dependency_link.assignment_id = a.id AND dependency.status != 'done'
+          )
           AND (
             lower(a.role) NOT IN ('reviewer', 'security-reviewer', 'tester') OR NOT EXISTS (
               SELECT 1 FROM assignments pending_write
@@ -1298,7 +1379,8 @@ export class DevTeamStore extends EventEmitter {
           writeScope,
           claimGeneration,
         });
-        return { ...candidate, agent_id: agentId, status: "claimed", claimed_at: stamp, checklist: this.#checklistFor(candidate.id), writeScope, claimToken, claimGeneration };
+        const dependencies = this.#dependenciesFor(candidate.id);
+        return { ...candidate, agent_id: agentId, status: "claimed", claimed_at: stamp, checklist: this.#checklistFor(candidate.id), writeScope, dependsOn: dependencies.map((item) => item.id), blockedBy: [], claimToken, claimGeneration };
       }
       this.db.prepare("UPDATE agents SET status = 'waiting', last_seen = ? WHERE id = ?").run(now(), agentId);
       return null;
@@ -1396,6 +1478,16 @@ export class DevTeamStore extends EventEmitter {
     return normalized.length ? normalized : [""];
   }
 
+  #dependenciesFor(assignmentId) {
+    return this.db.prepare(`
+      SELECT dependency.id, dependency.title, dependency.status, dependency.role
+      FROM assignment_dependencies link
+      JOIN assignments dependency ON dependency.id = link.depends_on_assignment_id
+      WHERE link.assignment_id = ?
+      ORDER BY dependency.created_at ASC
+    `).all(assignmentId);
+  }
+
   postMessage({ agentId, taskId, message, type = "agent.message", metadata = {} }) {
     const agent = this.getAgent(agentId);
     const task = this.getTask(taskId);
@@ -1474,6 +1566,7 @@ export class DevTeamStore extends EventEmitter {
     const unverifiedFiles = this.#unverifiedChangedFiles(task?.project_root, cleanChanged);
     this.markMessagesSeen(agentId);
     let version;
+    let followUpAssignmentId = null;
     this.#transaction(() => {
       const stamp = now();
       this.db.prepare("UPDATE assignments SET status = ?, completed_at = ?, claim_token_hash = NULL WHERE id = ?")
@@ -1494,12 +1587,29 @@ export class DevTeamStore extends EventEmitter {
         ...(unverifiedFiles.length ? { unverifiedFiles } : {}),
       });
       if (status === "blocked") {
-        this.db.prepare("UPDATE tasks SET status = 'blocked', updated_at = ? WHERE id = ?").run(stamp, assignment.task_id);
+        // An assignment-level blocker is a triage signal, not permission to stop every teammate.
+        // Queue a fresh planner item so the team can re-scope or ask the human while sibling work
+        // and write leases continue. Only the explicit blockTask/devteam_block path is task-wide.
+        followUpAssignmentId = randomUUID();
         this.db.prepare(`
-          UPDATE assignments SET status = 'blocked', completed_at = COALESCE(completed_at, ?)
-          WHERE task_id = ? AND status IN ('queued', 'claimed')
-        `).run(stamp, assignment.task_id);
-        this.#standDownTaskAgents(assignment.task_id, stamp, "A blocker was reported; co-workers were released to other work.");
+          INSERT INTO assignments (id, task_id, title, description, role, requires_write, status, created_at)
+          VALUES (?, ?, ?, ?, 'planner', 0, 'queued', ?)
+        `).run(
+          followUpAssignmentId,
+          assignment.task_id,
+          `Resolve blocker: ${assignment.title}`,
+          `Review the blocker reported for "${assignment.title}": ${message.trim()}. Re-scope the work, create a replacement assignment, or use devteam_block only if the entire task genuinely requires human input.`,
+          stamp,
+        );
+        this.#event(assignment.task_id, agentId, "assignment.created", `Resolve blocker: ${assignment.title}`, {
+          assignmentId: followUpAssignmentId,
+          role: "planner",
+          requiresWrite: false,
+          blockedAssignmentId: assignment.id,
+        });
+        this.db.prepare("UPDATE agents SET status = 'waiting', current_task_id = NULL, last_seen = ? WHERE id = ?")
+          .run(stamp, agentId);
+        this.#syncTaskStatus(assignment.task_id, stamp);
       } else {
         const disconnect = nextStatus === "disconnected";
         this.db.prepare("UPDATE agents SET status = ?, current_task_id = NULL, last_seen = ?, disconnected_at = ? WHERE id = ?")
@@ -1507,8 +1617,18 @@ export class DevTeamStore extends EventEmitter {
         this.#syncTaskStatus(assignment.task_id, stamp);
       }
     });
-    this.#changed(status === "blocked" ? "task.blocked" : "assignment.completed", assignment.task_id);
-    return { completed: true, taskId: assignment.task_id, assignmentId, status, version, changedFiles: cleanChanged, checks: cleanChecks, agent: agent.name };
+    this.#changed(status === "blocked" ? "assignment.blocked" : "assignment.completed", assignment.task_id);
+    return {
+      completed: true,
+      taskId: assignment.task_id,
+      assignmentId,
+      status,
+      version,
+      changedFiles: cleanChanged,
+      checks: cleanChecks,
+      agent: agent.name,
+      ...(status === "blocked" ? { taskBlocked: false, followUpAssignmentId } : {}),
+    };
   }
 
   // No dead-ends: a task can never require more independent approvals than the number
@@ -1640,6 +1760,77 @@ export class DevTeamStore extends EventEmitter {
     return { blocked: true, taskId, reason: reason.trim() };
   }
 
+  unblockTask({ taskId, reason }) {
+    const task = this.getTask(taskId);
+    if (!task) throw new Error("Task not found.");
+    if (task.status !== "blocked") throw new Error("Only a blocked task can be resumed.");
+    const cleanReason = String(reason || "").trim();
+    if (!cleanReason) throw new Error("A resume reason is required.");
+    const stamp = now();
+    const assignmentId = randomUUID();
+    let version;
+    this.#transaction(() => {
+      this.db.prepare("UPDATE tasks SET status = 'planning', version = version + 1, updated_at = ? WHERE id = ?")
+        .run(stamp, taskId);
+      this.db.prepare("DELETE FROM approvals WHERE task_id = ?").run(taskId);
+      this.db.prepare(`
+        INSERT INTO assignments (id, task_id, title, description, role, requires_write, status, created_at)
+        VALUES (?, ?, 'Plan resumed task', ?, 'planner', 0, 'queued', ?)
+      `).run(assignmentId, taskId, `The human resumed this blocked task: ${cleanReason}. Inspect the current project state and create fresh implementation and review assignments; do not revive stale claims.`, stamp);
+      version = this.db.prepare("SELECT version FROM tasks WHERE id = ?").get(taskId).version;
+      this.#event(taskId, null, "task.unblocked", `Human resumed the task: ${cleanReason}`, { reason: cleanReason, version });
+      this.#event(taskId, null, "assignment.created", "Plan resumed task", {
+        assignmentId,
+        role: "planner",
+        requiresWrite: false,
+        resumed: true,
+      });
+    });
+    this.#changed("task.unblocked", taskId);
+    return { resumed: true, taskId, assignmentId, version, status: "planning" };
+  }
+
+  acceptTaskByHuman({ taskId, summary }) {
+    const task = this.getTask(taskId);
+    if (!task) throw new Error("Task not found.");
+    if (["blocked", "cancelled"].includes(task.status)) throw new Error(`Cannot accept a ${task.status} task.`);
+    if (task.status === "accepted") return { accepted: true, taskId, version: task.version, humanOverride: true };
+    if (task.status !== "review") throw new Error("Human acceptance is available only when the task is ready for review.");
+    const cleanSummary = String(summary || "").trim();
+    if (!cleanSummary) throw new Error("An acceptance summary is required.");
+    const openAssignments = Number(this.db.prepare(`
+      SELECT COUNT(*) AS count FROM assignments WHERE task_id = ? AND status IN ('queued', 'claimed')
+    `).get(taskId).count);
+    if (openAssignments) throw new Error("Finish or release all open assignments before accepting the task.");
+    const approvalCount = Number(this.db.prepare(`
+      SELECT COUNT(*) AS count FROM approvals WHERE task_id = ? AND version = ?
+    `).get(taskId, task.version).count);
+    const stamp = now();
+    this.#transaction(() => {
+      this.db.prepare("UPDATE tasks SET status = 'accepted', updated_at = ? WHERE id = ?").run(stamp, taskId);
+      this.#event(taskId, null, "task.accepted", `Human accepted version ${task.version}: ${cleanSummary}`, {
+        summary: cleanSummary,
+        version: task.version,
+        approvalCount,
+        requiredApprovals: task.required_approvals,
+        humanOverride: true,
+      });
+      this.db.prepare(`
+        UPDATE agents SET status = 'waiting', current_task_id = NULL, last_seen = ?
+        WHERE current_task_id = ? AND status != 'disconnected'
+      `).run(stamp, taskId);
+    });
+    this.#changed("task.accepted", taskId);
+    return {
+      accepted: true,
+      taskId,
+      version: task.version,
+      approvalCount,
+      requiredApprovals: task.required_approvals,
+      humanOverride: true,
+    };
+  }
+
   humanMessage(taskId, message, target = "all", replyTo = null) {
     const task = this.getTask(taskId);
     if (!task) throw new Error("Task not found.");
@@ -1714,9 +1905,17 @@ export class DevTeamStore extends EventEmitter {
   // optimistic concurrency (pass the version you read; a mismatch is reported, not silently
   // clobbered) and carry provenance. A structured "world" document is just the value under one key. ---
 
-  noteSet({ agentId = null, taskId, key, value, expectedVersion = null }) {
+  #noteScope(taskId, scope = "task") {
     const task = this.getTask(taskId);
     if (!task) throw new Error("Task not found.");
+    const cleanScope = scope === "project" ? "project" : "task";
+    return cleanScope === "project"
+      ? { scope: cleanScope, table: "project_blackboard", idColumn: "project_id", id: task.project_id }
+      : { scope: cleanScope, table: "blackboard", idColumn: "task_id", id: taskId };
+  }
+
+  noteSet({ agentId = null, taskId, key, value, expectedVersion = null, scope = "task" }) {
+    const target = this.#noteScope(taskId, scope);
     this.assertMembership(agentId, taskId);
     const cleanKey = String(key || "").trim();
     if (!cleanKey) throw new Error("A blackboard key is required.");
@@ -1726,34 +1925,49 @@ export class DevTeamStore extends EventEmitter {
     const stamp = now();
     let result;
     this.#transaction(() => {
-      const current = this.db.prepare("SELECT version FROM blackboard WHERE task_id = ? AND key = ?").get(taskId, cleanKey);
+      const current = this.db.prepare(`SELECT version FROM ${target.table} WHERE ${target.idColumn} = ? AND key = ?`).get(target.id, cleanKey);
       const currentVersion = current?.version || 0;
       if (expectedVersion !== null && Number(expectedVersion) !== currentVersion) {
-        result = { ok: false, conflict: true, key: cleanKey, expectedVersion: Number(expectedVersion), currentVersion, nextAction: "Re-read this key with devteam_note_get, merge your change onto the current value, and set it again with the version you just read." };
+        result = { ok: false, conflict: true, scope: target.scope, key: cleanKey, expectedVersion: Number(expectedVersion), currentVersion, nextAction: "Re-read this key with devteam_note_get using the same scope, merge your change onto the current value, and set it again with the version you just read." };
         return;
       }
       const nextVersion = currentVersion + 1;
       this.db.prepare(`
-        INSERT INTO blackboard (task_id, key, value, version, updated_by, updated_by_name, updated_at)
+        INSERT INTO ${target.table} (${target.idColumn}, key, value, version, updated_by, updated_by_name, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(task_id, key) DO UPDATE SET value = excluded.value, version = excluded.version, updated_by = excluded.updated_by, updated_by_name = excluded.updated_by_name, updated_at = excluded.updated_at
-      `).run(taskId, cleanKey, cleanValue, nextVersion, agentId, author?.name || "human", stamp);
-      this.#event(taskId, agentId, "blackboard.updated", `Blackboard "${cleanKey}" updated (v${nextVersion}).`, { key: cleanKey, version: nextVersion });
-      result = { ok: true, key: cleanKey, version: nextVersion, updatedBy: author?.name || "human", updatedAt: stamp };
+        ON CONFLICT(${target.idColumn}, key) DO UPDATE SET value = excluded.value, version = excluded.version, updated_by = excluded.updated_by, updated_by_name = excluded.updated_by_name, updated_at = excluded.updated_at
+      `).run(target.id, cleanKey, cleanValue, nextVersion, agentId, author?.name || "human", stamp);
+      this.#event(taskId, agentId, "blackboard.updated", `${target.scope === "project" ? "Project" : "Task"} memory "${cleanKey}" updated (v${nextVersion}).`, { scope: target.scope, key: cleanKey, version: nextVersion });
+      result = { ok: true, scope: target.scope, key: cleanKey, version: nextVersion, updatedBy: author?.name || "human", updatedAt: stamp };
     });
     if (result.ok) this.#changed("blackboard.updated", taskId);
     return result;
   }
 
-  noteGet(taskId, key) {
-    const row = this.db.prepare("SELECT * FROM blackboard WHERE task_id = ? AND key = ?").get(taskId, String(key || "").trim());
+  noteGet(taskId, key, scope = "task", agentId = null) {
+    const target = this.#noteScope(taskId, scope);
+    if (agentId) this.assertMembership(agentId, taskId);
+    const row = this.db.prepare(`SELECT * FROM ${target.table} WHERE ${target.idColumn} = ? AND key = ?`).get(target.id, String(key || "").trim());
     if (!row) return null;
-    return { key: row.key, value: row.value, version: row.version, updatedBy: row.updated_by_name, updatedAt: row.updated_at };
+    return { scope: target.scope, key: row.key, value: row.value, version: row.version, updatedBy: row.updated_by_name, updatedAt: row.updated_at };
   }
 
-  noteList(taskId) {
-    return this.db.prepare("SELECT key, version, updated_by_name, updated_at FROM blackboard WHERE task_id = ? ORDER BY key ASC").all(taskId)
-      .map((row) => ({ key: row.key, version: row.version, updatedBy: row.updated_by_name, updatedAt: row.updated_at }));
+  noteList(taskId, scope = "task", agentId = null) {
+    const target = this.#noteScope(taskId, scope);
+    if (agentId) this.assertMembership(agentId, taskId);
+    return this.db.prepare(`SELECT key, version, updated_by_name, updated_at FROM ${target.table} WHERE ${target.idColumn} = ? ORDER BY key ASC`).all(target.id)
+      .map((row) => ({ scope: target.scope, key: row.key, version: row.version, updatedBy: row.updated_by_name, updatedAt: row.updated_at }));
+  }
+
+  knowledgeSearch({ agentId = null, taskId, query = "", category = null, status = null, limit = 20 }) {
+    const task = this.getTask(taskId);
+    if (!task) throw new Error("Task not found.");
+    this.assertMembership(agentId, taskId);
+    return {
+      automated: this.knowledge.enabled,
+      vaultPath: path.join(task.project_root, "knowledge"),
+      notes: this.knowledge.search(task.project_id, taskId, { query, category, status, limit }),
+    };
   }
 
   taskDetail(taskId) {
@@ -1763,11 +1977,16 @@ export class DevTeamStore extends EventEmitter {
       SELECT a.*, ag.name AS agent_name, ag.provider AS agent_provider
       FROM assignments a LEFT JOIN agents ag ON ag.id = a.agent_id
       WHERE a.task_id = ? ORDER BY a.created_at ASC
-    `).all(taskId).map((assignment) => ({
-      ...assignment,
-      checklist: this.#checklistFor(assignment.id),
-      writeScope: assignment.requires_write ? this.#writeScopeFor(assignment.id) : [],
-    }));
+    `).all(taskId).map((assignment) => {
+      const dependencies = this.#dependenciesFor(assignment.id);
+      return {
+        ...assignment,
+        checklist: this.#checklistFor(assignment.id),
+        writeScope: assignment.requires_write ? this.#writeScopeFor(assignment.id) : [],
+        dependsOn: dependencies.map((item) => item.id),
+        blockedBy: dependencies.filter((item) => item.status !== "done"),
+      };
+    });
     const members = this.db.prepare(`
       SELECT m.role, ag.name AS agent_name, ag.provider AS agent_provider, ag.status
       FROM task_members m JOIN agents ag ON ag.id = m.agent_id
@@ -1803,8 +2022,82 @@ export class DevTeamStore extends EventEmitter {
     }
     const proposals = this.proposalsForTask(taskId);
     const blackboard = this.db.prepare("SELECT key, value, version, updated_by_name, updated_at FROM blackboard WHERE task_id = ? ORDER BY key ASC")
-      .all(taskId).map((row) => ({ key: row.key, value: row.value, version: row.version, updatedBy: row.updated_by_name, updatedAt: row.updated_at }));
-    return { ...task, assignments, approvals, events, proposals, blackboard, members };
+      .all(taskId).map((row) => ({ scope: "task", key: row.key, value: row.value, version: row.version, updatedBy: row.updated_by_name, updatedAt: row.updated_at }));
+    const projectBlackboard = this.db.prepare("SELECT key, value, version, updated_by_name, updated_at FROM project_blackboard WHERE project_id = ? ORDER BY key ASC")
+      .all(task.project_id).map((row) => ({ scope: "project", key: row.key, value: row.value, version: row.version, updatedBy: row.updated_by_name, updatedAt: row.updated_at }));
+    const knowledge = this.knowledge.list(task.project_id, { limit: 30 });
+    return {
+      ...task, assignments, approvals, events, proposals, blackboard, projectBlackboard, knowledge, members,
+      knowledgeVault: {
+        automated: this.knowledge.enabled,
+        path: path.join(task.project_root, "knowledge"),
+        noteCount: knowledge.length,
+        error: this.knowledgeErrors.get(taskId) || this.knowledgeErrors.get(`project:${task.project_id}`) || null,
+      },
+    };
+  }
+
+  taskBrief(agentId, taskId) {
+    this.getAgent(agentId);
+    this.assertMembership(agentId, taskId);
+    const detail = this.taskDetail(taskId);
+    if (!detail) throw new Error("Task not found.");
+    const clip = (value, max) => {
+      const text = String(value || "");
+      return text.length > max ? `${text.slice(0, max)}…` : text;
+    };
+    const summarizeNote = (note) => ({
+      scope: note.scope,
+      key: note.key,
+      value: clip(note.value, 2_000),
+      version: note.version,
+      updatedBy: note.updatedBy,
+      updatedAt: note.updatedAt,
+    });
+    const relevantTypes = new Set(["human.message", "agent.decision", "agent.finding", "task.blocked", "task.unblocked", "task.accepted"]);
+    const recent = detail.events.filter((event) => relevantTypes.has(event.type)).slice(-12).map((event) => ({
+      id: event.id,
+      type: event.type,
+      from: event.agent_name || "human",
+      message: clip(event.message, 800),
+      at: event.created_at,
+    }));
+    const repliedTo = new Set(detail.events.map((event) => Number(event.metadata?.replyTo || 0)).filter(Boolean));
+    const unresolvedQuestions = detail.events
+      .filter((event) => event.type === "agent.question" && !repliedTo.has(event.id))
+      .slice(-10)
+      .map((event) => ({ id: event.id, from: event.agent_name || "agent", message: clip(event.message, 800), at: event.created_at }));
+    const openAssignments = detail.assignments
+      .filter((assignment) => ["queued", "claimed"].includes(assignment.status))
+      .map((assignment) => ({
+        id: assignment.id,
+        title: assignment.title,
+        description: clip(assignment.description, 600),
+        role: assignment.role,
+        status: assignment.status,
+        agent: assignment.agent_name || null,
+        dependsOn: assignment.dependsOn,
+        blockedBy: assignment.blockedBy,
+      }));
+    const currentAssignment = openAssignments.find((assignment) => detail.assignments.find((item) => item.id === assignment.id)?.agent_id === agentId) || null;
+    return {
+      task: {
+        id: detail.id,
+        title: detail.title,
+        description: clip(detail.description, 2_000),
+        status: detail.status,
+        version: detail.version,
+        project: { id: detail.project_id, name: detail.project_name, root: detail.project_root },
+      },
+      currentAssignment,
+      openAssignments,
+      taskMemory: detail.blackboard.map(summarizeNote),
+      projectMemory: detail.projectBlackboard.map(summarizeNote),
+      projectKnowledge: this.knowledge.relevant(detail.project_id, taskId, 12),
+      openProposals: detail.proposals.filter((proposal) => proposal.status === "open").map((proposal) => ({ id: proposal.id, kind: proposal.kind, summary: clip(proposal.summary, 800), votes: proposal.votes })),
+      recent,
+      unresolvedQuestions,
+    };
   }
 
   snapshot(taskId = undefined) {

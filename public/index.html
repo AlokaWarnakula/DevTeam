@@ -10,8 +10,9 @@
 </head>
 <body>
   <div class="app-shell">
-    <aside class="sidebar">
-      <div class="brand"><span class="brand-mark">D</span><div><strong>DevTeam</strong><small>local workspace</small></div></div>
+    <aside class="sidebar" id="sidebar">
+      <button class="drawer-close" type="button" data-close-panel="sidebar" aria-label="Close navigation">×</button>
+      <div class="brand"><img src="/devteam-logo.jpg" alt="DevTeam — local AI collaboration workspace" class="brand-logo"><div><strong>DevTeam</strong><small>local workspace</small></div></div>
       <button class="primary full" data-dialog="task-dialog"><span>＋</span> New task</button>
       <nav>
         <div class="section-label"><span>Projects</span><button class="icon-button" title="Add project" data-dialog="project-dialog">＋</button></div>
@@ -28,12 +29,13 @@
 
     <main class="workspace">
       <header class="task-header">
+        <button id="toggle-sidebar" class="panel-toggle" type="button" aria-label="Toggle navigation" aria-expanded="true" aria-controls="sidebar" title="Toggle navigation">☰</button>
         <div>
           <div class="eyebrow"><span id="project-name">DevTeam</span><span>/</span><span id="task-status" class="status">ready</span></div>
           <h1 id="task-title">Bring your AI team together</h1>
           <p id="task-description">Create a task, connect agents through MCP, and watch the plan, implementation, tests, and review happen in one place.</p>
         </div>
-        <div class="header-actions"><span id="task-version" class="version">v1</span><button id="toggle-description" class="secondary hidden" type="button" aria-expanded="false">More</button><button id="copy-task-invite" class="secondary" title="Copy a task-specific agent prompt">Invite agent</button><button class="secondary" data-dialog="task-dialog">New task</button></div>
+        <div class="header-actions"><span id="task-version" class="version">v1</span><button id="toggle-description" class="secondary hidden" type="button" aria-expanded="false">More</button><button id="copy-task-invite" class="secondary" title="Copy a task-specific agent prompt">Invite agent</button><button class="secondary" data-dialog="task-dialog">New task</button><button id="toggle-team" class="panel-toggle" type="button" aria-label="Toggle team panel" aria-expanded="true" aria-controls="team-panel" title="Toggle team panel">◧</button></div>
       </header>
 
       <section id="empty-state" class="empty-state">
@@ -53,7 +55,6 @@
             </label>
           </div>
           <div id="reply-context" class="reply-context hidden"></div>
-          <button id="continue-work" type="button" class="continue-work hidden" aria-pressed="false"><span>↻</span><span><strong>Continue with new work</strong><small>Reopen this conversation and add a fresh planning assignment</small></span></button>
           <textarea name="message" rows="1" placeholder="Message the team, or paste/drop an image or PDF…"></textarea>
           <div id="attachment-preview" class="attachment-preview hidden" aria-live="polite"></div>
           <div class="composer-footer"><span id="composer-hint">Delivered live to connected agents on their next check.</span><div class="composer-actions"><label class="attach-button" title="Attach images or PDFs"><span aria-hidden="true">＋</span><span class="sr-only">Attach images or PDFs</span><input id="attachment-input" type="file" accept="image/png,image/jpeg,image/gif,image/webp,application/pdf" multiple></label><button class="send" title="Send message" aria-label="Send message">↑</button></div></div>
@@ -61,22 +62,36 @@
       </section>
     </main>
 
-    <aside class="team-panel">
+    <aside class="team-panel" id="team-panel">
+      <button class="drawer-close" type="button" data-close-panel="team" aria-label="Close team panel">×</button>
       <div class="panel-head"><div><span class="eyebrow">LIVE ROOM</span><h2>Team</h2></div><span id="online-count" class="online-count">0 online</span></div>
       <div id="agent-list" class="agent-list"></div>
       <div id="reconnect-list" class="reconnect-list"></div>
       <div id="room-members" class="room-members hidden"></div>
       <div class="divider"></div>
       <div id="proposal-section" class="proposal-section hidden">
-        <div class="panel-title"><h3>Proposals</h3><button class="icon-button" id="new-proposal" data-dialog="proposal-dialog" title="Propose a role or decision to the team">＋</button></div>
+        <div class="panel-title"><h3>Proposals</h3><button class="icon-button" id="new-proposal" data-dialog="proposal-dialog" aria-label="Propose a role or decision to the team" title="Propose a role or decision to the team">＋</button></div>
         <div id="proposal-list" class="proposal-list" aria-live="polite"></div>
         <div class="divider"></div>
       </div>
       <div class="panel-title"><h3>Work queue</h3><span id="assignment-count" class="count">0</span></div>
       <div id="assignment-list" class="assignment-list"></div>
       <div class="divider"></div>
+      <div id="project-blackboard-section" class="blackboard-section hidden">
+        <div class="panel-title"><h3>Project memory</h3><span id="project-blackboard-count" class="count">0</span></div>
+        <p class="memory-scope">Shared by every DevTeam task in this project.</p>
+        <div id="project-blackboard-list" class="blackboard-list"></div>
+        <div class="divider"></div>
+      </div>
+      <div id="knowledge-section" class="blackboard-section hidden">
+        <div class="panel-title"><h3>Knowledge vault</h3><span id="knowledge-count" class="count">0</span></div>
+        <p class="memory-scope">Automatically maintained as Obsidian-compatible Markdown.</p>
+        <div id="knowledge-list" class="knowledge-list"></div>
+        <div class="divider"></div>
+      </div>
       <div id="blackboard-section" class="blackboard-section hidden">
-        <div class="panel-title"><h3>Shared memory</h3><span id="blackboard-count" class="count">0</span></div>
+        <div class="panel-title"><h3>Task memory</h3><span id="blackboard-count" class="count">0</span></div>
+        <p class="memory-scope">Visible only in this task room.</p>
         <div id="blackboard-list" class="blackboard-list"></div>
         <div class="divider"></div>
       </div>
@@ -85,6 +100,8 @@
         <div class="progress"><span id="approval-progress"></span></div>
         <p id="consensus-copy">Independent review begins after implementation.</p>
       </div>
+      <button id="accept-task" class="primary accept-btn hidden">Accept task</button>
+      <button id="unblock-task" class="success-link hidden">Resume blocked task</button>
       <button id="block-task" class="danger-link hidden">Stop and block task</button>
     </aside>
   </div>
@@ -117,7 +134,8 @@
       <label>Summary (what the team votes on)<input name="summary" maxlength="200" placeholder="Codex takes the security-reviewer role" required></label>
       <div id="role-fields">
         <label>Role<select name="role"><option value="implementer">implementer</option><option value="reviewer">reviewer</option><option value="security-reviewer">security-reviewer</option><option value="tester">tester</option><option value="researcher">researcher</option><option value="planner">planner</option></select></label>
-        <label>For agent (name)<input name="targetAgentName" maxlength="80" placeholder="Codex"></label>
+        <label>For agent<select name="targetAgentName" id="proposal-agent"><option value="">Anyone available</option></select></label>
+        <p class="hint role-agent-hint">One connected agent can take different roles in sequence. A review by the same agent is self-review, not independent consensus.</p>
         <label>What should they do?<textarea name="description" rows="3" placeholder="Describe the work for this role…"></textarea></label>
       </div>
       <p class="hint">Agents vote on their next check. Adopted only when every connected teammate agrees; a role proposal creates the assignment automatically.</p>

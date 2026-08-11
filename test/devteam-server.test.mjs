@@ -9,7 +9,7 @@ import { startDevTeamServer } from "../src/devteam/server.mjs";
 
 test("dashboard API and authenticated MCP endpoint work together", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-server-"));
-  const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd() });
+  const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd(), knowledge: { enabled: false } });
   t.after(async () => { await instance.close(); await rm(dataDir, { recursive: true, force: true }); });
 
   const home = await fetch(instance.url);
@@ -75,9 +75,79 @@ test("dashboard API and authenticated MCP endpoint work together", async (t) => 
   assert.equal((await deleteProject.json()).filesDeleted, false);
 });
 
+test("an unscoped MCP agent on a multi-task server receives room choices instead of false idle", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-room-required-"));
+  const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd(), knowledge: { enabled: false } });
+  t.after(async () => { await instance.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const state = await fetch(`${instance.url}/api/state`).then((response) => response.json());
+  const auth = { authorization: `Bearer ${instance.store.token}`, "content-type": "application/json" };
+  const create = (title) => fetch(`${instance.url}/api/tasks`, {
+    method: "POST",
+    headers: auth,
+    body: JSON.stringify({ projectId: state.projects[0].id, title, description: `${title} room.` }),
+  }).then((response) => response.json());
+  const [first, second] = await Promise.all([create("First task"), create("Second task")]);
+
+  const transport = new StreamableHTTPClientTransport(new URL(instance.mcpUrl), {
+    requestInit: { headers: { Authorization: `Bearer ${instance.store.token}` } },
+  });
+  const client = new Client({ name: "devteam-room-test", version: "1.0.0" });
+  await client.connect(transport);
+  t.after(() => client.close());
+
+  const connected = await client.callTool({ name: "devteam_connect", arguments: { name: "Roomless Agent", provider: "test" } });
+  const result = connected.structuredContent;
+  assert.equal(result.roomRequired, true);
+  assert.deepEqual(new Set(result.availableTasks.map((task) => task.id)), new Set([first.id, second.id]));
+  const waiting = await client.callTool({ name: "devteam_wait", arguments: { agentId: result.agent.id, timeoutSeconds: 1 } });
+  assert.equal(waiting.structuredContent.status, "room_required");
+  assert.equal(waiting.structuredContent.keepWaiting, false);
+  assert.match(waiting.structuredContent.next, /devteam_join/);
+
+  const joined = await client.callTool({ name: "devteam_join", arguments: { agentId: result.agent.id, taskId: first.id, role: "contributor" } });
+  assert.equal(joined.structuredContent.joined, true);
+  const assigned = await client.callTool({ name: "devteam_wait", arguments: { agentId: result.agent.id, timeoutSeconds: 1 } });
+  assert.equal(assigned.structuredContent.status, "assigned");
+  assert.equal(assigned.structuredContent.assignment.task_id, first.id);
+});
+
+test("MCP assignment dependencies sequence work and devteam_brief stays compact", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-dependency-mcp-"));
+  const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd(), knowledge: { enabled: false } });
+  t.after(async () => { await instance.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const state = await fetch(`${instance.url}/api/state`).then((response) => response.json());
+  const task = await fetch(`${instance.url}/api/tasks`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${instance.store.token}`, "content-type": "application/json" },
+    body: JSON.stringify({ projectId: state.projects[0].id, title: "Dependency MCP", description: "Sequence work." }),
+  }).then((response) => response.json());
+  const transport = new StreamableHTTPClientTransport(new URL(instance.mcpUrl), {
+    requestInit: { headers: { Authorization: `Bearer ${instance.store.token}` } },
+  });
+  const client = new Client({ name: "devteam-dependency-test", version: "1.0.0" });
+  await client.connect(transport);
+  t.after(() => client.close());
+  const connected = await client.callTool({ name: "devteam_connect", arguments: { name: "Worker", provider: "test" } });
+  const agentId = connected.structuredContent.agent.id;
+  const planner = await client.callTool({ name: "devteam_wait", arguments: { agentId, timeoutSeconds: 1 } });
+  const parent = await client.callTool({ name: "devteam_assign", arguments: { agentId, taskId: task.id, title: "Parent", description: "First." } });
+  const child = await client.callTool({ name: "devteam_assign", arguments: { agentId, taskId: task.id, title: "Child", description: "Second.", dependsOn: [parent.structuredContent.id] } });
+  const brief = await client.callTool({ name: "devteam_brief", arguments: { agentId, taskId: task.id } });
+  assert.equal(brief.structuredContent.currentAssignment.id, planner.structuredContent.assignment.id);
+  assert.deepEqual(brief.structuredContent.openAssignments.find((item) => item.id === child.structuredContent.id).dependsOn, [parent.structuredContent.id]);
+  assert.equal(Object.hasOwn(brief.structuredContent, "agents"), false);
+
+  await client.callTool({ name: "devteam_report", arguments: { agentId, assignmentId: planner.structuredContent.assignment.id, claimToken: planner.structuredContent.assignment.claimToken, message: "Planned." } });
+  const parentClaim = await client.callTool({ name: "devteam_wait", arguments: { agentId, timeoutSeconds: 1 } });
+  assert.equal(parentClaim.structuredContent.assignment.id, parent.structuredContent.id);
+  await client.callTool({ name: "devteam_report", arguments: { agentId, assignmentId: parent.structuredContent.id, claimToken: parentClaim.structuredContent.assignment.claimToken, message: "Parent done." } });
+  const childClaim = await client.callTool({ name: "devteam_wait", arguments: { agentId, timeoutSeconds: 1 } });
+  assert.equal(childClaim.structuredContent.assignment.id, child.structuredContent.id);
+});
+
 test("a human message wakes a waiting agent through MCP and records delivery", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-wake-"));
-  const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd() });
+  const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd(), knowledge: { enabled: false } });
   t.after(async () => { await instance.close(); await rm(dataDir, { recursive: true, force: true }); });
 
   const state = await fetch(`${instance.url}/api/state`).then((response) => response.json());
@@ -119,7 +189,7 @@ test("a human message wakes a waiting agent through MCP and records delivery", a
 
 test("an MCP session cannot act as an agent it did not connect as", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-identity-"));
-  const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd() });
+  const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd(), knowledge: { enabled: false } });
   t.after(async () => { await instance.close(); await rm(dataDir, { recursive: true, force: true }); });
 
   const connect = async (name) => {
@@ -147,7 +217,7 @@ test("an MCP session cannot act as an agent it did not connect as", async (t) =>
 
 test("mutating API rejects cross-origin and non-local requests", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-origin-"));
-  const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd() });
+  const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd(), knowledge: { enabled: false } });
   t.after(async () => { await instance.close(); await rm(dataDir, { recursive: true, force: true }); });
 
   const state = await fetch(`${instance.url}/api/state`).then((response) => response.json());
@@ -187,7 +257,7 @@ test("mutating API rejects cross-origin and non-local requests", async (t) => {
 
 test("a busy agent is reached with pending messages on its next action", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-reach-"));
-  const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd() });
+  const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd(), knowledge: { enabled: false } });
   t.after(async () => { await instance.close(); await rm(dataDir, { recursive: true, force: true }); });
 
   const state = await fetch(`${instance.url}/api/state`).then((response) => response.json());
@@ -223,7 +293,7 @@ test("a busy agent is reached with pending messages on its next action", async (
 
 test("shared blackboard round-trips over MCP and a stuck write lease can be force-released via REST", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-hive-"));
-  const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd() });
+  const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd(), knowledge: { enabled: false } });
   t.after(async () => { await instance.close(); await rm(dataDir, { recursive: true, force: true }); });
 
   const state = await fetch(`${instance.url}/api/state`).then((r) => r.json());
@@ -248,6 +318,16 @@ test("shared blackboard round-trips over MCP and a stuck write lease can be forc
   const got = await client.callTool({ name: "devteam_note_get", arguments: { agentId, taskId: task.id, key: "world" } });
   assert.equal(got.structuredContent.value, "goal: ship it");
   assert.equal(got.structuredContent.version, 1);
+  assert.equal(got.structuredContent.scope, "task");
+
+  await client.callTool({ name: "devteam_note_set", arguments: { agentId, taskId: task.id, scope: "project", key: "architecture", value: "local-first" } });
+  const projectNote = await client.callTool({ name: "devteam_note_get", arguments: { agentId, taskId: task.id, scope: "project", key: "architecture" } });
+  assert.equal(projectNote.structuredContent.scope, "project");
+  assert.equal(projectNote.structuredContent.value, "local-first");
+  const projectKeys = await client.callTool({ name: "devteam_note_get", arguments: { agentId, taskId: task.id, scope: "project" } });
+  assert.equal(projectKeys.structuredContent.scope, "project");
+  assert.deepEqual(projectKeys.structuredContent.keys.map((item) => item.key), ["architecture"]);
+  assert.equal(instance.store.taskDetail(task.id).projectBlackboard[0].value, "local-first");
 
   // Claim the planner assignment, then delegate a write assignment and claim it to hold a lease.
   await client.callTool({ name: "devteam_wait", arguments: { agentId, timeoutSeconds: 2 } });
@@ -273,7 +353,7 @@ test("shared blackboard round-trips over MCP and a stuck write lease can be forc
 
 test("task attachments validate content, size, paths, and serve safe previews", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-attachments-"));
-  const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd() });
+  const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd(), knowledge: { enabled: false } });
   t.after(async () => { await instance.close(); await rm(dataDir, { recursive: true, force: true }); });
 
   const state = await fetch(`${instance.url}/api/state`).then((response) => response.json());
@@ -317,7 +397,7 @@ test("task attachments validate content, size, paths, and serve safe previews", 
 
 test("dashboard can continue completed work inside the same task conversation", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-continue-api-"));
-  const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd() });
+  const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd(), knowledge: { enabled: false } });
   t.after(async () => { await instance.close(); await rm(dataDir, { recursive: true, force: true }); });
   const state = await fetch(`${instance.url}/api/state`).then((response) => response.json());
   const auth = { authorization: `Bearer ${instance.store.token}`, "content-type": "application/json" };
@@ -341,4 +421,46 @@ test("dashboard can continue completed work inside the same task conversation", 
   assert.equal(detail.version, 2);
   assert.ok(detail.events.some((event) => event.message === "Now add export support."));
   assert.ok(detail.assignments.some((assignment) => assignment.status === "queued" && assignment.role === "planner" && /follow-up/i.test(assignment.title)));
+});
+
+test("dashboard can resume blocked work and records human acceptance without forging consensus", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-human-controls-"));
+  const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd(), knowledge: { enabled: false } });
+  t.after(async () => { await instance.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const state = await fetch(`${instance.url}/api/state`).then((response) => response.json());
+  const auth = { authorization: `Bearer ${instance.store.token}`, "content-type": "application/json" };
+  const task = await fetch(`${instance.url}/api/tasks`, {
+    method: "POST", headers: auth,
+    body: JSON.stringify({ projectId: state.projects[0].id, title: "Human controls", description: "Recover and accept.", requiredApprovals: 2 }),
+  }).then((response) => response.json());
+
+  const earlyAccept = await fetch(`${instance.url}/api/tasks/${task.id}/accept`, {
+    method: "POST", headers: auth, body: JSON.stringify({ summary: "Too soon." }),
+  });
+  assert.equal(earlyAccept.status, 400);
+
+  await fetch(`${instance.url}/api/tasks/${task.id}/block`, {
+    method: "POST", headers: auth, body: JSON.stringify({ reason: "Pause for a choice." }),
+  });
+  const resumedResponse = await fetch(`${instance.url}/api/tasks/${task.id}/unblock`, {
+    method: "POST", headers: auth, body: JSON.stringify({ reason: "Choice made." }),
+  });
+  assert.equal(resumedResponse.status, 200);
+  const resumed = await resumedResponse.json();
+  assert.equal(resumed.version, 2);
+
+  instance.store.db.prepare("UPDATE assignments SET status = 'done' WHERE task_id = ? AND status IN ('queued', 'claimed')").run(task.id);
+  instance.store.db.prepare("UPDATE tasks SET status = 'review' WHERE id = ?").run(task.id);
+  const acceptedResponse = await fetch(`${instance.url}/api/tasks/${task.id}/accept`, {
+    method: "POST", headers: auth, body: JSON.stringify({ summary: "The delivered result is good." }),
+  });
+  assert.equal(acceptedResponse.status, 200);
+  const accepted = await acceptedResponse.json();
+  assert.equal(accepted.humanOverride, true);
+  assert.equal(accepted.approvalCount, 0);
+  const detail = await fetch(`${instance.url}/api/tasks/${task.id}`).then((response) => response.json());
+  const event = detail.events.findLast((item) => item.type === "task.accepted");
+  assert.equal(detail.status, "accepted");
+  assert.equal(event.metadata.humanOverride, true);
+  assert.match(event.message, /Human accepted/);
 });

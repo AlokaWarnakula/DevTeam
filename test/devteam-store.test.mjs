@@ -1,9 +1,65 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, mkdir, symlink } from "node:fs/promises";
+import { mkdtemp, rm, mkdir, symlink, writeFile, readFile, readdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { DevTeamStore } from "../src/devteam/store.mjs";
+
+test("automatic knowledge vault exports safe Obsidian notes and feeds task briefings", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-knowledge-data-"));
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "devteam-knowledge-project-"));
+  await mkdir(path.join(projectRoot, "memory"), { recursive: true });
+  await writeFile(path.join(projectRoot, "memory", "INDEX.md"), "# Old memory\n\nAPI_KEY=super-secret-value", "utf8");
+  const store = new DevTeamStore(dataDir, { knowledge: { enabled: true } });
+  t.after(async () => {
+    store.close();
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  });
+
+  const project = store.ensureProject("Knowledge project", projectRoot);
+  const task = store.createTask({ projectId: project.id, title: "Add durable memory", description: "Exercise automatic knowledge." });
+  const agent = store.connectAgent({ name: "Codex", provider: "OpenAI" });
+  const plan = store.claimNextAssignment(agent.id);
+  store.noteSet({ agentId: agent.id, taskId: task.id, scope: "project", key: "architecture/runtime", value: "SQLite is the source of truth; Markdown is the exported view." });
+  const proposal = store.createProposal({ agentId: agent.id, taskId: task.id, kind: "decision", summary: "Use one serialized knowledge exporter", details: {} });
+  store.voteProposal({ proposalId: proposal.id, vote: "agree" });
+  store.completeAssignment({
+    agentId: agent.id,
+    assignmentId: plan.id,
+    message: "Implemented exporter. password=hunter2",
+    changedFiles: ["src/knowledge.mjs", ".env", "secrets/token.txt"],
+    checks: ["node --test"],
+  });
+
+  const vault = path.join(projectRoot, "knowledge");
+  const index = await readFile(path.join(vault, "INDEX.md"), "utf8");
+  const current = await readFile(path.join(vault, "CURRENT.md"), "utf8");
+  const componentFiles = await readdir(path.join(vault, "components"));
+  const decisionFiles = await readdir(path.join(vault, "decisions"));
+  const archiveFiles = await readdir(path.join(vault, "archive"));
+  const exported = await Promise.all([...componentFiles.map((file) => path.join(vault, "components", file)), ...archiveFiles.map((file) => path.join(vault, "archive", file))].map((file) => readFile(file, "utf8")));
+
+  assert.match(index, /\[\[CURRENT\]\]/);
+  assert.match(index, /\[\[decisions\//);
+  assert.match(current, /Add durable memory/);
+  assert.ok(componentFiles.length >= 1, "completed implementation becomes component knowledge");
+  assert.ok(decisionFiles.length >= 1, "adopted proposal becomes a durable decision");
+  assert.ok(archiveFiles.length >= 1, "legacy Shorekeeper memory is imported without deleting it");
+  assert.equal(await readFile(path.join(projectRoot, "memory", "INDEX.md"), "utf8"), "# Old memory\n\nAPI_KEY=super-secret-value");
+  assert.doesNotMatch(exported.join("\n"), /hunter2|super-secret-value|secrets\/token|\.env/);
+  assert.match(exported.join("\n"), /\[REDACTED\]/);
+
+  const detail = store.taskDetail(task.id);
+  assert.ok(detail.knowledge.length >= 3);
+  const brief = store.taskBrief(agent.id, task.id);
+  assert.ok(brief.projectKnowledge.length >= 3);
+  assert.ok(brief.projectKnowledge.every((note) => note.body.length <= 1_300));
+  const search = store.knowledgeSearch({ agentId: agent.id, taskId: task.id, query: "serialized", category: "decisions" });
+  assert.equal(search.automated, true);
+  assert.equal(search.notes.length, 1);
+  assert.match(search.notes[0].title, /serialized knowledge exporter/i);
+});
 
 test("DevTeam coordinates plan, write lease, review, versioning, and consensus", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-store-"));
@@ -433,6 +489,125 @@ test("blocking a task stands co-workers down to waiting instead of force-disconn
   assert.ok(store.taskDetail(task.id).events.some((e) => e.type === "agent.standdown"), "co-workers are notified via the timeline");
 });
 
+test("assignment dependencies hold queued work until every same-task prerequisite is done", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-dependencies-"));
+  const store = new DevTeamStore(dataDir);
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Dependencies", process.cwd());
+  const task = store.createTask({ projectId: project.id, title: "Build in order", description: "Parent before child." });
+  const planner = store.connectAgent({ name: "Planner", provider: "test" });
+  const worker = store.connectAgent({ name: "Worker", provider: "test" });
+  const plan = store.claimNextAssignment(planner.id);
+  const parent = store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Schema", description: "Create schema.", targetAgentName: "Worker" });
+  const child = store.createAssignment({ agentId: planner.id, taskId: task.id, title: "API", description: "Use schema.", targetAgentName: "Worker", dependsOn: [parent.id] });
+  store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Planned." });
+
+  const detailBefore = store.taskDetail(task.id).assignments.find((item) => item.id === child.id);
+  assert.deepEqual(detailBefore.dependsOn, [parent.id]);
+  assert.deepEqual(detailBefore.blockedBy.map((item) => item.title), ["Schema"]);
+  assert.equal(store.claimNextAssignment(worker.id).id, parent.id, "the prerequisite is claimed first");
+  assert.equal(store.claimNextAssignment(planner.id), null, "another agent cannot skip ahead to the dependent work");
+  store.completeAssignment({ agentId: worker.id, assignmentId: parent.id, message: "Schema done." });
+  assert.equal(store.claimNextAssignment(worker.id).id, child.id, "the child unlocks after its dependency is done");
+  assert.deepEqual(store.taskDetail(task.id).assignments.find((item) => item.id === child.id).blockedBy, []);
+  store.completeAssignment({ agentId: worker.id, assignmentId: child.id, message: "API done." });
+
+  const blockedParent = store.createAssignment({ agentId: planner.id, taskId: task.id, title: "External choice", description: "May block.", targetAgentName: "Worker" });
+  const blockedChild = store.createAssignment({ agentId: planner.id, taskId: task.id, title: "After choice", description: "Must remain queued.", targetAgentName: "Worker", dependsOn: [blockedParent.id] });
+  assert.equal(store.claimNextAssignment(worker.id).id, blockedParent.id);
+  store.completeAssignment({ agentId: worker.id, assignmentId: blockedParent.id, message: "Choice unavailable.", status: "blocked" });
+  const blockedDetail = store.taskDetail(task.id).assignments.find((item) => item.id === blockedChild.id);
+  assert.equal(blockedDetail.status, "queued");
+  assert.equal(blockedDetail.blockedBy[0].status, "blocked", "a blocked prerequisite never silently unlocks its dependent");
+
+  const otherTask = store.createTask({ projectId: project.id, title: "Other", description: "Different task." });
+  store.joinTask(planner.id, otherTask.id);
+  assert.throws(() => store.createAssignment({ agentId: planner.id, taskId: otherTask.id, title: "Cross-task", description: "Invalid.", dependsOn: [parent.id] }), /same task/);
+  assert.throws(() => store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Missing", description: "Invalid.", dependsOn: ["00000000-0000-4000-8000-000000000000"] }), /existing assignment/);
+});
+
+test("an assignment blocker queues triage without stopping sibling work or the task", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-assignment-block-"));
+  const store = new DevTeamStore(dataDir);
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Assignment blocker", process.cwd());
+  const task = store.createTask({ projectId: project.id, title: "Parallel work", description: "One item may need triage." });
+  const planner = store.connectAgent({ name: "Planner", provider: "test" });
+  const alice = store.connectAgent({ name: "Alice", provider: "test" });
+  const bob = store.connectAgent({ name: "Bob", provider: "test" });
+  const plan = store.claimNextAssignment(planner.id);
+  const risky = store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Risky", description: "May block.", requiresWrite: true, targetAgentName: "Alice", paths: ["src/risky"] });
+  const sibling = store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Sibling", description: "Must continue.", requiresWrite: true, targetAgentName: "Bob", paths: ["src/sibling"] });
+  store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Plan complete." });
+  assert.equal(store.claimNextAssignment(alice.id).id, risky.id);
+  assert.equal(store.claimNextAssignment(bob.id).id, sibling.id);
+
+  const outcome = store.completeAssignment({ agentId: alice.id, assignmentId: risky.id, message: "Needs a human choice.", status: "blocked" });
+  const detail = store.taskDetail(task.id);
+  assert.equal(outcome.taskBlocked, false);
+  assert.equal(detail.status, "planning", "the triage planner keeps the task active");
+  assert.equal(detail.assignments.find((item) => item.id === sibling.id).status, "claimed", "sibling work is untouched");
+  assert.equal(store.getAgent(bob.id).status, "busy", "the sibling agent keeps its claim");
+  assert.ok(detail.assignments.some((item) => item.id === outcome.followUpAssignmentId && item.role === "planner" && item.status === "queued"));
+  assert.equal(detail.events.some((event) => event.type === "task.blocked"), false, "assignment triage is not mislabeled task-wide");
+});
+
+test("multi-task room choices are actionable and agent snapshots redact resume hashes", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-room-choice-"));
+  const store = new DevTeamStore(dataDir);
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Rooms", process.cwd());
+  const first = store.createTask({ projectId: project.id, title: "First", description: "First room." });
+  const second = store.createTask({ projectId: project.id, title: "Second", description: "Second room." });
+  const agent = store.connectAgent({ name: "Roomless", provider: "test" });
+
+  const roomStatus = store.roomStatusForAgent(agent.id);
+  assert.deepEqual(roomStatus.joinedTaskIds, []);
+  assert.deepEqual(new Set(roomStatus.activeTasks.map((task) => task.id)), new Set([first.id, second.id]));
+  assert.ok(roomStatus.activeTasks.every((task) => task.projectName === "Rooms" && Number.isInteger(task.openAssignments)));
+  assert.equal(Object.hasOwn(store.listAgents().find((item) => item.id === agent.id), "resume_token_hash"), false);
+  assert.equal(JSON.stringify(store.snapshotForAgent(agent.id)).includes("resume_token_hash"), false);
+});
+
+test("a human can safely resume a blocked task with a fresh version and planner", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-unblock-"));
+  const store = new DevTeamStore(dataDir);
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Recovery", process.cwd());
+  const task = store.createTask({ projectId: project.id, title: "Recover me", description: "Resume safely." });
+  store.blockTask({ taskId: task.id, reason: "Paused for a decision." });
+
+  const resumed = store.unblockTask({ taskId: task.id, reason: "Decision made; continue cleanly." });
+  const detail = store.taskDetail(task.id);
+  assert.equal(resumed.version, 2);
+  assert.equal(detail.status, "planning");
+  assert.equal(detail.approvals.length, 0);
+  assert.ok(detail.assignments.some((item) => item.id === resumed.assignmentId && item.status === "queued" && item.role === "planner"));
+  assert.ok(detail.events.some((event) => event.type === "task.unblocked" && event.metadata.version === 2));
+  assert.throws(() => store.unblockTask({ taskId: task.id, reason: "Again" }), /Only a blocked task/);
+});
+
+test("human acceptance requires finished review work and is labeled as an override", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-human-accept-"));
+  const store = new DevTeamStore(dataDir);
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Human acceptance", process.cwd());
+  const task = store.createTask({ projectId: project.id, title: "Accept me", description: "Human decides.", requiredApprovals: 2 });
+  const planner = store.connectAgent({ name: "Planner", provider: "test" });
+  assert.throws(() => store.acceptTaskByHuman({ taskId: task.id, summary: "Too early." }), /ready for review/);
+  const plan = store.claimNextAssignment(planner.id);
+  store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Planning is complete." });
+
+  const accepted = store.acceptTaskByHuman({ taskId: task.id, summary: "I reviewed the delivered result." });
+  const detail = store.taskDetail(task.id);
+  const event = detail.events.findLast((item) => item.type === "task.accepted");
+  assert.equal(accepted.humanOverride, true);
+  assert.equal(detail.status, "accepted");
+  assert.equal(event.metadata.humanOverride, true);
+  assert.equal(event.metadata.approvalCount, 0, "human acceptance does not forge agent approvals");
+  assert.match(event.message, /Human accepted/);
+});
+
 test("task and project deletion remove DevTeam history without touching project files", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-delete-"));
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "devteam-project-"));
@@ -820,6 +995,64 @@ test("the shared blackboard stores versioned team memory with optimistic concurr
   store.joinTask(codex.id, task.id); // codex now explicitly only in task A
   assert.throws(() => store.noteSet({ agentId: codex.id, taskId: taskB.id, key: "x", value: "y" }), /not a member/);
   assert.equal(store.taskDetail(task.id).blackboard.length, 1, "taskDetail surfaces the blackboard for the dashboard");
+});
+
+test("project memory persists across same-project tasks while membership isolates other projects", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-project-memory-"));
+  const store = new DevTeamStore(dataDir);
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Persistent memory", process.cwd());
+  const firstTask = store.createTask({ projectId: project.id, title: "First task", description: "Write project memory." });
+  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI" });
+  const first = store.noteSet({ agentId: codex.id, taskId: firstTask.id, scope: "project", key: "conventions", value: "Use SQLite." });
+  assert.equal(first.scope, "project");
+  assert.equal(first.version, 1);
+
+  const secondTask = store.createTask({ projectId: project.id, title: "Second task", description: "Read project memory." });
+  const claude = store.connectAgent({ name: "Claude", provider: "Anthropic" });
+  store.joinTask(claude.id, secondTask.id);
+  const carried = store.noteGet(secondTask.id, "conventions", "project", claude.id);
+  assert.equal(carried.value, "Use SQLite.", "a later task in the project sees durable memory");
+  assert.equal(carried.updatedBy, "Codex");
+  assert.equal(store.noteGet(secondTask.id, "conventions", "task", claude.id), null, "task and project scopes remain distinct");
+
+  const stale = store.noteSet({ agentId: claude.id, taskId: secondTask.id, scope: "project", key: "conventions", value: "Use Postgres.", expectedVersion: 0 });
+  assert.equal(stale.conflict, true);
+  assert.equal(stale.scope, "project");
+  const merged = store.noteSet({ agentId: claude.id, taskId: secondTask.id, scope: "project", key: "conventions", value: "Use SQLite with WAL.", expectedVersion: 1 });
+  assert.equal(merged.version, 2);
+
+  const otherProject = store.ensureProject("Other project", path.join(os.tmpdir(), "devteam-project-memory-other"));
+  const otherTask = store.createTask({ projectId: otherProject.id, title: "Other task", description: "Isolated." });
+  assert.throws(() => store.noteGet(otherTask.id, "conventions", "project", codex.id), /not a member/);
+  assert.throws(() => store.noteSet({ agentId: codex.id, taskId: otherTask.id, scope: "project", key: "x", value: "y" }), /not a member/);
+  assert.equal(store.taskDetail(firstTask.id).projectBlackboard[0].value, "Use SQLite with WAL.");
+  assert.equal(store.taskDetail(firstTask.id).blackboard.length, 0);
+});
+
+test("taskBrief returns bounded actionable context without global agent secrets", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-brief-"));
+  const store = new DevTeamStore(dataDir);
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Brief", process.cwd());
+  const task = store.createTask({ projectId: project.id, title: "Brief me", description: "Keep context compact." });
+  const agent = store.connectAgent({ name: "Codex", provider: "test" });
+  store.noteSet({ agentId: agent.id, taskId: task.id, key: "goal", value: "x".repeat(3_000) });
+  store.noteSet({ agentId: agent.id, taskId: task.id, scope: "project", key: "convention", value: "local-first" });
+  store.postMessage({ agentId: agent.id, taskId: task.id, type: "agent.question", message: "Which API shape?" });
+  store.postMessage({ agentId: agent.id, taskId: task.id, type: "agent.decision", message: "Use a compact response." });
+
+  const brief = store.taskBrief(agent.id, task.id);
+  assert.equal(brief.task.title, "Brief me");
+  assert.equal(brief.taskMemory[0].value.length, 2_001, "large memory values are truncated with an ellipsis");
+  assert.equal(brief.projectMemory[0].value, "local-first");
+  assert.match(brief.recent[0].message, /compact response/);
+  assert.match(brief.unresolvedQuestions[0].message, /API shape/);
+  assert.equal(JSON.stringify(brief).includes("resume_token_hash"), false);
+  assert.equal(JSON.stringify(brief).includes("agents"), false, "the brief is task context, not a global agent dump");
+
+  const otherTask = store.createTask({ projectId: project.id, title: "Other", description: "Not joined." });
+  assert.throws(() => store.taskBrief(agent.id, otherTask.id), /not a member/);
 });
 
 test("opening an existing database repairs stale nonterminal task status", async (t) => {

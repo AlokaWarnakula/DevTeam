@@ -41,9 +41,10 @@ export async function startDevTeamServer({
   dataDir,
   workspaceRoot = process.cwd(),
   liveness = {},
+  knowledge = { enabled: true },
 } = {}) {
   if (!dataDir) throw new Error("dataDir is required.");
-  const store = new DevTeamStore(dataDir, { liveness });
+  const store = new DevTeamStore(dataDir, { liveness, knowledge });
   const attachmentRoot = path.resolve(dataDir, "attachments");
   const root = requireDirectory(workspaceRoot);
   store.ensureProject(path.basename(root), root);
@@ -238,6 +239,14 @@ export async function startDevTeamServer({
   app.post("/api/tasks/:taskId/block", (req, res) => {
     requireFields(req.body, ["reason"]);
     res.json(store.blockTask({ taskId: req.params.taskId, reason: req.body.reason }));
+  });
+  app.post("/api/tasks/:taskId/unblock", (req, res) => {
+    requireFields(req.body, ["reason"]);
+    res.json(store.unblockTask({ taskId: req.params.taskId, reason: req.body.reason }));
+  });
+  app.post("/api/tasks/:taskId/accept", (req, res) => {
+    requireFields(req.body, ["summary"]);
+    res.json(store.acceptTaskByHuman({ taskId: req.params.taskId, summary: req.body.summary }));
   });
   app.post("/api/assignments/:assignmentId/force-release", (req, res) => {
     requireFields(req.body, ["confirmTitle"]);

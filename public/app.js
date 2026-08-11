@@ -1,5 +1,7 @@
 const $ = (selector) => document.querySelector(selector);
 const escapeHtml = (value = "") => String(value).replace(/[&<>'"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[char]));
+// Keep timeline markup deliberately small: escape first, then allow only balanced **bold** spans.
+const renderMessageText = (value = "") => escapeHtml(value).replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
 const time = (stamp) => new Intl.DateTimeFormat([], { hour: "numeric", minute: "2-digit" }).format(new Date(stamp));
 const relativeTime = (stamp) => {
   if (!stamp) return "";
@@ -43,7 +45,6 @@ let pendingAttachments = [];
 let proposalTaskId = null;
 let proposalStatuses = new Map();
 let renderedTaskId = null;
-let continuationMode = false;
 let descriptionExpanded = false;
 const ATTACHMENT_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf"]);
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
@@ -98,6 +99,7 @@ function render() {
   $("#conversation").classList.toggle("hidden", !task);
   $("#copy-task-invite").classList.toggle("hidden", !task);
   $("#block-task").classList.toggle("hidden", !task || ["accepted", "blocked", "cancelled"].includes(task.status));
+  $("#unblock-task").classList.toggle("hidden", !task || task.status !== "blocked");
   if (task) renderTask(task);
   else document.title = "DevTeam — Local AI collaboration";
   renderAgents();
@@ -137,7 +139,7 @@ function renderEvent(event) {
     ? `<div class="reply-quote">↳ ${escapeHtml(parent.agent_id ? (parent.agent_name || "Agent") : "You")}: ${escapeHtml((parent.message || "").slice(0, 100))}</div>`
     : "";
   const parsed = parseAttachmentMarkers(event.message);
-  const body = parsed.message ? `<div class="event-body">${escapeHtml(parsed.message)}</div>` : "";
+  const body = parsed.message ? `<div class="event-body">${renderMessageText(parsed.message)}</div>` : "";
   const attachments = parsed.attachments.length ? `<div class="message-attachments">${parsed.attachments.map(renderMessageAttachment).join("")}</div>` : "";
   return `<article class="event ${human ? "from-human" : ""}"><div class="avatar ${human ? "human" : ""}">${initials(name)}</div><div class="event-main"><div class="event-top"><span class="event-name">${escapeHtml(name)}</span><span class="provider">${escapeHtml(human ? "you" : event.agent_provider || event.type)}</span>${badge}<span class="event-time">${time(event.created_at)}</span><button class="reply-btn" data-reply="${event.id}" title="Reply to this message" aria-label="Reply">↩</button></div>${quote}${body}${attachments}${meta.length ? `<div class="event-meta">${meta.map((item) => `<span class="chip">${escapeHtml(item)}</span>`).join("")}</div>` : ""}${human ? deliveryLine(event) : ""}</div></article>`;
 }
@@ -166,7 +168,7 @@ function renderMessageAttachment(attachment) {
 
 function renderTask(task) {
   const taskChanged = renderedTaskId !== task.id;
-  if (taskChanged) { continuationMode = false; descriptionExpanded = false; }
+  if (taskChanged) descriptionExpanded = false;
   $("#project-name").textContent = task.project_name;
   $("#task-status").textContent = task.status;
   $("#task-title").textContent = task.title;
@@ -182,7 +184,6 @@ function renderTask(task) {
   renderMembers(task);
   renderProposals(task);
   const openAssignments = task.assignments.filter((item) => ["queued", "claimed"].includes(item.status)).length;
-  renderContinuationControl(task, openAssignments);
   $("#assignment-count").textContent = openAssignments;
   $("#assignment-list").innerHTML = task.assignments.slice().reverse().slice(0, 8).map((item) => {
     const checklist = item.checklist && item.checklist.length
@@ -194,7 +195,10 @@ function renderTask(task) {
     const release = item.status === "claimed" && item.requires_write
       ? `<button class="mini release" data-release="${item.id}" data-release-title="${escapeHtml(item.title)}" title="Force-release this stuck write lease (asks you to confirm the title)">Release lease</button>`
       : "";
-    return `<div class="assignment"><div class="assignment-top"><strong>${escapeHtml(item.title)}</strong><span class="role">${escapeHtml(item.role)}</span></div><p>${escapeHtml(item.agent_name ? `${item.agent_name} · ${item.status}` : item.status)}${item.requires_write ? " · write lease" : ""}</p>${scope}${checklist}${release}</div>`;
+    const blockedBy = item.blockedBy?.length
+      ? `<div class="dependency-wait"><strong>Waiting for</strong>${item.blockedBy.map((dependency) => `<span>${escapeHtml(dependency.title)} · ${escapeHtml(dependency.status)}</span>`).join("")}</div>`
+      : "";
+    return `<div class="assignment"><div class="assignment-top"><strong>${escapeHtml(item.title)}</strong><span class="role">${escapeHtml(item.role)}</span></div><p>${escapeHtml(item.agent_name ? `${item.agent_name} · ${item.status}` : item.status)}${item.requires_write ? " · write lease" : ""}</p>${blockedBy}${scope}${checklist}${release}</div>`;
   }).join("") || `<p class="hint">Waiting for the plan</p>`;
   renderBlackboard(task);
   const approvals = task.approvals.length;
@@ -202,13 +206,24 @@ function renderTask(task) {
   $("#approval-progress").style.width = `${Math.min(100, approvals / task.required_approvals * 100)}%`;
   const remaining = Math.max(0, task.required_approvals - approvals);
   const connectedCount = state.agents.filter((agent) => agent.status !== "disconnected").length;
-  let consensusCopy = task.status === "accepted"
-    ? "The current version has team consensus."
-    : `${remaining} independent approval${remaining === 1 ? "" : "s"} still needed.`;
-  if (task.status !== "accepted" && remaining > 0 && connectedCount < remaining) {
-    consensusCopy += ` Only ${connectedCount} agent${connectedCount === 1 ? "" : "s"} connected — connect ${remaining - connectedCount} more (each agent approves once) to reach consensus.`;
+  const acceptedEvent = task.status === "accepted" && task.events.slice().reverse().find((e) => e.type === "task.accepted");
+  const humanOverride = acceptedEvent && acceptedEvent.metadata && acceptedEvent.metadata.humanOverride;
+  let consensusCopy;
+  if (task.status === "accepted") {
+    consensusCopy = humanOverride
+      ? "You accepted this task directly. This was not independent agent consensus."
+      : "The current version has team consensus.";
+  } else if (task.status === "blocked") {
+    consensusCopy = "Task is blocked. Use Resume to unblock and continue work.";
+  } else {
+    consensusCopy = `${remaining} independent approval${remaining === 1 ? "" : "s"} still needed.`;
+    if (remaining > 0 && connectedCount < remaining) {
+      consensusCopy += ` Only ${connectedCount} agent${connectedCount === 1 ? "" : "s"} connected — connect ${remaining - connectedCount} more (each agent approves once) to reach consensus.`;
+    }
   }
   $("#consensus-copy").textContent = consensusCopy;
+  const canAccept = openAssignments === 0 && ["review"].includes(task.status);
+  $("#accept-task").classList.toggle("hidden", !canAccept);
   if (nearBottom) requestAnimationFrame(() => eventList.scrollTo({ top: eventList.scrollHeight, behavior: "smooth" }));
 }
 
@@ -221,19 +236,6 @@ function renderTaskDescription(description) {
   button.classList.toggle("hidden", !long);
   button.textContent = descriptionExpanded ? "Less" : "More";
   button.setAttribute("aria-expanded", String(descriptionExpanded));
-}
-
-function renderContinuationControl(task, openAssignments) {
-  const button = $("#continue-work");
-  const eligible = openAssignments === 0 && ["review", "accepted"].includes(task.status);
-  if (!eligible) continuationMode = false;
-  button.classList.toggle("hidden", !eligible);
-  button.classList.toggle("active", continuationMode);
-  button.setAttribute("aria-pressed", String(continuationMode));
-  const field = $("#message-form").elements.message;
-  field.placeholder = continuationMode
-    ? "Describe the next work for this same task conversation…"
-    : "Message the team, or paste/drop an image or PDF…";
 }
 
 // Who belongs to this task room and in what role — so the human can see the room's membership,
@@ -252,12 +254,32 @@ function renderMembers(task) {
 
 // The team's shared working memory: versioned keys with provenance. A long value is collapsed.
 function renderBlackboard(task) {
-  const section = $("#blackboard-section");
+  renderMemoryScope("blackboard", task.blackboard || []);
+  renderMemoryScope("project-blackboard", task.projectBlackboard || []);
+  renderKnowledge(task);
+}
+
+function renderKnowledge(task) {
+  const section = $("#knowledge-section");
   if (!section) return;
-  const notes = task.blackboard || [];
+  const notes = task.knowledge || [];
+  section.classList.toggle("hidden", !task.knowledgeVault?.automated && notes.length === 0);
+  $("#knowledge-count").textContent = notes.length;
+  const error = task.knowledgeVault?.error;
+  $("#knowledge-list").innerHTML = `${error ? `<p class="knowledge-error">Export needs attention: ${escapeHtml(error.message)}</p>` : ""}${notes.slice(0, 10).map((note) => `
+    <div class="knowledge-note">
+      <div><span class="knowledge-category">${escapeHtml(note.category)}</span><span class="knowledge-status ${escapeHtml(note.status)}">${escapeHtml(note.status)}</span></div>
+      <strong>${escapeHtml(note.title)}</strong>
+      <small>${escapeHtml(note.link)} · r${note.revision} · ${relativeTime(note.updated_at)}</small>
+    </div>`).join("") || '<p class="memory-scope">Ready — notes appear as the team completes work.</p>'}`;
+}
+
+function renderMemoryScope(prefix, notes) {
+  const section = $(`#${prefix}-section`);
+  if (!section) return;
   section.classList.toggle("hidden", notes.length === 0);
-  $("#blackboard-count").textContent = notes.length;
-  $("#blackboard-list").innerHTML = notes.map((note) => {
+  $(`#${prefix}-count`).textContent = notes.length;
+  $(`#${prefix}-list`).innerHTML = notes.map((note) => {
     const value = String(note.value ?? "");
     const preview = value.length > 240 ? `${value.slice(0, 240)}…` : value;
     return `<details class="note"><summary><span class="note-key">${escapeHtml(note.key)}</span><span class="note-meta">v${note.version} · ${escapeHtml(note.updatedBy || "?")} · ${relativeTime(note.updatedAt)}</span></summary><pre class="note-body">${escapeHtml(preview)}</pre></details>`;
@@ -274,7 +296,9 @@ function renderReplyContext() {
 
 function renderAgents() {
   renderAgentList();
-  populateMessageTargets(state.agents.filter((agent) => agent.status !== "disconnected"));
+  const connected = state.agents.filter((agent) => agent.status !== "disconnected");
+  populateMessageTargets(connected);
+  populateProposalAgents(connected);
 }
 
 // Team role negotiation: show open proposals with live vote tallies and let the human weigh in.
@@ -413,6 +437,17 @@ function populateMessageTargets(connected) {
     : "No agents connected yet — they will read this in the timeline when they join.";
 }
 
+function populateProposalAgents(connected) {
+  const select = $("#proposal-agent");
+  if (!select) return;
+  const previous = select.value;
+  const unique = [...new Map(connected.map((agent) => [agent.name, agent])).values()];
+  select.innerHTML = [`<option value="">Anyone available</option>`]
+    .concat(unique.map((agent) => `<option value="${escapeHtml(agent.name)}">${escapeHtml(agent.name)} · ${escapeHtml(agent.provider)}</option>`))
+    .join("");
+  select.value = unique.some((agent) => agent.name === previous) ? previous : "";
+}
+
 document.addEventListener("click", async (event) => {
   const removeAttachment = event.target.closest("[data-remove-attachment]");
   if (removeAttachment) {
@@ -532,12 +567,10 @@ $("#message-form").addEventListener("submit", async (event) => {
     const markers = uploaded.map((attachment) => `[[devteam-attachment ${JSON.stringify(attachment)}]]`);
     const body = { message: [message, ...markers].filter(Boolean).join("\n"), target };
     if (replyTo) body.replyTo = replyTo.id;
-    if (continuationMode) body.continueTask = true;
     await api(`/api/tasks/${taskId}/messages`, { method: "POST", body: JSON.stringify(body) });
     field.value = "";
     clearPendingAttachments();
     replyTo = null;
-    continuationMode = false;
     renderReplyContext();
     await refresh();
   } catch (error) { toast(error.message); }
@@ -554,13 +587,6 @@ $("#message-form").addEventListener("keydown", (event) => {
 $("#attachment-input").addEventListener("change", (event) => {
   addAttachments(event.target.files || []);
   event.target.value = "";
-});
-
-$("#continue-work").addEventListener("click", () => {
-  continuationMode = !continuationMode;
-  const task = state?.selectedTask;
-  if (task) renderContinuationControl(task, task.assignments.filter((item) => ["queued", "claimed"].includes(item.status)).length);
-  $("#message-form").elements.message.focus();
 });
 
 $("#message-form").addEventListener("paste", (event) => {
@@ -598,6 +624,17 @@ $("#proposal-form").addEventListener("submit", async (event) => {
   } catch (error) { toast(error.message); }
 });
 
+$("#accept-task").addEventListener("click", async () => {
+  if (!confirm("Accept this task without full agent consensus?\n\nThis overrides the normal independent-review requirement. The task will be marked as human-accepted.")) return;
+  const summary = prompt("Optional: add a short acceptance note (or press OK to skip).");
+  try { await api(`/api/tasks/${selectedTaskId}/accept`, { method: "POST", body: JSON.stringify({ summary: summary || "Human accepted from dashboard" }) }); await refresh(); toast("Task accepted"); } catch (error) { toast(error.message); }
+});
+
+$("#unblock-task").addEventListener("click", async () => {
+  const reason = prompt("Why is the task ready to resume?"); if (!reason) return;
+  try { await api(`/api/tasks/${selectedTaskId}/unblock`, { method: "POST", body: JSON.stringify({ reason }) }); await refresh(); toast("Task unblocked — agents can resume"); } catch (error) { toast(error.message); }
+});
+
 $("#block-task").addEventListener("click", async () => {
   const reason = prompt("Why should the team stop this task?"); if (!reason) return;
   try { await api(`/api/tasks/${selectedTaskId}/block`, { method: "POST", body: JSON.stringify({ reason }) }); await refresh(); } catch (error) { toast(error.message); }
@@ -621,7 +658,49 @@ $("#toggle-description").addEventListener("click", () => {
   if (state?.selectedTask) renderTaskDescription(state.selectedTask.description);
 });
 
+function initPanelToggles() {
+  const shell = $(".app-shell");
+  const sidebarBtn = $("#toggle-sidebar");
+  const teamBtn = $("#toggle-team");
+  const narrow = window.innerWidth <= 1050;
+  if (localStorage.getItem("dt-sidebar") === "collapsed" || (narrow && !localStorage.getItem("dt-sidebar"))) shell.classList.add("sidebar-collapsed");
+  if (localStorage.getItem("dt-panel") === "collapsed" || (narrow && !localStorage.getItem("dt-panel"))) shell.classList.add("panel-collapsed");
+  if (narrow && !shell.classList.contains("sidebar-collapsed") && !shell.classList.contains("panel-collapsed")) shell.classList.add("panel-collapsed");
+  const sync = () => {
+    const sidebarOpen = !shell.classList.contains("sidebar-collapsed");
+    const panelOpen = !shell.classList.contains("panel-collapsed");
+    sidebarBtn.setAttribute("aria-expanded", String(sidebarOpen));
+    teamBtn.setAttribute("aria-expanded", String(panelOpen));
+    localStorage.setItem("dt-sidebar", sidebarOpen ? "open" : "collapsed");
+    localStorage.setItem("dt-panel", panelOpen ? "open" : "collapsed");
+  };
+  const togglePanel = (panel) => {
+    const className = panel === "sidebar" ? "sidebar-collapsed" : "panel-collapsed";
+    const opening = shell.classList.contains(className);
+    shell.classList.toggle(className);
+    if (opening && window.matchMedia("(max-width: 1050px)").matches) {
+      shell.classList.add(panel === "sidebar" ? "panel-collapsed" : "sidebar-collapsed");
+    }
+    sync();
+  };
+  sidebarBtn.addEventListener("click", () => togglePanel("sidebar"));
+  teamBtn.addEventListener("click", () => togglePanel("team"));
+  for (const button of document.querySelectorAll("[data-close-panel]")) {
+    button.addEventListener("click", () => {
+      shell.classList.add(button.dataset.closePanel === "sidebar" ? "sidebar-collapsed" : "panel-collapsed");
+      sync();
+    });
+  }
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape" || !window.matchMedia("(max-width: 1050px)").matches) return;
+    shell.classList.add("sidebar-collapsed", "panel-collapsed");
+    sync();
+  });
+  sync();
+}
+
 async function boot() {
+  initPanelToggles();
   try {
     config = await api("/api/config"); $("#server-address").textContent = new URL(config.mcpUrl).host;
     await refresh();
