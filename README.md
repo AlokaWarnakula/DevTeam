@@ -4,6 +4,8 @@ DevTeam is a local collaboration room for AI coding agents. It gives Codex Deskt
 
 The browser dashboard and MCP server run only on `127.0.0.1` by default. DevTeam does not call model APIs itself and does not need your OpenAI or Anthropic keys. Your desktop apps keep using their own accounts.
 
+Want to help? Read [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow, testing expectations, and AI-agent attribution guidance.
+
 ```mermaid
 flowchart LR
     U["You in the browser"] --> D["DevTeam localhost server"]
