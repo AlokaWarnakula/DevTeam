@@ -294,7 +294,10 @@ test("a long-silent read-only claim is recovered automatically", async (t) => {
   const worker = store.connectAgent({ name: "Worker", provider: "test" });
   const plan = store.claimNextAssignment(worker.id); // planner role: read-only
   assert.equal(plan.requires_write, 0);
-  store.db.prepare("UPDATE agents SET last_seen = ? WHERE id = ?").run("2000-01-01T00:00:00.000Z", worker.id);
+  // Long enough silent to safely recover the read-only claim (> staleWorkMs), but not so long the
+  // agent is auto-purged as a ghost (< forgetMs) — so it survives as 'unresponsive' to be checked.
+  const longSilence = new Date(Date.now() - 20 * 60 * 1000).toISOString();
+  store.db.prepare("UPDATE agents SET last_seen = ? WHERE id = ?").run(longSilence, worker.id);
 
   const replacement = store.connectAgent({ name: "Replacement", provider: "test" });
   assert.equal(store.claimNextAssignment(replacement.id).id, plan.id, "a long-silent read-only claim is safely recovered");
@@ -1282,4 +1285,99 @@ test("continueTask during review advances the version and clears the in-progress
   assert.equal(cont.reopened, true, "a follow-up during review reopens as new work");
   assert.equal(cont.version, versionBefore + 1, "the version advances so the partial approval can't carry over");
   assert.equal(store.taskDetail(task.id).approvals.length, 0, "the in-progress approval is cleared");
+});
+
+test("forgetAgent removes an unresponsive ghost, returns its work, and refuses a live agent", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-forget-"));
+  const store = new DevTeamStore(dataDir, { liveness: { presenceMs: 1 } });
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Ghost project", process.cwd());
+  const task = store.createTask({ projectId: project.id, title: "Hold a lease", description: "Exercise ghost removal." });
+
+  const live = store.connectAgent({ name: "Live", provider: "Claude" });
+  assert.throws(() => store.forgetAgent(live.id), /still connected/, "a connected agent is protected from removal");
+
+  const writer = store.connectAgent({ name: "Writer", provider: "Codex" });
+  const plan = store.claimNextAssignment(writer.id);
+  store.createAssignment({ agentId: writer.id, taskId: task.id, title: "Edit core", description: "Change files.", role: "implementer", requiresWrite: true, targetAgentName: "Writer" });
+  store.completeAssignment({ agentId: writer.id, assignmentId: plan.id, message: "Planned." });
+  const write = store.claimNextAssignment(writer.id);
+  assert.equal(write.requires_write, 1, "the writer holds a write lease");
+
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  store.reapAndRecover();
+  assert.equal(store.getAgent(writer.id).status, "unresponsive", "a silent busy writer becomes unresponsive but keeps its claim");
+
+  const result = store.forgetAgent(writer.id);
+  assert.equal(result.forgotten, true);
+  assert.ok(!store.listAgents().some((agent) => agent.name === "Writer"), "the removed agent leaves the roster");
+  const wrote = store.taskDetail(task.id).assignments.find((assignment) => assignment.title === "Edit core");
+  assert.equal(wrote.status, "queued", "its unfinished write work returns to the queue");
+  assert.equal(wrote.agent_id, null);
+});
+
+test("long-gone agents are auto-purged, but a ghost still holding a write lease is kept", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-purge-"));
+  const store = new DevTeamStore(dataDir, { liveness: { presenceMs: 1, forgetMs: 1 } });
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Purge project", process.cwd());
+  const task = store.createTask({ projectId: project.id, title: "Reap the ghosts", description: "Exercise auto-purge." });
+
+  const writer = store.connectAgent({ name: "Writer", provider: "Codex" });
+  const idler = store.connectAgent({ name: "Idler", provider: "Claude" });
+  const plan = store.claimNextAssignment(writer.id);
+  store.createAssignment({ agentId: writer.id, taskId: task.id, title: "Edit core", description: "Change files.", role: "implementer", requiresWrite: true, targetAgentName: "Writer" });
+  store.completeAssignment({ agentId: writer.id, assignmentId: plan.id, message: "Planned." });
+  store.claimNextAssignment(writer.id); // Writer now holds a write lease.
+  store.disconnectAgent(idler.id); // Idler leaves for good, holding nothing.
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  store.reapAndRecover();
+  const names = store.listAgents().map((agent) => agent.name);
+  assert.ok(!names.includes("Idler"), "a long-disconnected agent is purged from the roster");
+  const survivor = store.listAgents().find((agent) => agent.name === "Writer");
+  assert.ok(survivor, "a ghost still holding a write lease is kept, not silently purged");
+  assert.equal(survivor.status, "unresponsive");
+});
+
+test("updateTask edits task information without touching version, approvals, or work", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-edit-task-"));
+  const store = new DevTeamStore(dataDir);
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Edit project", process.cwd());
+  const task = store.createTask({ projectId: project.id, title: "Typo in titel", description: "Old brief.", requiredApprovals: 2 });
+  const versionBefore = task.version;
+
+  const updated = store.updateTask(task.id, { title: "Fixed title", description: "Sharpened brief.", requiredApprovals: 3 });
+  assert.equal(updated.title, "Fixed title");
+  assert.equal(updated.description, "Sharpened brief.");
+  assert.equal(updated.required_approvals, 3);
+  assert.equal(updated.version, versionBefore, "editing the brief does not advance the version");
+  assert.equal(store.taskDetail(task.id).events.some((event) => event.type === "task.updated"), true, "the edit is recorded on the timeline");
+  assert.throws(() => store.updateTask(task.id, { title: "   " }), /title cannot be empty/);
+  assert.throws(() => store.updateTask("missing-id", { title: "x" }), /Task not found/);
+});
+
+test("updateProject renames a project and repoints its root with validation", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-edit-project-"));
+  const rootA = await mkdtemp(path.join(os.tmpdir(), "devteam-root-a-"));
+  const rootB = await mkdtemp(path.join(os.tmpdir(), "devteam-root-b-"));
+  const store = new DevTeamStore(dataDir);
+  t.after(async () => {
+    store.close();
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(rootA, { recursive: true, force: true });
+    await rm(rootB, { recursive: true, force: true });
+  });
+  const first = store.ensureProject("First", rootA);
+  const second = store.ensureProject("Second", rootB);
+
+  const renamed = store.updateProject(first.id, { name: "First renamed" });
+  assert.equal(renamed.name, "First renamed");
+  assert.equal(renamed.root, path.resolve(rootA), "leaving root out keeps the existing folder");
+
+  assert.throws(() => store.updateProject(first.id, { root: rootB }), /already uses that folder/, "a root already owned by another project is rejected");
+  const moved = store.updateProject(first.id, { root: rootA });
+  assert.equal(moved.root, path.resolve(rootA));
+  assert.throws(() => store.updateProject(second.id, { name: "  " }), /name cannot be empty/);
 });

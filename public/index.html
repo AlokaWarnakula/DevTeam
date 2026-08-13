@@ -35,7 +35,7 @@
           <h1 id="task-title">Bring your AI team together</h1>
           <p id="task-description">Create a task, connect agents through MCP, and watch the plan, implementation, tests, and review happen in one place.</p>
         </div>
-        <div class="header-actions"><span id="task-version" class="version">v1</span><button id="toggle-description" class="secondary hidden" type="button" aria-expanded="false">More</button><button id="copy-task-invite" class="secondary" title="Copy a task-specific agent prompt">Invite agent</button><button class="secondary" data-dialog="task-dialog">New task</button><button id="toggle-team" class="panel-toggle" type="button" aria-label="Toggle team panel" aria-expanded="true" aria-controls="team-panel" title="Toggle team panel">◧</button></div>
+        <div class="header-actions"><span id="task-version" class="version">v1</span><button id="toggle-description" class="secondary hidden" type="button" aria-expanded="false">More</button><button id="copy-task-invite" class="secondary" title="Copy a task-specific agent prompt">Invite agent</button><button id="edit-task" class="secondary hidden" type="button" title="Edit this task's title, description, or approvals">Edit task</button><button class="secondary" data-dialog="task-dialog">New task</button><button id="toggle-team" class="panel-toggle" type="button" aria-label="Toggle team panel" aria-expanded="true" aria-controls="team-panel" title="Toggle team panel">◧</button></div>
       </header>
 
       <section id="empty-state" class="empty-state">
@@ -83,6 +83,12 @@
         <div id="project-blackboard-list" class="blackboard-list"></div>
         <div class="divider"></div>
       </div>
+      <div id="codegraph-section" class="blackboard-section hidden">
+        <div class="panel-title"><h3>Code graph</h3><span id="codegraph-count" class="count">0</span></div>
+        <p class="memory-scope">Automatically maps local modules and import relationships.</p>
+        <div id="codegraph-summary" class="codegraph-summary"></div>
+        <div class="divider"></div>
+      </div>
       <div id="knowledge-section" class="blackboard-section hidden">
         <div class="panel-title"><h3>Knowledge vault</h3><span id="knowledge-count" class="count">0</span></div>
         <p class="memory-scope">Automatically maintained as Obsidian-compatible Markdown.</p>
@@ -124,6 +130,27 @@
       <label>Absolute folder path<input name="root" placeholder="C:\Projects\my-app" required></label>
       <p class="hint">Agents will receive this path with their assignments. The folder must already exist.</p>
       <div class="dialog-actions"><button type="button" class="secondary close">Cancel</button><button class="primary" value="submit">Add project</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="task-edit-dialog">
+    <form id="task-edit-form" method="dialog">
+      <div class="dialog-head"><div><span class="eyebrow">EDIT WORK</span><h2>Edit task details</h2></div><button type="button" class="close">×</button></div>
+      <label>Task title<input name="title" maxlength="120" required></label>
+      <label>What should the team deliver?<textarea name="description" rows="5" required></textarea></label>
+      <label>Independent approvals<select name="requiredApprovals"><option value="1">1 reviewer</option><option value="2">2 reviewers</option><option value="3">3 reviewers</option></select></label>
+      <p class="hint">Editing the brief does not reset the version, existing approvals, or work already done — it just updates the task's information.</p>
+      <div class="dialog-actions"><button type="button" class="secondary close">Cancel</button><button class="primary" value="submit">Save changes</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="project-edit-dialog">
+    <form id="project-edit-form" method="dialog">
+      <div class="dialog-head"><div><span class="eyebrow">WORKSPACE</span><h2>Edit project</h2></div><button type="button" class="close">×</button></div>
+      <label>Project name<input name="name" maxlength="80" required></label>
+      <label>Absolute folder path<input name="root" required></label>
+      <p class="hint">The folder must already exist. Changing it re-points where agents work and where the knowledge vault is written.</p>
+      <div class="dialog-actions"><button type="button" class="secondary close">Cancel</button><button class="primary" value="submit">Save changes</button></div>
     </form>
   </dialog>
 

@@ -89,7 +89,7 @@ async function refresh() {
 
 function render() {
   const task = state.selectedTask;
-  $("#project-list").innerHTML = state.projects.map((project) => `<div class="nav-row"><button class="project-item ${selectedProjectId === project.id ? "active" : ""}" data-project="${project.id}" title="Open ${escapeHtml(project.name)}"><span>${escapeHtml(project.name)}</span></button><button class="row-delete" data-delete-project="${project.id}" title="Remove project from DevTeam" aria-label="Remove ${escapeHtml(project.name)} from DevTeam">×</button></div>`).join("") || `<p class="hint">No projects</p>`;
+  $("#project-list").innerHTML = state.projects.map((project) => `<div class="nav-row"><button class="project-item ${selectedProjectId === project.id ? "active" : ""}" data-project="${project.id}" title="Open ${escapeHtml(project.name)}"><span>${escapeHtml(project.name)}</span></button><span class="row-actions"><button class="row-edit" data-edit-project="${project.id}" title="Edit project name or folder" aria-label="Edit ${escapeHtml(project.name)}">✎</button><button class="row-delete" data-delete-project="${project.id}" title="Remove project from DevTeam" aria-label="Remove ${escapeHtml(project.name)} from DevTeam">×</button></span></div>`).join("") || `<p class="hint">No projects</p>`;
   const visibleTasks = selectedProjectId ? state.tasks.filter((item) => item.project_id === selectedProjectId) : state.tasks;
   $("#task-count").textContent = visibleTasks.length;
   $("#task-list").innerHTML = visibleTasks.map((item) => `<div class="nav-row"><button class="task-item ${task?.id === item.id ? "active" : ""}" data-task="${item.id}" title="Open task history"><span class="dot"></span><span>${escapeHtml(item.title)}<small>${escapeHtml(item.status)} · ${item.open_assignments} open</small></span></button><button class="row-delete" data-delete-task="${item.id}" title="Delete task history" aria-label="Delete task history for ${escapeHtml(item.title)}">×</button></div>`).join("") || `<p class="hint">No tasks yet</p>`;
@@ -98,6 +98,7 @@ function render() {
   $("#empty-state").classList.toggle("hidden", Boolean(task));
   $("#conversation").classList.toggle("hidden", !task);
   $("#copy-task-invite").classList.toggle("hidden", !task);
+  $("#edit-task").classList.toggle("hidden", !task || task.status === "cancelled");
   $("#block-task").classList.toggle("hidden", !task || ["accepted", "blocked", "cancelled"].includes(task.status));
   $("#unblock-task").classList.toggle("hidden", !task || task.status !== "blocked");
   if (task) renderTask(task);
@@ -248,7 +249,10 @@ function renderMembers(task) {
   if (!members.length) { container.innerHTML = ""; return; }
   container.innerHTML = `<div class="members-head">In this room</div>` + members.map((member) => {
     const dead = member.status === "disconnected";
-    return `<div class="member-row ${dead ? "gone" : ""}"><span class="member-name">${escapeHtml(member.agent_name)}</span><span class="member-role ${member.role === "observer" ? "observer" : ""}">${escapeHtml(member.role)}</span><span class="member-status">${escapeHtml(member.status)}</span></div>`;
+    const forget = dead && member.agent_id
+      ? `<button class="row-delete" data-forget-agent="${member.agent_id}" data-forget-name="${escapeHtml(member.agent_name)}" title="Remove this agent from DevTeam" aria-label="Remove ${escapeHtml(member.agent_name)}">×</button>`
+      : "";
+    return `<div class="member-row ${dead ? "gone" : ""}"><span class="member-name">${escapeHtml(member.agent_name)}</span><span class="member-role ${member.role === "observer" ? "observer" : ""}">${escapeHtml(member.role)}</span><span class="member-status">${escapeHtml(member.status)}</span>${forget}</div>`;
   }).join("");
 }
 
@@ -256,7 +260,19 @@ function renderMembers(task) {
 function renderBlackboard(task) {
   renderMemoryScope("blackboard", task.blackboard || []);
   renderMemoryScope("project-blackboard", task.projectBlackboard || []);
+  renderCodeGraph(task);
   renderKnowledge(task);
+}
+
+function renderCodeGraph(task) {
+  const section = $("#codegraph-section");
+  if (!section) return;
+  const graph = task.codeGraph || {};
+  section.classList.toggle("hidden", !graph.automated && !graph.moduleCount && !graph.error);
+  $("#codegraph-count").textContent = graph.moduleCount || 0;
+  const warning = graph.truncated ? `<p class="codegraph-warning">Showing the deterministic 3,000-module safety cap.</p>` : "";
+  const error = graph.error ? `<p class="knowledge-error">Index needs attention: ${escapeHtml(graph.error.message)}</p>` : "";
+  $("#codegraph-summary").innerHTML = `${error}<div class="codegraph-metrics"><span><strong>${Number(graph.moduleCount || 0)}</strong> modules</span><span><strong>${Number(graph.edgeCount || 0)}</strong> edges</span></div>${warning}<small>${graph.indexedAt ? `Indexed ${relativeTime(graph.indexedAt)}` : "Ready — indexing starts automatically."}</small>${graph.path ? `<code title="${escapeHtml(graph.path)}">${escapeHtml(graph.path)}</code>` : ""}`;
 }
 
 function renderKnowledge(task) {
@@ -365,7 +381,12 @@ function renderAgentList() {
     const unread = agent.pending_messages > 0
       ? `<span class="unread-badge" title="${agent.pending_messages} message${agent.pending_messages === 1 ? "" : "s"} not delivered yet">${agent.pending_messages}</span>`
       : "";
-    return `<div class="agent"><div class="avatar">${initials(agent.name)}</div><div class="agent-info"><strong>${escapeHtml(agent.name)}${unread}</strong><small>${escapeHtml(agent.provider)} · ${escapeHtml(agent.status)}</small><small class="activity">${escapeHtml(activityLine(agent))}</small></div><span class="agent-status ${agent.status} ${freshness(agent.last_seen)}" title="${escapeHtml(agent.status)} · seen ${relativeTime(agent.last_seen)}"></span></div>`;
+    // An unresponsive agent that has genuinely left keeps lingering as "online" (it holds its claim
+    // on purpose). Offer a Remove so the human can clear the leftover session id on the spot.
+    const forget = agent.status === "unresponsive"
+      ? `<button class="row-delete" data-forget-agent="${agent.id}" data-forget-name="${escapeHtml(agent.name)}" title="Remove this unresponsive agent from DevTeam" aria-label="Remove ${escapeHtml(agent.name)}">×</button>`
+      : "";
+    return `<div class="agent"><div class="avatar">${initials(agent.name)}</div><div class="agent-info"><strong>${escapeHtml(agent.name)}${unread}</strong><small>${escapeHtml(agent.provider)} · ${escapeHtml(agent.status)}</small><small class="activity">${escapeHtml(activityLine(agent))}</small></div><span class="agent-actions"><span class="agent-status ${agent.status} ${freshness(agent.last_seen)}" title="${escapeHtml(agent.status)} · seen ${relativeTime(agent.last_seen)}"></span>${forget}</span></div>`;
   }).join("") || `<p class="hint">No agents connected. Copy the MCP setup, then invoke <code>$devteam</code> in an AI desktop.</p>`;
   renderReconnectList();
 }
@@ -495,6 +516,28 @@ document.addEventListener("click", async (event) => {
     } catch (error) { toast(error.message); }
     return;
   }
+  const forgetAgentButton = event.target.closest("[data-forget-agent]");
+  if (forgetAgentButton) {
+    const name = forgetAgentButton.dataset.forgetName || "this agent";
+    if (!confirm(`Remove ${name} from DevTeam?\n\nThis clears the leftover session id so it stops showing here. Any work it still holds returns to the queue. It can reconnect any time with $devteam.`)) return;
+    try {
+      await api(`/api/agents/${forgetAgentButton.dataset.forgetAgent}`, { method: "DELETE", body: JSON.stringify({}) });
+      await refresh();
+      toast(`${name} removed from DevTeam`);
+    } catch (error) { toast(error.message); }
+    return;
+  }
+  const editProjectButton = event.target.closest("[data-edit-project]");
+  if (editProjectButton) {
+    const project = state.projects.find((item) => item.id === editProjectButton.dataset.editProject);
+    if (!project) return;
+    const form = $("#project-edit-form");
+    form.dataset.projectId = project.id;
+    form.elements.name.value = project.name;
+    form.elements.root.value = project.root;
+    $("#project-edit-dialog").showModal();
+    return;
+  }
   if (event.target.closest(".reply-cancel")) { replyTo = null; renderReplyContext(); return; }
   const replyButton = event.target.closest("[data-reply]");
   if (replyButton) {
@@ -550,6 +593,41 @@ $("#project-form").addEventListener("submit", async (event) => {
   try {
     const project = await api("/api/projects", { method: "POST", body: JSON.stringify(Object.fromEntries(new FormData(event.target))) });
     selectedProjectId = project.id; event.target.reset(); event.target.closest("dialog").close(); await refresh(); toast("Project added");
+  } catch (error) { toast(error.message); }
+});
+
+$("#edit-task").addEventListener("click", () => {
+  const task = state?.selectedTask;
+  if (!task) return;
+  const form = $("#task-edit-form");
+  form.dataset.taskId = task.id;
+  form.elements.title.value = task.title;
+  form.elements.description.value = task.description;
+  form.elements.requiredApprovals.value = String(task.required_approvals);
+  $("#task-edit-dialog").showModal();
+});
+
+$("#task-edit-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.target;
+  const taskId = form.dataset.taskId;
+  if (!taskId) return;
+  const values = Object.fromEntries(new FormData(form));
+  try {
+    await api(`/api/tasks/${taskId}`, { method: "PATCH", body: JSON.stringify({ title: values.title, description: values.description, requiredApprovals: Number(values.requiredApprovals) }) });
+    form.closest("dialog").close(); await refresh(); toast("Task updated");
+  } catch (error) { toast(error.message); }
+});
+
+$("#project-edit-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.target;
+  const projectId = form.dataset.projectId;
+  if (!projectId) return;
+  const values = Object.fromEntries(new FormData(form));
+  try {
+    await api(`/api/projects/${projectId}`, { method: "PATCH", body: JSON.stringify({ name: values.name, root: values.root }) });
+    form.closest("dialog").close(); await refresh(); toast("Project updated");
   } catch (error) { toast(error.message); }
 });
 

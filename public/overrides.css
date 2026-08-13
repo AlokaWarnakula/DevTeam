@@ -668,6 +668,45 @@
   line-height: 1.4;
 }
 
+.codegraph-summary {
+  display: grid;
+  gap: 7px;
+}
+
+.codegraph-metrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+}
+
+.codegraph-metrics span {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #11151b;
+  padding: 8px;
+  color: #77828f;
+  font-size: 10px;
+}
+
+.codegraph-metrics strong {
+  display: block;
+  color: var(--blue);
+  font-size: 16px;
+}
+
+.codegraph-summary small,
+.codegraph-summary code {
+  color: #66717e;
+  font: 9px/1.35 ui-monospace, monospace;
+  overflow-wrap: anywhere;
+}
+
+.codegraph-warning {
+  margin: 0;
+  color: var(--amber);
+  font-size: 10px;
+}
+
 .conversation {
   flex: 1 1 auto;
   min-height: 0;
@@ -1053,3 +1092,36 @@
   .task-header > div:first-of-type { flex: 1 1 auto; }
   .header-actions { gap: 5px; }
 }
+
+/* Edit control in project rows: sits beside the existing remove (×) button. */
+.nav-row { grid-template-columns: minmax(0, 1fr) auto; }
+.row-actions { display: flex; align-items: center; gap: 2px; }
+.row-edit {
+  width: 25px;
+  height: 25px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: #65707d;
+  cursor: pointer;
+  opacity: 0;
+  transition: 0.15s;
+  font-size: 13px;
+  line-height: 1;
+}
+.nav-row:hover .row-edit,
+.row-edit:focus-visible { opacity: 1; }
+.row-edit:hover { background: #17212e; color: var(--blue); }
+
+/* Remove (×) control on a stale agent card: revealed with the status dot on hover. */
+.agent { position: relative; }
+.agent-actions { display: flex; align-items: center; gap: 7px; }
+.agent .row-delete { width: 22px; height: 22px; font-size: 15px; }
+.agent:hover .row-delete,
+.agent .row-delete:focus-visible { opacity: 1; }
+
+/* Remove (×) control on a gone room member. */
+.member-row .row-delete { width: 20px; height: 20px; font-size: 14px; flex: 0 0 auto; }
+.member-row:hover .row-delete,
+.member-row .row-delete:focus-visible { opacity: 1; }
+.member-row.gone:hover { opacity: 0.85; }

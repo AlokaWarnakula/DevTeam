@@ -3,6 +3,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { mkdirSync, statSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { CodeGraph } from "./codegraph.mjs";
 import { KnowledgeVault } from "./knowledge.mjs";
 
 const now = () => new Date().toISOString();
@@ -16,7 +17,7 @@ const fromJson = (value, fallback = null) => {
 };
 
 export class DevTeamStore extends EventEmitter {
-  constructor(dataDir, { liveness = {}, knowledge = {} } = {}) {
+  constructor(dataDir, { liveness = {}, knowledge = {}, codegraph = {} } = {}) {
     super();
     this.dataDir = path.resolve(dataDir);
     mkdirSync(this.dataDir, { recursive: true });
@@ -26,6 +27,8 @@ export class DevTeamStore extends EventEmitter {
     this.#migrate();
     this.knowledge = new KnowledgeVault(this.db, knowledge);
     this.knowledgeErrors = new Map();
+    this.codegraph = new CodeGraph(this.db, codegraph);
+    this.codegraphErrors = new Map();
     this.token = this.#getOrCreateToken();
     // Presence and ownership are different questions. A *busy* agent that goes quiet is
     // presumed to still be working — reasoning and editing make no MCP calls — so it keeps
@@ -38,6 +41,7 @@ export class DevTeamStore extends EventEmitter {
       staleWorkMs: 900_000,       // quiet longer than this: a read-only claim may be safely recovered
       proposalTimeoutMs: 600_000, // open longer than this: escalate the proposal for a human decision
       continuationWindowMs: 180_000, // after acceptance, keep the room "active" this long so members stay assembled for a same-conversation follow-up
+      forgetMs: 86_400_000,       // gone this long (disconnected, or unresponsive holding no write lease): purge the row so ghosts stop lingering as "online"
       ...liveness,
     };
     this.#recoverOrphanedClaims("Recovered an orphaned assignment during server startup.");
@@ -265,7 +269,7 @@ export class DevTeamStore extends EventEmitter {
 
   #changed(type, taskId = null) {
     const knowledgeChanges = new Set([
-      "task.created", "task.continued", "task.accepted", "task.blocked", "task.unblocked",
+      "task.created", "task.continued", "task.updated", "task.accepted", "task.blocked", "task.unblocked",
       "assignment.created", "assignment.completed", "assignment.blocked",
       "proposal.adopted", "blackboard.updated", "agent.decision", "agent.finding", "human.message",
     ]);
@@ -276,6 +280,18 @@ export class DevTeamStore extends EventEmitter {
       } catch (error) {
         this.knowledgeErrors.set(taskId, { message: error.message, at: now() });
         this.emit("knowledge-error", { taskId, type, error });
+      }
+    }
+    const codeGraphChanges = new Set(["task.created", "assignment.completed", "assignment.blocked"]);
+    if (taskId && codeGraphChanges.has(type)) {
+      const task = this.db.prepare("SELECT project_id FROM tasks WHERE id = ?").get(taskId);
+      const errorKey = task ? `project:${task.project_id}` : null;
+      try {
+        this.codegraph.syncTask(taskId);
+        if (errorKey) this.codegraphErrors.delete(errorKey);
+      } catch (error) {
+        if (errorKey) this.codegraphErrors.set(errorKey, { message: error.message, at: now() });
+        this.emit("codegraph-error", { taskId, type, error });
       }
     }
     this.emit("change", { type, taskId, at: now() });
@@ -340,9 +356,11 @@ export class DevTeamStore extends EventEmitter {
   #reapStaleAgents() {
     const presenceBefore = new Date(Date.now() - this.liveness.presenceMs).toISOString();
     const staleWorkBefore = new Date(Date.now() - this.liveness.staleWorkMs).toISOString();
+    const forgetBefore = new Date(Date.now() - this.liveness.forgetMs).toISOString();
     const stamp = now();
     const affectedTasks = new Set();
     let presenceChanged = false;
+    let purged = false;
     this.#transaction(() => {
       // Idle (waiting) agents that went silent are simply gone; they own nothing to protect.
       const goneIdle = this.db.prepare(`
@@ -370,9 +388,26 @@ export class DevTeamStore extends EventEmitter {
         this.#syncTaskStatus(row.task_id, stamp);
         affectedTasks.add(row.task_id);
       }
+      // Agents gone a very long time are purged so the roster reflects reality instead of showing
+      // days-old ghosts as "online". A disconnected agent already holds no claim; an unresponsive
+      // one is purged only when it holds no write lease — a still-held lease is left for a human to
+      // force-release first, preserving the write-safety guarantee.
+      const purgeable = this.db.prepare(`
+        SELECT id FROM agents
+        WHERE last_seen < ? AND (
+          status = 'disconnected'
+          OR (status = 'unresponsive' AND id NOT IN (
+            SELECT agent_id FROM assignments WHERE status = 'claimed' AND requires_write = 1 AND agent_id IS NOT NULL
+          ))
+        )
+      `).all(forgetBefore);
+      for (const row of purgeable) {
+        for (const taskId of this.#purgeAgent(row.id)) affectedTasks.add(taskId);
+        purged = true;
+      }
     });
     for (const taskId of affectedTasks) this.#changed("assignment.released", taskId);
-    if (presenceChanged) this.#changed("agent.disconnected");
+    if (presenceChanged || purged) this.#changed("agent.disconnected");
     return [];
   }
 
@@ -826,6 +861,8 @@ export class DevTeamStore extends EventEmitter {
     if (existing) {
       try { this.knowledge.initializeProject(existing.id); }
       catch (error) { this.knowledgeErrors.set(`project:${existing.id}`, { message: error.message, at: now() }); }
+      try { this.codegraph.initializeProject(existing.id); this.codegraphErrors.delete(`project:${existing.id}`); }
+      catch (error) { this.codegraphErrors.set(`project:${existing.id}`, { message: error.message, at: now() }); }
       return existing;
     }
     const project = { id: randomUUID(), name: name.trim(), root: normalizedRoot, created_at: now() };
@@ -833,6 +870,8 @@ export class DevTeamStore extends EventEmitter {
       .run(project.id, project.name, project.root, project.created_at);
     try { this.knowledge.initializeProject(project.id); }
     catch (error) { this.knowledgeErrors.set(`project:${project.id}`, { message: error.message, at: now() }); }
+    try { this.codegraph.initializeProject(project.id); this.codegraphErrors.delete(`project:${project.id}`); }
+    catch (error) { this.codegraphErrors.set(`project:${project.id}`, { message: error.message, at: now() }); }
     this.#changed("project.created");
     return project;
   }
@@ -847,6 +886,31 @@ export class DevTeamStore extends EventEmitter {
       GROUP BY p.id
       ORDER BY p.created_at ASC
     `).all();
+  }
+
+  // Edit a project's display name and/or its root folder after creation. Changing the root is
+  // validated for existence by the caller (server) and for uniqueness here (one project per root),
+  // and re-initializes the knowledge vault against the new location. At least one field must change.
+  updateProject(projectId, { name = undefined, root = undefined } = {}) {
+    const project = this.db.prepare("SELECT * FROM projects WHERE id = ?").get(projectId);
+    if (!project) throw new Error("Project not found.");
+    const nextName = name === undefined ? project.name : String(name).trim();
+    if (!nextName) throw new Error("Project name cannot be empty.");
+    const nextRoot = root === undefined ? project.root : path.resolve(root);
+    if (nextRoot !== project.root) {
+      const clash = this.db.prepare("SELECT id FROM projects WHERE root = ? AND id != ?").get(nextRoot, projectId);
+      if (clash) throw new Error("Another project already uses that folder.");
+    }
+    if (nextName === project.name && nextRoot === project.root) return project;
+    this.db.prepare("UPDATE projects SET name = ?, root = ? WHERE id = ?").run(nextName, nextRoot, projectId);
+    if (nextRoot !== project.root) {
+      try { this.knowledge.initializeProject(projectId); }
+      catch (error) { this.knowledgeErrors.set(`project:${projectId}`, { message: error.message, at: now() }); }
+      try { this.codegraph.initializeProject(projectId); this.codegraphErrors.delete(`project:${projectId}`); }
+      catch (error) { this.codegraphErrors.set(`project:${projectId}`, { message: error.message, at: now() }); }
+    }
+    this.#changed("project.updated");
+    return this.db.prepare("SELECT * FROM projects WHERE id = ?").get(projectId);
   }
 
   createTask({ projectId, title, description, requiredApprovals = 2 }) {
@@ -895,6 +959,39 @@ export class DevTeamStore extends EventEmitter {
           ORDER BY t.updated_at DESC
         `).all();
     return rows;
+  }
+
+  // Edit a task's own information (title, description, or how many independent approvals it needs)
+  // after creation, so a typo or a sharpened spec no longer means deleting and recreating the room.
+  // This is metadata only: it does not touch the version, existing approvals, assignments, or the
+  // timeline of work — it just records that the human revised the brief. At least one field changes.
+  updateTask(taskId, { title = undefined, description = undefined, requiredApprovals = undefined } = {}) {
+    const task = this.getTask(taskId);
+    if (!task) throw new Error("Task not found.");
+    if (task.status === "cancelled") throw new Error("A cancelled task cannot be edited.");
+    const nextTitle = title === undefined ? task.title : String(title).trim();
+    if (!nextTitle) throw new Error("Task title cannot be empty.");
+    const nextDescription = description === undefined ? task.description : String(description).trim();
+    if (!nextDescription) throw new Error("Task description cannot be empty.");
+    const nextApprovals = requiredApprovals === undefined
+      ? task.required_approvals
+      : Math.max(1, Math.min(8, Number(requiredApprovals) || task.required_approvals));
+    if (nextTitle === task.title && nextDescription === task.description && nextApprovals === task.required_approvals) {
+      return this.getTask(taskId);
+    }
+    const changed = [
+      nextTitle !== task.title ? "title" : null,
+      nextDescription !== task.description ? "description" : null,
+      nextApprovals !== task.required_approvals ? "approvals" : null,
+    ].filter(Boolean);
+    const stamp = now();
+    this.#transaction(() => {
+      this.db.prepare("UPDATE tasks SET title = ?, description = ?, required_approvals = ?, updated_at = ? WHERE id = ?")
+        .run(nextTitle, nextDescription, nextApprovals, stamp, taskId);
+      this.#event(taskId, null, "task.updated", `Task details edited (${changed.join(", ")}).`, { changed, requiredApprovals: nextApprovals });
+    });
+    this.#changed("task.updated", taskId);
+    return this.getTask(taskId);
   }
 
   deleteProject(projectId, confirmName) {
@@ -1198,6 +1295,49 @@ export class DevTeamStore extends EventEmitter {
     try { agent = this.getAgent(agentId); } catch { return { disconnected: false }; }
     if (agent.status === "disconnected") return { disconnected: false };
     return this.disconnectAgent(agentId, "MCP transport closed.");
+  }
+
+  // Human-driven removal of an agent that has left for good. A currently connected agent
+  // (waiting/busy) is protected: it must go unresponsive or disconnect first, so a live teammate
+  // is never deleted out from under its own work by accident. Pass force to override that guard.
+  // Releasing any claim the agent still holds is part of removal — the human's explicit removal is
+  // the confirmation, mirroring force-release — so a stuck write lease is freed as the ghost goes.
+  forgetAgent(agentId, { force = false } = {}) {
+    const agent = this.getAgent(agentId); // throws a clear "connect again" error if already gone
+    if (!force && !["disconnected", "unresponsive"].includes(agent.status)) {
+      throw new Error("Agent is still connected. Disconnect it, or wait for it to go unresponsive, before removing it.");
+    }
+    const affectedTaskIds = this.#transaction(() => this.#purgeAgent(agentId));
+    for (const taskId of affectedTaskIds) this.#changed("assignment.released", taskId);
+    this.#changed("agent.forgotten");
+    return { forgotten: true, agentId, name: agent.name };
+  }
+
+  // Remove an agent row entirely: release any live claim it still holds, detach the historical
+  // references the schema would otherwise pin (events, completed assignments, and proposals it
+  // raised are nullable with no cascade), then delete it — approvals, message receipts, and room
+  // memberships cascade away. Runs inside the caller's transaction and returns the task ids whose
+  // open work changed, so the caller can emit the right change signals.
+  #purgeAgent(agentId) {
+    const stamp = now();
+    const name = this.db.prepare("SELECT name FROM agents WHERE id = ?").get(agentId)?.name || "An agent";
+    const claimedTaskIds = this.db.prepare(
+      "SELECT DISTINCT task_id FROM assignments WHERE agent_id = ? AND status = 'claimed'",
+    ).all(agentId).map((row) => row.task_id);
+    if (claimedTaskIds.length) {
+      this.db.prepare(
+        "UPDATE assignments SET status = 'queued', agent_id = NULL, claimed_at = NULL WHERE agent_id = ? AND status = 'claimed'",
+      ).run(agentId);
+      for (const taskId of claimedTaskIds) {
+        this.#event(taskId, null, "assignment.released", `${name}'s work returned to the queue when the agent was removed.`, { reason: "agent-forgotten" });
+        this.#syncTaskStatus(taskId, stamp);
+      }
+    }
+    this.db.prepare("UPDATE assignments SET agent_id = NULL WHERE agent_id = ?").run(agentId);
+    this.db.prepare("UPDATE events SET agent_id = NULL WHERE agent_id = ?").run(agentId);
+    this.db.prepare("UPDATE proposals SET proposer_id = NULL WHERE proposer_id = ?").run(agentId);
+    this.db.prepare("DELETE FROM agents WHERE id = ?").run(agentId);
+    return claimedTaskIds;
   }
 
   // Human-driven recovery for a stuck claim — e.g. a crashed writer whose write lease will
@@ -1970,6 +2110,33 @@ export class DevTeamStore extends EventEmitter {
     };
   }
 
+  codeGraphSearch({ agentId = null, taskId, path: modulePath }) {
+    const task = this.getTask(taskId);
+    if (!task) throw new Error("Task not found.");
+    this.assertMembership(agentId, taskId);
+    return {
+      automated: this.codegraph.enabled,
+      graphPath: path.join(task.project_root, "knowledge", "graph"),
+      ...this.codegraph.neighborhood(taskId, modulePath),
+    };
+  }
+
+  codeContextForAssignment(agentId, taskId, assignmentId) {
+    this.getAgent(agentId);
+    this.assertMembership(agentId, taskId);
+    const task = this.getTask(taskId);
+    const errorKey = task ? `project:${task.project_id}` : null;
+    try {
+      this.codegraph.reconcileTask(taskId);
+      if (errorKey) this.codegraphErrors.delete(errorKey);
+      return this.codegraph.codeContext(taskId, { assignmentId });
+    } catch (error) {
+      if (errorKey) this.codegraphErrors.set(errorKey, { message: error.message, at: now() });
+      this.emit("codegraph-error", { taskId, type: "codegraph.context", error });
+      return this.codegraph.enabled ? [] : null;
+    }
+  }
+
   taskDetail(taskId) {
     const task = this.getTask(taskId);
     if (!task) return null;
@@ -1988,7 +2155,7 @@ export class DevTeamStore extends EventEmitter {
       };
     });
     const members = this.db.prepare(`
-      SELECT m.role, ag.name AS agent_name, ag.provider AS agent_provider, ag.status
+      SELECT m.role, ag.id AS agent_id, ag.name AS agent_name, ag.provider AS agent_provider, ag.status
       FROM task_members m JOIN agents ag ON ag.id = m.agent_id
       WHERE m.task_id = ? ORDER BY m.joined_at ASC
     `).all(taskId);
@@ -2026,6 +2193,7 @@ export class DevTeamStore extends EventEmitter {
     const projectBlackboard = this.db.prepare("SELECT key, value, version, updated_by_name, updated_at FROM project_blackboard WHERE project_id = ? ORDER BY key ASC")
       .all(task.project_id).map((row) => ({ scope: "project", key: row.key, value: row.value, version: row.version, updatedBy: row.updated_by_name, updatedAt: row.updated_at }));
     const knowledge = this.knowledge.list(task.project_id, { limit: 30 });
+    const codeGraphState = this.codegraph.projectState(task.project_id);
     return {
       ...task, assignments, approvals, events, proposals, blackboard, projectBlackboard, knowledge, members,
       knowledgeVault: {
@@ -2034,12 +2202,30 @@ export class DevTeamStore extends EventEmitter {
         noteCount: knowledge.length,
         error: this.knowledgeErrors.get(taskId) || this.knowledgeErrors.get(`project:${task.project_id}`) || null,
       },
+      codeGraph: {
+        automated: this.codegraph.enabled,
+        path: path.join(task.project_root, "knowledge", "graph"),
+        moduleCount: codeGraphState?.moduleCount || 0,
+        edgeCount: codeGraphState?.edgeCount || 0,
+        truncated: Boolean(codeGraphState?.truncated),
+        indexedAt: codeGraphState?.indexedAt || null,
+        error: this.codegraphErrors.get(`project:${task.project_id}`) || null,
+      },
     };
   }
 
   taskBrief(agentId, taskId) {
     this.getAgent(agentId);
     this.assertMembership(agentId, taskId);
+    const task = this.getTask(taskId);
+    const errorKey = task ? `project:${task.project_id}` : null;
+    try {
+      this.codegraph.reconcileTask(taskId);
+      if (errorKey) this.codegraphErrors.delete(errorKey);
+    } catch (error) {
+      if (errorKey) this.codegraphErrors.set(errorKey, { message: error.message, at: now() });
+      this.emit("codegraph-error", { taskId, type: "codegraph.brief", error });
+    }
     const detail = this.taskDetail(taskId);
     if (!detail) throw new Error("Task not found.");
     const clip = (value, max) => {
@@ -2080,6 +2266,12 @@ export class DevTeamStore extends EventEmitter {
         blockedBy: assignment.blockedBy,
       }));
     const currentAssignment = openAssignments.find((assignment) => detail.assignments.find((item) => item.id === assignment.id)?.agent_id === agentId) || null;
+    let codeContext = this.codegraph.enabled ? [] : null;
+    try { codeContext = this.codegraph.codeContext(taskId, { assignmentId: currentAssignment?.id || null }); }
+    catch (error) {
+      if (errorKey) this.codegraphErrors.set(errorKey, { message: error.message, at: now() });
+      this.emit("codegraph-error", { taskId, type: "codegraph.context", error });
+    }
     return {
       task: {
         id: detail.id,
@@ -2094,6 +2286,7 @@ export class DevTeamStore extends EventEmitter {
       taskMemory: detail.blackboard.map(summarizeNote),
       projectMemory: detail.projectBlackboard.map(summarizeNote),
       projectKnowledge: this.knowledge.relevant(detail.project_id, taskId, 12),
+      codeContext,
       openProposals: detail.proposals.filter((proposal) => proposal.status === "open").map((proposal) => ({ id: proposal.id, kind: proposal.kind, summary: clip(proposal.summary, 800), votes: proposal.votes })),
       recent,
       unresolvedQuestions,

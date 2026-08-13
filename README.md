@@ -11,7 +11,7 @@ DevTeam began as a simple way to put several agents in one room. It has grown in
 - **Human-led roles and decisions** — connecting agents do not appoint themselves. You or a DevTeam assignment tells each agent whether it is planning, implementing, testing, or reviewing. Agent proposals appear in the dashboard for an explicit **Agree** or **Object** decision, and accepting the finished task is a separate human action.
 - **Safe parallel work** — bounded assignments, dependency chains, one claim per agent, fencing tokens, and path-scoped write leases prevent overlapping writers from silently damaging each other's work.
 - **Evidence instead of vague status** — agents report exact changed files, checks, findings, and checklist results. File-changing work advances the task version and invalidates stale approvals.
-- **Durable project intelligence** — task/project blackboards and an automatic Obsidian-compatible `knowledge/` vault preserve architecture, decisions, components, conventions, pitfalls, workflows, and session history across tasks.
+- **Durable project intelligence** — task/project blackboards and an automatic Obsidian-compatible `knowledge/` vault preserve architecture, decisions, components, conventions, pitfalls, workflows, and session history across tasks. CodeGraph adds a deterministic local map of JS/TS modules and imports.
 - **Honest review** — independent reviewers are required when available; solo work can still finish but is clearly marked `selfReviewed`. Human acceptance is recorded as a human override, never disguised as agent consensus.
 - **Recovery without chaos** — resumable sessions, message replay, room routing, assignment-level blockers, task-level stops, human Resume, and force-release controls keep interrupted work recoverable.
 - **A practical local dashboard** — responsive collapsible panels, live presence, targeted messages, threaded replies, safe Markdown emphasis, proposals, work evidence, memory, and knowledge stay visible in one place.
@@ -27,7 +27,7 @@ flowchart LR
     A["Claude Desktop"] <-->|"MCP tools"| D
     O["Other MCP agent"] <-->|"MCP tools"| D
     D --> Q["SQLite tasks, messages, approvals"]
-    D --> K["Automatic knowledge/ vault"]
+    D --> K["Automatic knowledge/ vault + CodeGraph"]
     C --> W["Shared project files"]
     A --> W
     O --> W
@@ -114,7 +114,7 @@ Other agents can join if they support MCP Streamable HTTP and custom request hea
 2. Each desktop agent connects from the task-specific **Invite agent** prompt and calls `devteam_wait`. On a server with several active tasks, an unscoped connect returns `room_required` plus compact task IDs; the agent must call `devteam_join` before waiting, so it cannot mistake the global lobby for a quiet task room.
 3. The first agent receives the planning assignment and its role from DevTeam. It inspects the project and posts the plan. When you or that planning assignment authorizes a work split, it creates bounded implementation, test, and review assignments with declared write paths and real prerequisites (`dependsOn`). Connecting alone never authorizes an agent to choose or assign roles.
 4. Write assignments whose declared paths don't overlap run **in parallel**; overlapping ones (or a write with no declared paths, which locks the whole project) wait. A dependent assignment stays queued until every prerequisite is done. Read-only review can still happen independently. Each agent holds one claimed assignment at a time.
-5. Agents begin with `devteam_brief`, a bounded context pack containing the goal, current/open assignments and dependencies, both memory scopes, relevant durable knowledge, open proposals, recent decisions/findings, and unresolved questions—without downloading the full task history. They post decisions and evidence to the shared timeline, keep current-job state in **task memory** and durable cross-task context in **project memory** (`devteam_note_set`/`_get` with `scope: task|project`, versioned with provenance), and report exact files and checks. DevTeam automatically converts that structured history into the project's `knowledge/` vault; `devteam_knowledge` searches it when an agent needs more. It records declared file paths but never reads source-file contents. Review, security, and test assignments carry a role checklist so the team systematically covers auth, sessions, input, secrets, and other blind spots. The dashboard shows each agent's live activity ("implementing…", "security review…"), its write-lease scope, both memory scopes, and the knowledge vault, and messages can be replied to as threads.
+5. Agents begin with `devteam_brief`, a bounded context pack containing the goal, current/open assignments and dependencies, both memory scopes, relevant durable knowledge, automatic task-relevant CodeGraph context, open proposals, recent decisions/findings, and unresolved questions—without downloading the full task history. The same bounded code context arrives automatically with a newly claimed assignment. Agents post decisions and evidence to the shared timeline, keep current-job state in **task memory** and durable cross-task context in **project memory** (`devteam_note_set`/`_get` with `scope: task|project`, versioned with provenance), and report exact files and checks. DevTeam converts that structured history into the project's `knowledge/` vault; `devteam_knowledge` searches it when an agent needs more, while `devteam_codegraph` returns one bounded module neighborhood. Review, security, and test assignments carry a role checklist so the team systematically covers auth, sessions, input, secrets, and other blind spots. The dashboard shows each agent's live activity ("implementing…", "security review…"), its write-lease scope, both memory scopes, the knowledge vault, and CodeGraph health, and messages can be replied to as threads.
 6. Each file-changing report advances the task version and clears older approvals. The author of a version cannot approve it when another teammate can review instead; a solo self-acceptance is labeled `selfReviewed`.
 7. When the current version has enough independent approvals and no open work, the task is accepted.
 
@@ -136,11 +136,17 @@ knowledge/
   pitfalls/
   workflows/
   archive/
+  graph/
+    graph.json
+    INDEX.md
+    <module notes>.md
 ```
 
 Completed and blocked assignments, adopted proposals, agent decisions/findings, task lifecycle changes, and project-memory updates are processed automatically. Notes include task/event provenance, related non-secret file paths, timestamps, revision, confidence, and a lifecycle status (`verified`, `inferred`, `disputed`, `stale`, or `archived`). SQLite remains the transactional source of truth and one exporter writes the Markdown, so agents never race on shared vault files. Existing `memory/INDEX.md` and recent `memory_YYYY-MM-DD.md` Shorekeeper files are copied into `knowledge/archive/` on first use; the originals are left untouched. Secret-like values and paths are redacted or excluded, imports are size/count bounded, and DevTeam writes only under the registered project root.
 
 The vault is ordinary Markdown and may be opened directly in Obsidian or version-controlled when that is appropriate for the project. Treat it like project documentation: review it before publishing a repository. This DevTeam repository ignores its own live `knowledge/` output so local task history is not accidentally pushed to GitHub.
+
+CodeGraph is maintained with no manual indexing command. Project registration performs a safe full scan; completed or blocked assignments immediately re-index their reported paths; throttled reconciliation before briefings catches manual edits, crashes, renames, and incomplete reports. It indexes only bounded JS/TS-family metadata plus JSON leaves, never source bodies, and ignores symlinks, generated/hidden directories, secret-like paths, binary files, and files over 256 KiB. Relative imports are preserved even while unresolved so a later target file can create the edge without reparsing its importer. Output under `knowledge/graph/` is deterministic, collision-safe, capped at 3,000 modules, and owned independently from the rest of the knowledge vault.
 
 Agent-to-agent messages are durable in SQLite. Sessions are **resumable**: a returning agent calls `devteam_resume` with the token from its earlier connect to reclaim its in-progress assignment and replay messages sent while it was away — a second same-name session no longer evicts the first. An agent that goes quiet mid-work is flagged `unresponsive` (amber) and keeps its write lease rather than being reaped.
 

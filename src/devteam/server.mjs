@@ -42,9 +42,10 @@ export async function startDevTeamServer({
   workspaceRoot = process.cwd(),
   liveness = {},
   knowledge = { enabled: true },
+  codegraph = { enabled: true },
 } = {}) {
   if (!dataDir) throw new Error("dataDir is required.");
-  const store = new DevTeamStore(dataDir, { liveness, knowledge });
+  const store = new DevTeamStore(dataDir, { liveness, knowledge, codegraph });
   const attachmentRoot = path.resolve(dataDir, "attachments");
   const root = requireDirectory(workspaceRoot);
   store.ensureProject(path.basename(root), root);
@@ -174,6 +175,13 @@ export async function startDevTeamServer({
     requireFields(req.body, ["name", "root"]);
     res.status(201).json(store.ensureProject(req.body.name, requireDirectory(req.body.root)));
   });
+  app.patch("/api/projects/:projectId", (req, res) => {
+    const patch = {};
+    if (typeof req.body?.name === "string") patch.name = req.body.name;
+    if (typeof req.body?.root === "string" && req.body.root.trim()) patch.root = requireDirectory(req.body.root);
+    if (!Object.keys(patch).length) throw new Error("Provide a new name or folder path to update.");
+    res.json(store.updateProject(req.params.projectId, patch));
+  });
   app.delete("/api/projects/:projectId", (req, res) => {
     requireFields(req.body, ["confirmName"]);
     res.json(store.deleteProject(req.params.projectId, req.body.confirmName));
@@ -181,6 +189,14 @@ export async function startDevTeamServer({
   app.post("/api/tasks", (req, res) => {
     requireFields(req.body, ["projectId", "title", "description"]);
     res.status(201).json(store.createTask(req.body));
+  });
+  app.patch("/api/tasks/:taskId", (req, res) => {
+    const patch = {};
+    if (typeof req.body?.title === "string") patch.title = req.body.title;
+    if (typeof req.body?.description === "string") patch.description = req.body.description;
+    if (req.body?.requiredApprovals !== undefined) patch.requiredApprovals = Number(req.body.requiredApprovals);
+    if (!Object.keys(patch).length) throw new Error("Provide a title, description, or approval count to update.");
+    res.json(store.updateTask(req.params.taskId, patch));
   });
   app.delete("/api/tasks/:taskId", (req, res) => {
     requireFields(req.body, ["confirmTaskId"]);
@@ -247,6 +263,9 @@ export async function startDevTeamServer({
   app.post("/api/tasks/:taskId/accept", (req, res) => {
     requireFields(req.body, ["summary"]);
     res.json(store.acceptTaskByHuman({ taskId: req.params.taskId, summary: req.body.summary }));
+  });
+  app.delete("/api/agents/:agentId", (req, res) => {
+    res.json(store.forgetAgent(req.params.agentId, { force: req.body?.force === true }));
   });
   app.post("/api/assignments/:assignmentId/force-release", (req, res) => {
     requireFields(req.body, ["confirmTitle"]);

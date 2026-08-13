@@ -153,9 +153,11 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
       }
       const assignment = store.claimNextAssignment(agentId);
       if (assignment) {
+        const codeContext = store.codeContextForAssignment(agentId, assignment.task_id, assignment.id);
         return {
           status: "assigned",
           assignment,
+          codeContext,
           keepWaiting: true,
           instructions: "Inspect the current project state before acting. Complete this bounded assignment, then call devteam_report — pass back assignment.claimToken so a stale report is fenced if your lease moved. Use devteam_assign to delegate follow-up implementation, testing, or independent review.",
         };
@@ -190,7 +192,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
 
   server.registerTool("devteam_brief", {
     title: "Read a compact task briefing",
-    description: "Read a bounded, membership-scoped briefing instead of the full task timeline: goal/version/project, your current assignment, open work and dependencies, task/project memory, open proposals, recent decisions/findings, and unresolved questions.",
+    description: "Read a bounded, membership-scoped briefing instead of the full task timeline: goal/version/project, your current assignment, open work and dependencies, task/project memory, relevant durable knowledge, automatic bounded code context, recent decisions/findings, and unresolved questions.",
     inputSchema: {
       agentId: z.string().uuid(),
       taskId: z.string().uuid(),
@@ -325,6 +327,19 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
   }, safe(async (args) => {
     requireIdentity(args.agentId);
     return withInbox(args.agentId, store.knowledgeSearch(args));
+  }));
+
+  server.registerTool("devteam_codegraph", {
+    title: "Inspect the automatic code graph",
+    description: "Return a bounded, task-membership-scoped one-hop neighborhood for one indexed module. Results contain paths and symbols only, never source bodies.",
+    inputSchema: {
+      agentId: z.string().uuid(),
+      taskId: z.string().uuid(),
+      path: z.string().min(1).max(500).describe("Project-relative module path"),
+    },
+  }, safe(async (args) => {
+    requireIdentity(args.agentId);
+    return withInbox(args.agentId, store.codeGraphSearch({ agentId: args.agentId, taskId: args.taskId, path: args.path }));
   }));
 
   server.registerTool("devteam_report", {

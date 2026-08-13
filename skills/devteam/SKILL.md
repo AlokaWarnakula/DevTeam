@@ -49,12 +49,12 @@ You stay reachable even while busy: **any** tool result may include a `pendingMe
 
 ## Shared team memory
 
-DevTeam has two versioned blackboards: **task memory** for the current job and **project memory** for durable context shared by every task in the same registered project. It also maintains an automatic Obsidian-compatible `knowledge/` vault from structured team events. Project scope is inferred from the authorized `taskId`; DevTeam records declared changed-file paths but does not read source-file contents.
+DevTeam has two versioned blackboards: **task memory** for the current job and **project memory** for durable context shared by every task in the same registered project. It also maintains an automatic Obsidian-compatible `knowledge/` vault from structured team events and an automatic CodeGraph under `knowledge/graph/` that maps local JS/TS modules and imports. Project scope is inferred from the authorized `taskId`; CodeGraph stores only bounded structural metadata, never source bodies.
 
-- At the start of your work, prefer `devteam_brief` for a bounded context pack (goal, current/open assignments, dependencies, both memory scopes, relevant durable knowledge, recent decisions, and unresolved questions). Use `devteam_note_get` when you need a full specific blackboard value, or `devteam_knowledge` to search architecture, decisions, components, conventions, pitfalls, workflows, and imported legacy memory.
+- At the start of your work, prefer `devteam_brief` for a bounded context pack (goal, current/open assignments, dependencies, both memory scopes, relevant durable knowledge, automatic task-relevant code context, recent decisions, and unresolved questions). A claimed assignment also carries the same bounded code context automatically. Use `devteam_note_get` when you need a full specific blackboard value, `devteam_knowledge` to search architecture/decisions/conventions, or `devteam_codegraph` for a bounded one-hop module neighborhood.
 - Record shared state with `devteam_note_set` under a clear `key` (e.g. `world`, `decisions`, `ownership`) and the narrowest useful scope. A structured world model is just JSON stored under one key.
 - Writes use optimistic concurrency: pass the `version` you read as `expectedVersion`. If it conflicts (a teammate wrote first), re-read, merge your change onto the current value, and set it again — never clobber.
-- Do not manually edit generated vault notes during an active DevTeam run. Report exact results, checks, decisions, findings, blockers, and changed files through the normal tools; the serialized exporter creates provenance-rich Markdown automatically. Existing Shorekeeper `memory/` files are imported without deletion.
+- Do not manually edit generated vault or CodeGraph notes during an active DevTeam run. Report exact results, checks, decisions, findings, blockers, and changed files through the normal tools; the serialized exporters update Markdown automatically and reconciliation repairs unreported filesystem drift. Existing Shorekeeper `memory/` files are imported without deletion.
 
 ## Proposals and team decisions
 

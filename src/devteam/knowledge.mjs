@@ -19,7 +19,7 @@ const parseJson = (value, fallback = null) => {
   try { return value == null ? fallback : JSON.parse(value); } catch { return fallback; }
 };
 
-const redact = (value) => String(value || "")
+export const redact = (value) => String(value || "")
   .replace(/-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----/gi, "[REDACTED PRIVATE KEY]")
   .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{12,}/gi, "Bearer [REDACTED]")
   .replace(/\b(gh[opusr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,})\b/g, "[REDACTED TOKEN]")
@@ -35,7 +35,7 @@ const short = (value, max = 200) => {
   return text.length > max ? `${text.slice(0, Math.max(1, max - 1))}…` : text;
 };
 
-const slugify = (value, fallback = "note") => {
+export const slugify = (value, fallback = "note") => {
   const slug = String(value || "").toLowerCase().normalize("NFKD")
     .replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80);
   return slug || fallback;
@@ -43,7 +43,7 @@ const slugify = (value, fallback = "note") => {
 
 const yamlString = (value) => JSON.stringify(String(value ?? ""));
 const stampDate = (value) => String(value || new Date().toISOString()).slice(0, 10);
-const secretLike = (file) => {
+export const secretLike = (file) => {
   const clean = String(file || "").replace(/\\/g, "/").toLowerCase();
   return clean === ".env" || clean.startsWith(".env.") || clean.includes("/.env")
     || /(^|\/)(credentials?|secrets?|tokens?|private[-_.]?keys?)(\/|\.|$)/.test(clean)
@@ -87,7 +87,7 @@ function frontmatter(note) {
   ].join("\n");
 }
 
-function atomicWrite(filePath, content) {
+export function atomicWrite(filePath, content) {
   mkdirSync(path.dirname(filePath), { recursive: true });
   const temp = `${filePath}.tmp-${process.pid}`;
   writeFileSync(temp, content, { encoding: "utf8", mode: 0o600 });
