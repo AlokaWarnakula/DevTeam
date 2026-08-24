@@ -66,10 +66,11 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
       provider: z.string().min(1).max(80).describe("Provider or host, for example OpenAI Codex Desktop or Anthropic Claude Desktop"),
       capabilities: z.array(z.string().max(80)).max(20).default([]).describe("Useful specialties such as implementation, review, security, or testing"),
       runtimeProfile: z.any().optional().describe("Provider-neutral host/runtime profile. Report only host-, adapter-, or user-supplied model and effort options; never invent availability."),
+      sessionGeneration: z.number().int().min(1).optional().describe("Host-reported fresh conversation generation when available."),
       taskId: z.string().uuid().optional().describe("Task room to join on connect. Required to disambiguate a server hosting more than one task."),
     },
-  }, safe(async ({ name, provider, capabilities, runtimeProfile, taskId }) => {
-    const agent = store.connectAgent({ name, provider, capabilities, runtimeProfile });
+  }, safe(async ({ name, provider, capabilities, runtimeProfile, sessionGeneration, taskId }) => {
+    const agent = store.connectAgent({ name, provider, capabilities, runtimeProfile, sessionGeneration, freshTaskId: taskId || null });
     session.agentId = agent.id;
     let room = null;
     if (taskId) {
@@ -156,6 +157,8 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
           next: "The team is deciding how to organise. Review each proposal and vote with devteam_vote (agree or object, with a short reason). A proposal is adopted only when every connected teammate agrees.",
         };
       }
+      const rotation = store.sessionRotationRecommendation(agentId);
+      if (rotation) return { ...rotation, keepWaiting: true };
       const assignment = store.claimNextAssignment(agentId);
       if (assignment) {
         if (assignment.runtimeActionRequired) {
@@ -227,6 +230,15 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
   }, safe(async ({ agentId, profile }) => {
     requireIdentity(agentId);
     return withInbox(agentId, { updated: true, runtimeProfile: store.updateRuntimeProfile({ agentId, profile }) });
+  }));
+
+  server.registerTool("devteam_session_continue", {
+    title: "Continue the current session",
+    description: "Record the human choice to continue this desktop session after a fresh-session recommendation. This is advisory and does not prove context quality.",
+    inputSchema: { agentId: z.string().uuid(), taskId: z.string().uuid() },
+  }, safe(async ({ agentId, taskId }) => {
+    requireIdentity(agentId);
+    return withInbox(agentId, store.continueCurrentSession({ agentId, taskId }));
   }));
 
   server.registerTool("devteam_assignment_assessment", {

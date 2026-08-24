@@ -120,6 +120,8 @@ Other agents can join if they support MCP Streamable HTTP and custom request hea
 7. Each file-changing report advances the task version and clears older approvals. The author of a version cannot approve it when another teammate can review instead; a solo self-acceptance is labeled `selfReviewed`.
 8. When the current version has enough independent approvals and no open work, the task is accepted.
 
+New tasks default to `per_task`: the dashboard copies a task-specific fresh-session invitation, and a profiled session identifies the task it was opened for. Related assignments stay in that session. `adaptive` adds explicit recovery/context-pressure rotation points, `manual` preserves the pre-migration behavior, and experimental `per_assignment` is intentionally discouraged. Existing database rows migrate to `manual`, so an upgrade never surprises an active team. A recommendation never releases an active claim; desktop users either open the fresh invitation (using a checkpoint for active work) or explicitly record that they are continuing the current session.
+
 An assignment that reports `status: blocked` now stops only that assignment and queues a planner to re-scope it; sibling work continues. `devteam_block` (or **Stop and block task**) is the explicit task-wide stop. A blocked task can be resumed from the dashboard, which advances the version, clears stale approvals, and creates a fresh planner assignment rather than reviving old claims. When all work is closed and the task is in review, the human can also **Accept task**; this is recorded and displayed as a human override, never mislabeled as independent agent consensus.
 
 ### Automatic project knowledge

@@ -310,6 +310,13 @@ export class DevTeamStore extends EventEmitter {
       ["assignments", "claim_token_hash", "TEXT"],                        // hashed fencing token for the live claim
       ["assignments", "assignment_version", "INTEGER NOT NULL DEFAULT 1"],
       ["assignments", "complexity_override", "TEXT"],
+      ["tasks", "session_policy", "TEXT NOT NULL DEFAULT 'manual'"],
+      ["tasks", "session_policy_version", "INTEGER NOT NULL DEFAULT 1"],
+      ["tasks", "base_runtime_profile", "TEXT"],
+      ["agents", "session_generation", "INTEGER NOT NULL DEFAULT 1"],
+      ["agents", "fresh_task_id", "TEXT"],
+      ["agents", "replaced_by_agent_id", "TEXT"],
+      ["agents", "session_policy_ack_task_id", "TEXT"],
     ]) {
       try { this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`); } catch { /* already present */ }
     }
@@ -1002,7 +1009,7 @@ export class DevTeamStore extends EventEmitter {
     return this.db.prepare("SELECT * FROM projects WHERE id = ?").get(projectId);
   }
 
-  createTask({ projectId, title, description, requiredApprovals = 2 }) {
+  createTask({ projectId, title, description, requiredApprovals = 2, sessionPolicy = "per_task", baseRuntimeProfile = null }) {
     const project = this.db.prepare("SELECT * FROM projects WHERE id = ?").get(projectId);
     if (!project) throw new Error("Project not found.");
     const taskId = randomUUID();
@@ -1011,9 +1018,12 @@ export class DevTeamStore extends EventEmitter {
     const approvals = Math.max(1, Math.min(8, Number(requiredApprovals) || 2));
     this.#transaction(() => {
       this.db.prepare(`
-        INSERT INTO tasks (id, project_id, title, description, status, version, required_approvals, created_at, updated_at)
-        VALUES (?, ?, ?, ?, 'planning', 1, ?, ?, ?)
-      `).run(taskId, projectId, title.trim(), description.trim(), approvals, stamp, stamp);
+        INSERT INTO tasks (id, project_id, title, description, status, version, required_approvals,
+          session_policy, session_policy_version, base_runtime_profile, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 'planning', 1, ?, ?, 1, ?, ?, ?)
+      `).run(taskId, projectId, title.trim(), description.trim(), approvals,
+        ["manual", "per_task", "adaptive", "per_assignment"].includes(sessionPolicy) ? sessionPolicy : "per_task",
+        baseRuntimeProfile ? json(baseRuntimeProfile) : null, stamp, stamp);
       this.db.prepare(`
         INSERT INTO assignments (id, task_id, title, description, role, requires_write, status, created_at)
         VALUES (?, ?, ?, ?, 'planner', 0, 'queued', ?)
@@ -1056,7 +1066,7 @@ export class DevTeamStore extends EventEmitter {
   // after creation, so a typo or a sharpened spec no longer means deleting and recreating the room.
   // This is metadata only: it does not touch the version, existing approvals, assignments, or the
   // timeline of work — it just records that the human revised the brief. At least one field changes.
-  updateTask(taskId, { title = undefined, description = undefined, requiredApprovals = undefined } = {}) {
+  updateTask(taskId, { title = undefined, description = undefined, requiredApprovals = undefined, sessionPolicy = undefined, baseRuntimeProfile = undefined } = {}) {
     const task = this.getTask(taskId);
     if (!task) throw new Error("Task not found.");
     if (task.status === "cancelled") throw new Error("A cancelled task cannot be edited.");
@@ -1067,19 +1077,26 @@ export class DevTeamStore extends EventEmitter {
     const nextApprovals = requiredApprovals === undefined
       ? task.required_approvals
       : Math.max(1, Math.min(8, Number(requiredApprovals) || task.required_approvals));
-    if (nextTitle === task.title && nextDescription === task.description && nextApprovals === task.required_approvals) {
+    const nextPolicy = sessionPolicy === undefined ? task.session_policy : String(sessionPolicy);
+    if (!["manual", "per_task", "adaptive", "per_assignment"].includes(nextPolicy)) throw new Error("Invalid session policy.");
+    const nextBaseProfile = baseRuntimeProfile === undefined ? task.base_runtime_profile : (baseRuntimeProfile == null ? null : json(baseRuntimeProfile));
+    if (nextTitle === task.title && nextDescription === task.description && nextApprovals === task.required_approvals
+      && nextPolicy === task.session_policy && nextBaseProfile === task.base_runtime_profile) {
       return this.getTask(taskId);
     }
     const changed = [
       nextTitle !== task.title ? "title" : null,
       nextDescription !== task.description ? "description" : null,
       nextApprovals !== task.required_approvals ? "approvals" : null,
+      nextPolicy !== task.session_policy ? "session policy" : null,
+      nextBaseProfile !== task.base_runtime_profile ? "base runtime profile" : null,
     ].filter(Boolean);
     const stamp = now();
     this.#transaction(() => {
-      this.db.prepare("UPDATE tasks SET title = ?, description = ?, required_approvals = ?, updated_at = ? WHERE id = ?")
-        .run(nextTitle, nextDescription, nextApprovals, stamp, taskId);
-      this.#event(taskId, null, "task.updated", `Task details edited (${changed.join(", ")}).`, { changed, requiredApprovals: nextApprovals });
+      this.db.prepare(`UPDATE tasks SET title = ?, description = ?, required_approvals = ?, session_policy = ?,
+        session_policy_version = session_policy_version + ?, base_runtime_profile = ?, updated_at = ? WHERE id = ?`)
+        .run(nextTitle, nextDescription, nextApprovals, nextPolicy, nextPolicy === task.session_policy ? 0 : 1, nextBaseProfile, stamp, taskId);
+      this.#event(taskId, null, "task.updated", `Task details edited (${changed.join(", ")}).`, { changed, requiredApprovals: nextApprovals, sessionPolicy: nextPolicy });
     });
     this.#changed("task.updated", taskId);
     return this.getTask(taskId);
@@ -1806,7 +1823,7 @@ export class DevTeamStore extends EventEmitter {
     };
   }
 
-  connectAgent({ name, provider, capabilities = [], runtimeProfile = null }) {
+  connectAgent({ name, provider, capabilities = [], runtimeProfile = null, sessionGeneration = 1, freshTaskId = null }) {
     const cleanName = name.trim();
     const cleanProvider = provider.trim();
     if (!cleanName || !cleanProvider) throw new Error("Agent name and provider are required.");
@@ -1822,9 +1839,9 @@ export class DevTeamStore extends EventEmitter {
     const RECONNECT_REPLAY_MS = 6 * 60 * 60 * 1000;
     this.#transaction(() => {
       this.db.prepare(`
-        INSERT INTO agents (id, name, provider, capabilities, status, connected_at, last_seen, resume_token_hash)
-        VALUES (?, ?, ?, ?, 'waiting', ?, ?, ?)
-      `).run(id, cleanName, cleanProvider, json(capabilities), stamp, stamp, this.#hashToken(resumeToken));
+        INSERT INTO agents (id, name, provider, capabilities, status, connected_at, last_seen, resume_token_hash, session_generation, fresh_task_id)
+        VALUES (?, ?, ?, ?, 'waiting', ?, ?, ?, ?, ?)
+      `).run(id, cleanName, cleanProvider, json(capabilities), stamp, stamp, this.#hashToken(resumeToken), Math.max(1, Number(sessionGeneration) || 1), freshTaskId || null);
       // A returning identity (same name+provider) that recently disconnected should still see what it
       // missed while away, even on a plain reconnect that carries no resume token. Inherit that prior
       // session's read floor — never its claim or write lease — so the backlog of directed/broadcast
@@ -1852,6 +1869,39 @@ export class DevTeamStore extends EventEmitter {
     // The resume token is returned exactly once, to this caller, and only its hash is stored.
     if (runtimeProfile) this.updateRuntimeProfile({ agentId: id, profile: runtimeProfile });
     return { ...this.getAgent(id), runtimeProfile: this.runtimeProfile(id), resumeToken };
+  }
+
+  sessionRotationRecommendation(agentId) {
+    const agent = this.getAgent(agentId);
+    if (!this.runtimeProfile(agentId)) return null;
+    const rooms = this.#claimableTaskIds(agentId);
+    for (const taskId of rooms) {
+      const task = this.getTask(taskId);
+      if (!task || !["per_task", "adaptive", "per_assignment"].includes(task.session_policy)) continue;
+      if (task.session_policy !== "per_assignment" && (agent.fresh_task_id === taskId || agent.session_policy_ack_task_id === taskId)) continue;
+      const eligible = Number(this.db.prepare("SELECT COUNT(*) AS count FROM assignments WHERE task_id = ? AND status = 'queued'").get(taskId).count);
+      if (!eligible) continue;
+      return {
+        status: "session_rotation_recommended", taskId, sessionPolicy: task.session_policy,
+        sessionGeneration: Number(agent.session_generation || 1),
+        reason: task.session_policy === "per_assignment"
+          ? "This experimental task policy recommends a fresh session for each assignment."
+          : "This task uses a fresh-session policy and the current profiled session was not started for this task.",
+        actions: ["create_checkpoint", "continue_current_session"],
+        next: "Open a fresh task-specific session or explicitly continue this session. Active claims are never released by this recommendation.",
+      };
+    }
+    return null;
+  }
+
+  continueCurrentSession({ agentId, taskId }) {
+    this.assertMembership(agentId, taskId);
+    const task = this.getTask(taskId);
+    if (!task) throw new Error("Task not found.");
+    this.db.prepare("UPDATE agents SET session_policy_ack_task_id = ?, last_seen = ? WHERE id = ?").run(taskId, now(), agentId);
+    this.#event(taskId, agentId, "session.rotation_continued", "The human chose to continue the current session despite the fresh-session recommendation.", { sessionPolicy: task.session_policy });
+    this.#changed("session.rotation_continued", taskId);
+    return { continued: true, taskId, advisory: true };
   }
 
   getAgent(agentId) {

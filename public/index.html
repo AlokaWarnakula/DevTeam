@@ -138,6 +138,7 @@
       <label>Task title<input name="title" maxlength="120" placeholder="Add password reset flow" required></label>
       <label>What should the team deliver?<textarea name="description" rows="5" placeholder="Describe the outcome, constraints, and definition of done…" required></textarea></label>
       <label>Independent approvals<select name="requiredApprovals"><option value="2">2 reviewers (recommended)</option><option value="1">1 reviewer</option><option value="3">3 reviewers</option></select></label>
+      <label>Session policy<select name="sessionPolicy"><option value="per_task" selected>Fresh session per task (recommended)</option><option value="adaptive">Adaptive</option><option value="manual">Manual</option><option value="per_assignment">Per assignment (experimental)</option></select></label>
       <div class="dialog-actions"><button type="button" class="secondary close">Cancel</button><button class="primary" value="submit">Start task</button></div>
     </form>
   </dialog>
@@ -158,6 +159,7 @@
       <label>Task title<input name="title" maxlength="120" required></label>
       <label>What should the team deliver?<textarea name="description" rows="5" required></textarea></label>
       <label>Independent approvals<select name="requiredApprovals"><option value="1">1 reviewer</option><option value="2">2 reviewers</option><option value="3">3 reviewers</option></select></label>
+      <label>Session policy<select name="sessionPolicy"><option value="per_task">Fresh session per task</option><option value="adaptive">Adaptive</option><option value="manual">Manual</option><option value="per_assignment">Per assignment (experimental)</option></select></label>
       <p class="hint">Editing the brief does not reset the version, existing approvals, or work already done — it just updates the task's information.</p>
       <div class="dialog-actions"><button type="button" class="secondary close">Cancel</button><button class="primary" value="submit">Save changes</button></div>
     </form>

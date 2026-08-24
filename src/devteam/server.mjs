@@ -208,8 +208,14 @@ export async function startDevTeamServer({
     if (typeof req.body?.title === "string") patch.title = req.body.title;
     if (typeof req.body?.description === "string") patch.description = req.body.description;
     if (req.body?.requiredApprovals !== undefined) patch.requiredApprovals = Number(req.body.requiredApprovals);
-    if (!Object.keys(patch).length) throw new Error("Provide a title, description, or approval count to update.");
+    if (typeof req.body?.sessionPolicy === "string") patch.sessionPolicy = req.body.sessionPolicy;
+    if (Object.hasOwn(req.body || {}, "baseRuntimeProfile")) patch.baseRuntimeProfile = req.body.baseRuntimeProfile;
+    if (!Object.keys(patch).length) throw new Error("Provide task details or a session policy to update.");
     res.json(store.updateTask(req.params.taskId, patch));
+  });
+  app.patch("/api/tasks/:taskId/session-policy", (req, res) => {
+    requireFields(req.body, ["sessionPolicy"]);
+    res.json(store.updateTask(req.params.taskId, { sessionPolicy: req.body.sessionPolicy, baseRuntimeProfile: req.body?.baseRuntimeProfile }));
   });
   app.delete("/api/tasks/:taskId", (req, res) => {
     requireFields(req.body, ["confirmTaskId"]);

@@ -171,10 +171,11 @@ function renderTask(task) {
   const taskChanged = renderedTaskId !== task.id;
   if (taskChanged) descriptionExpanded = false;
   $("#project-name").textContent = task.project_name;
-  $("#task-status").textContent = task.status;
+  $("#task-status").textContent = `${task.status} · ${(task.session_policy || "manual").replace("_", " ")}`;
   $("#task-title").textContent = task.title;
   renderTaskDescription(task.description);
   $("#task-version").textContent = `v${task.version}`;
+  $("#copy-task-invite").textContent = task.session_policy === "manual" ? "Invite agent" : "Fresh-session invite";
   const eventList = $("#event-list");
   const nearBottom = taskChanged || eventList.scrollHeight - eventList.scrollTop - eventList.clientHeight < 220;
   renderedTaskId = task.id;
@@ -451,7 +452,7 @@ function renderAgentList() {
     const runtime = profile
       ? `<small class="runtime-profile">${escapeHtml(profile.currentModel || "unknown model")} · ${escapeHtml(profile.currentEffort || "unknown effort")} · ${escapeHtml(profile.source)}${profile.stale ? " · expired" : ""}</small>`
       : `<small class="runtime-profile unknown">Runtime not advertised</small>`;
-    return `<div class="agent"><div class="avatar">${initials(agent.name)}</div><div class="agent-info"><strong>${escapeHtml(agent.name)}${unread}</strong><small>${escapeHtml(agent.provider)} · ${escapeHtml(agent.status)}</small>${runtime}<small class="activity">${escapeHtml(activityLine(agent))}</small></div><span class="agent-actions"><span class="agent-status ${agent.status} ${freshness(agent.last_seen)}" title="${escapeHtml(agent.status)} · seen ${relativeTime(agent.last_seen)}"></span>${forget}</span></div>`;
+    return `<div class="agent"><div class="avatar">${initials(agent.name)}</div><div class="agent-info"><strong>${escapeHtml(agent.name)}${unread}</strong><small>${escapeHtml(agent.provider)} · ${escapeHtml(agent.status)} · session ${Number(agent.session_generation || 1)}</small>${runtime}<small class="activity">${escapeHtml(activityLine(agent))}</small></div><span class="agent-actions"><span class="agent-status ${agent.status} ${freshness(agent.last_seen)}" title="${escapeHtml(agent.status)} · seen ${relativeTime(agent.last_seen)}"></span>${forget}</span></div>`;
   }).join("") || `<p class="hint">No agents connected. Copy the MCP setup, then invoke <code>$devteam</code> in an AI desktop.</p>`;
   renderReconnectList();
 }
@@ -472,7 +473,8 @@ function renderReconnectList() {
 function agentInvite(name = "your agent") {
   const task = state?.selectedTask;
   if (!task) return "Use $devteam to join the local DevTeam.";
-  return `Use $devteam as ${name} and join task "${task.title}" with taskId ${task.id}. If this is a returning session, resume the prior DevTeam session so missed messages replay before claiming work.`;
+  const fresh = task.session_policy === "manual" ? "" : " Open a fresh desktop conversation for this task using host-advertised runtime settings; related assignments normally stay in that session.";
+  return `Use $devteam as ${name} and join task "${task.title}" with taskId ${task.id}.${fresh} If this is the same returning conversation, resume the prior DevTeam session so missed messages replay before claiming work. Use checkpoint takeover only when the invitation includes a one-time checkpoint token.`;
 }
 
 function addAttachments(files) {
@@ -815,6 +817,7 @@ $("#edit-task").addEventListener("click", () => {
   form.elements.title.value = task.title;
   form.elements.description.value = task.description;
   form.elements.requiredApprovals.value = String(task.required_approvals);
+  form.elements.sessionPolicy.value = task.session_policy || "manual";
   $("#task-edit-dialog").showModal();
 });
 
@@ -825,7 +828,7 @@ $("#task-edit-form").addEventListener("submit", async (event) => {
   if (!taskId) return;
   const values = Object.fromEntries(new FormData(form));
   try {
-    await api(`/api/tasks/${taskId}`, { method: "PATCH", body: JSON.stringify({ title: values.title, description: values.description, requiredApprovals: Number(values.requiredApprovals) }) });
+    await api(`/api/tasks/${taskId}`, { method: "PATCH", body: JSON.stringify({ title: values.title, description: values.description, requiredApprovals: Number(values.requiredApprovals), sessionPolicy: values.sessionPolicy }) });
     form.closest("dialog").close(); await refresh(); toast("Task updated");
   } catch (error) { toast(error.message); }
 });
