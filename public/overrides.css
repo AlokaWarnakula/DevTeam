@@ -94,6 +94,28 @@
   line-height: 1.35;
 }
 
+.composer-guidance {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 12px;
+  min-width: 0;
+}
+
+.composer-shortcut {
+  color: #8994a2;
+  white-space: nowrap;
+}
+
+.composer-shortcut kbd {
+  padding: 1px 5px;
+  border: 1px solid #343d49;
+  border-bottom-color: #485361;
+  border-radius: 4px;
+  background: #10151c;
+  color: #aeb8c4;
+  font: 9px ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
 .event-main {
   min-width: 0;
 }
@@ -109,6 +131,12 @@
   max-width: 100%;
   overflow-wrap: anywhere;
   word-break: break-word;
+}
+
+.event-body {
+  /* Preserve authored paragraphs and repeated spaces while still wrapping long text. */
+  white-space: pre-wrap;
+  white-space: break-spaces;
 }
 
 /* Distinct treatment for messages from the human operator */
@@ -785,6 +813,22 @@
   z-index: 3;
 }
 
+.composer:focus-within {
+  border-color: color-mix(in srgb, var(--blue) 60%, #2c343e);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--blue) 10%, transparent), 0 18px 60px #0009;
+}
+
+.composer textarea {
+  min-height: 1.45em;
+  line-height: 1.45;
+  overflow-y: hidden;
+}
+
+.composer .send:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+
 .composer.dragging {
   border-color: var(--blue);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--blue) 18%, transparent), 0 18px 60px #0009;
@@ -1069,6 +1113,21 @@
   max-height: 3em;
 }
 
+#task-description {
+  white-space: pre-wrap;
+  white-space: break-spaces;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+#task-description.is-long.expanded {
+  max-height: min(36vh, 24rem);
+  padding-right: 10px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
 #toggle-description {
   padding-inline: 10px;
   color: var(--blue);
@@ -1216,6 +1275,17 @@
   }
 }
 
+/* Keep task copy readable on laptop-width screens instead of squeezing it beside five controls. */
+@media (min-width: 1051px) and (max-width: 1450px) {
+  .task-header { flex-wrap: wrap; }
+  .task-header > div:first-of-type { flex: 1 1 calc(100% - 58px); }
+  .header-actions {
+    flex: 1 0 100%;
+    justify-content: flex-end;
+    padding-left: 48px;
+  }
+}
+
 @media (max-width: 720px) {
   .sidebar { width: 85vw; max-width: 300px; }
   .team-panel { width: 85vw; max-width: 320px; }
@@ -1224,6 +1294,9 @@
   .task-header { gap: 10px; }
   .task-header > div:first-of-type { flex: 1 1 auto; }
   .header-actions { gap: 5px; }
+  #task-description { display: block; font-size: 12px; }
+  #task-description.collapsed { display: -webkit-box; }
+  #toggle-description { display: inline-flex; }
 }
 
 /* Edit control in project rows: sits beside the existing remove (×) button. */

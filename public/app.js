@@ -46,6 +46,7 @@ let proposalTaskId = null;
 let proposalStatuses = new Map();
 let renderedTaskId = null;
 let descriptionExpanded = false;
+let messageSending = false;
 const ATTACHMENT_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf"]);
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 
@@ -259,12 +260,23 @@ function renderSessionCheckpoints(task) {
 function renderTaskDescription(description) {
   const element = $("#task-description");
   const button = $("#toggle-description");
-  const long = String(description || "").length > 220 || String(description || "").split("\n").length > 3;
-  element.textContent = description;
+  const text = String(description || "");
+  const long = text.length > 220 || text.split("\n").length > 3;
+  if (element.textContent !== text) element.textContent = text;
+  element.classList.toggle("is-long", long);
   element.classList.toggle("collapsed", long && !descriptionExpanded);
+  element.classList.toggle("expanded", long && descriptionExpanded);
   button.classList.toggle("hidden", !long);
   button.textContent = descriptionExpanded ? "Less" : "More";
-  button.setAttribute("aria-expanded", String(descriptionExpanded));
+  button.setAttribute("aria-expanded", String(long && descriptionExpanded));
+}
+
+function resizeMessageField(field) {
+  field.style.height = "auto";
+  const maxHeight = Number.parseFloat(getComputedStyle(field).maxHeight) || 130;
+  const height = Math.min(field.scrollHeight, maxHeight);
+  field.style.height = `${height}px`;
+  field.style.overflowY = field.scrollHeight > maxHeight ? "auto" : "hidden";
 }
 
 // Who belongs to this task room and in what role — so the human can see the room's membership,
@@ -847,12 +859,14 @@ $("#project-edit-form").addEventListener("submit", async (event) => {
 
 $("#message-form").addEventListener("submit", async (event) => {
   event.preventDefault(); if (!selectedTaskId) return;
+  if (messageSending) return;
   const field = event.target.elements.message;
   const target = event.target.elements.target?.value || "all";
   const message = field.value.trim();
   const taskId = selectedTaskId;
   if (!message && pendingAttachments.length === 0) { toast("Write a message or attach a file"); return; }
   const sendButton = event.target.querySelector(".send");
+  messageSending = true;
   sendButton.disabled = true;
   try {
     const uploaded = await Promise.all(pendingAttachments.map((item) => uploadAttachment(item.file, taskId)));
@@ -861,20 +875,23 @@ $("#message-form").addEventListener("submit", async (event) => {
     if (replyTo) body.replyTo = replyTo.id;
     await api(`/api/tasks/${taskId}/messages`, { method: "POST", body: JSON.stringify(body) });
     field.value = "";
+    resizeMessageField(field);
     clearPendingAttachments();
     replyTo = null;
     renderReplyContext();
     await refresh();
   } catch (error) { toast(error.message); }
-  finally { sendButton.disabled = false; }
+  finally { messageSending = false; sendButton.disabled = false; }
 });
 
 $("#message-form").addEventListener("keydown", (event) => {
-  if (event.target.tagName === "TEXTAREA" && event.key === "Enter" && !event.shiftKey) {
+  if (event.target.tagName === "TEXTAREA" && event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {
     event.preventDefault();
     event.target.form.requestSubmit();
   }
 });
+
+$("#message-form").elements.message.addEventListener("input", (event) => resizeMessageField(event.target));
 
 $("#attachment-input").addEventListener("change", (event) => {
   addAttachments(event.target.files || []);

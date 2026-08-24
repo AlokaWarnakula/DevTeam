@@ -18,6 +18,15 @@ test("dashboard API and authenticated MCP endpoint work together", async (t) => 
   assert.match(homeHtml, /DevTeam/);
   assert.match(homeHtml, /Memory health/);
   assert.match(homeHtml, /knowledge-filter/);
+  assert.match(homeHtml, /role="log" aria-label="Team chat history"/, "chat history has accessible log semantics");
+  assert.match(homeHtml, /Shift \+ Enter<\/kbd> new line/, "multiline drafting shortcut is visible");
+  const dashboardScript = await fetch(`${instance.url}/app.js`).then((response) => response.text());
+  const dashboardStyles = await fetch(`${instance.url}/overrides.css`).then((response) => response.text());
+  assert.match(dashboardScript, /function resizeMessageField\(/, "the message composer grows with multiline drafts");
+  assert.match(dashboardScript, /!event\.isComposing/, "IME composition does not submit a partial message");
+  assert.match(dashboardScript, /if \(messageSending\) return;/, "duplicate sends are guarded while a post is in flight");
+  assert.match(dashboardStyles, /#task-description[\s\S]*white-space: break-spaces;/, "task descriptions preserve authored whitespace");
+  assert.match(dashboardStyles, /#task-description\.is-long\.expanded[\s\S]*overflow-y: auto;/, "expanded long briefs stay bounded and scrollable");
   const config = await fetch(`${instance.url}/api/config`).then((response) => response.json());
   assert.equal(config.mcpUrl, instance.mcpUrl);
   const state = await fetch(`${instance.url}/api/state`).then((response) => response.json());
@@ -180,10 +189,11 @@ test("a human message wakes a waiting agent through MCP and records delivery", a
   const connected = await client.callTool({ name: "devteam_connect", arguments: { name: "Codex", provider: "test", capabilities: ["coding"] } });
   const agentId = connected.structuredContent.agent.id;
 
+  const authoredMessage = "Codex,\n\nplease   prioritise security.";
   await fetch(`${instance.url}/api/tasks/${task.id}/messages`, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${instance.store.token}` },
-    body: JSON.stringify({ message: "Codex, please prioritise security.", target: "Codex" }),
+    body: JSON.stringify({ message: authoredMessage, target: "Codex" }),
   });
 
   const waking = await client.callTool({ name: "devteam_wait", arguments: { agentId, timeoutSeconds: 5 } });
@@ -193,6 +203,7 @@ test("a human message wakes a waiting agent through MCP and records delivery", a
 
   const detail = await fetch(`${instance.url}/api/tasks/${task.id}`).then((response) => response.json());
   const humanEvent = detail.events.find((event) => event.type === "human.message");
+  assert.equal(humanEvent.message, authoredMessage, "internal line breaks and repeated spaces survive the chat pipeline");
   assert.ok(humanEvent.receipts.some((receipt) => receipt.agent_name === "Codex" && receipt.delivered_at), "delivery is recorded for the dashboard");
 
   const nextWait = await client.callTool({ name: "devteam_wait", arguments: { agentId, timeoutSeconds: 5 } });
