@@ -122,6 +122,8 @@ Other agents can join if they support MCP Streamable HTTP and custom request hea
 
 New tasks default to `per_task`: the dashboard copies a task-specific fresh-session invitation, and a profiled session identifies the task it was opened for. Related assignments stay in that session. `adaptive` adds explicit recovery/context-pressure rotation points, `manual` preserves the pre-migration behavior, and experimental `per_assignment` is intentionally discouraged. Existing database rows migrate to `manual`, so an upgrade never surprises an active team. A recommendation never releases an active claim; desktop users either open the fresh invitation (using a checkpoint for active work) or explicitly record that they are continuing the current session.
 
+Managed runner automation is optional and disabled by default. When the server owner explicitly supplies an adapter allowlist, the authenticated control plane can launch Codex CLI, Claude CLI, or a generic command adapter using only a host-advertised model/effort selection. Arguments are always arrays with `shell: false`; model IDs, invitations, and user content are never concatenated into a shell command. Launch first creates a safe checkpoint. A spawn failure cancels only that checkpoint and keeps the old session and claim; a successful spawn still keeps the old claim until the new process connects and atomically takes over. Desktop mode needs no managed runner, provider key, or automatic switch support.
+
 An assignment that reports `status: blocked` now stops only that assignment and queues a planner to re-scope it; sibling work continues. `devteam_block` (or **Stop and block task**) is the explicit task-wide stop. A blocked task can be resumed from the dashboard, which advances the version, clears stale approvals, and creates a fresh planner assignment rather than reviving old claims. When all work is closed and the task is in review, the human can also **Accept task**; this is recorded and displayed as a human override, never mislabeled as independent agent consensus.
 
 ### Automatic project knowledge
@@ -201,6 +203,7 @@ DevTeam keeps the room honest automatically. A periodic sweep (and every claim, 
 - Project folders must exist before they can be registered.
 - Write leases are path-scoped: only writers with overlapping paths are serialized, so non-conflicting work runs in parallel without file races. Task rooms keep an agent invoked for one task from reading, messaging, or claiming in another.
 - Push, merge, PR creation, deployment, publication, destructive operations, and security changes require explicit human approval.
+- Managed runners are opt-in, adapter-allowlisted, authenticated, and accept only advertised selections. Exceptional settings still require explicit human approval; launch failure never releases the old claim.
 - Consensus improves coverage; it does not guarantee correctness. Inspect the final diff before shipping.
 
 ## Development

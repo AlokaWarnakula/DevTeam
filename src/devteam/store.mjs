@@ -1904,6 +1904,12 @@ export class DevTeamStore extends EventEmitter {
     return { continued: true, taskId, advisory: true };
   }
 
+  recordManagedLaunch({ taskId, agentId = null, adapterId, pid = null, status, message }) {
+    this.assertMembership(agentId, taskId);
+    this.#event(taskId, agentId, `runtime.managed_${status}`, message, { adapterId, pid });
+    this.#changed(`runtime.managed_${status}`, taskId);
+  }
+
   getAgent(agentId) {
     const row = this.db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId);
     if (!row) throw new Error("Agent session not found. Connect to DevTeam again.");

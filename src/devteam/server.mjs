@@ -9,6 +9,8 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { DevTeamStore } from "./store.mjs";
 import { createDevTeamMcpServer } from "./mcp.mjs";
+import { ManagedRuntimeSupervisor } from "./runtime/managed.mjs";
+import { resolveRuntimeRequirement } from "./runtime/index.mjs";
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.resolve(moduleDir, "../../public");
@@ -44,9 +46,11 @@ export async function startDevTeamServer({
   knowledge = { enabled: true },
   codegraph = { enabled: true },
   checkpoint = {},
+  managed = {},
 } = {}) {
   if (!dataDir) throw new Error("dataDir is required.");
   const store = new DevTeamStore(dataDir, { liveness, knowledge, codegraph, checkpoint });
+  const supervisor = new ManagedRuntimeSupervisor(managed);
   const attachmentRoot = path.resolve(dataDir, "attachments");
   const root = requireDirectory(workspaceRoot);
   store.ensureProject(path.basename(root), root);
@@ -253,6 +257,39 @@ export async function startDevTeamServer({
       humanApproved: req.body?.humanApproved === true,
     }));
   });
+  app.post("/api/tasks/:taskId/managed-launch", asyncRoute(async (req, res) => {
+    requireFields(req.body, ["agentId", "assignmentId", "adapterId", "modelId", "effortId"]);
+    const task = store.getTask(req.params.taskId);
+    if (!task) return res.status(404).json({ error: "Task not found." });
+    const assignment = store.db.prepare("SELECT * FROM assignments WHERE id = ? AND task_id = ?").get(req.body.assignmentId, task.id);
+    if (!assignment) throw new Error("Assignment does not belong to this task.");
+    const profile = store.runtimeProfile(req.body.agentId);
+    if (profile?.switchMode !== "automatic") throw new Error("This session did not advertise an automatic managed switch mode.");
+    const assessment = store.assignmentAssessment({ assignmentId: assignment.id });
+    if (assessment.requirements.humanApprovalRequired && req.body?.humanApproved !== true) throw new Error("Exceptional managed settings require explicit human approval.");
+    const advertisedModel = profile.availableModels.find((model) => model.id === req.body.modelId);
+    const advertisedEffort = advertisedModel?.efforts.find((effort) => effort.id === req.body.effortId);
+    if (!advertisedModel || !advertisedEffort) throw new Error("Managed selection must exactly match the host-advertised profile.");
+    const selectedProfile = { ...profile, currentModel: advertisedModel.id, currentEffort: advertisedEffort.id, currentModelClass: advertisedModel.class, currentEffortClass: advertisedEffort.class };
+    if (!resolveRuntimeRequirement(assessment.requirements, selectedProfile).satisfied) throw new Error("The selected managed runtime does not satisfy the current assessment.");
+    const checkpointResult = store.createSessionCheckpoint({ agentId: req.body.agentId, taskId: task.id, assignmentId: assignment.id, nextAction: "Managed runner should connect and take over this checkpoint." });
+    const invitation = checkpointInvitation(task, checkpointResult);
+    try {
+      const launched = await supervisor.launch({
+        adapterId: req.body.adapterId,
+        selection: { modelId: advertisedModel.id, effortId: advertisedEffort.id },
+        taskInvite: invitation,
+        projectRoot: task.project_root,
+        env: { DEVTEAM_MCP_URL: `${req.protocol}://${req.get("host")}/mcp`, DEVTEAM_TOKEN: store.token },
+      });
+      store.recordManagedLaunch({ taskId: task.id, agentId: req.body.agentId, adapterId: req.body.adapterId, pid: launched.pid, status: "launched", message: "An opt-in managed runner launched; the old claim remains until checkpoint takeover succeeds." });
+      res.status(201).json({ launched: true, pid: launched.pid, adapterId: launched.adapterId, checkpoint: checkpointResult.checkpoint, invitation });
+    } catch (error) {
+      store.cancelSessionCheckpoint({ agentId: req.body.agentId, taskId: task.id, checkpointId: checkpointResult.checkpoint.id, reason: "Managed launch failed; the old claim was kept." });
+      store.recordManagedLaunch({ taskId: task.id, agentId: req.body.agentId, adapterId: req.body.adapterId, status: "failed", message: `Managed launch failed: ${error.message}. The old claim was kept.` });
+      throw error;
+    }
+  }));
   app.post("/api/tasks/:taskId/checkpoints", (req, res) => {
     const task = store.getTask(req.params.taskId);
     if (!task) return res.status(404).json({ error: "Task not found." });
@@ -409,6 +446,7 @@ export async function startDevTeamServer({
     mcpUrl: `${url}/mcp`,
     async close() {
       clearInterval(reaper);
+      supervisor.stopAll();
       await Promise.allSettled([...transports.values()].map((transport) => transport.close()));
       await new Promise((resolve, reject) => httpServer.close((error) => error ? reject(error) : resolve()));
       store.close();

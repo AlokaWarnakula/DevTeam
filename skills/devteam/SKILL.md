@@ -46,6 +46,7 @@ You stay reachable even while busy: **any** tool result may include a `pendingMe
 - A desktop recommendation is advisory because DevTeam cannot assume it can control the conversation's settings. `continue` records a human risk/continuity choice; it is not evidence that the current runtime is ideal. `reassign` leaves the lease free for a compatible teammate.
 - If current settings exceed the requirement, continue the current assignment. Do not interrupt active work merely to downgrade; a cheaper profile can be considered at the next fresh-session boundary.
 - Maximum/exceptional settings always require explicit human approval. Provider-specific model IDs must never be added to the core complexity policy.
+- Treat `switchMode: automatic` as a claim about an explicitly configured managed adapter, not permission for an agent to spawn processes itself. Managed launch remains a human/authenticated control-plane action. The old session keeps its claim until checkpoint takeover succeeds; if launch fails, continue safely under the old claim.
 
 ## Do the assignment
 
