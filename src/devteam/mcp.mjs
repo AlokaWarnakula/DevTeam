@@ -209,6 +209,70 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
     return store.taskBrief(agentId, taskId, { pendingMessages, pendingProposals });
   }));
 
+  server.registerTool("devteam_session_checkpoint", {
+    title: "Create a safe session checkpoint",
+    description: "Create a redacted, bounded handoff capsule before intentionally replacing this session. If this session owns an assignment, its existing claim stays live until a fresh connected session successfully takes over. Returns a one-time handoff token; keep it private and pass it only to the intended fresh session.",
+    inputSchema: {
+      agentId: z.string().uuid(),
+      taskId: z.string().uuid(),
+      assignmentId: z.string().uuid().optional().describe("Active assignment to hand off; omitted means this session's current claim in the task, if any."),
+      decisions: z.array(z.string().max(1200)).max(30).default([]),
+      blockers: z.array(z.string().max(1200)).max(30).default([]),
+      checks: z.array(z.string().max(1000)).max(50).default([]),
+      failedApproaches: z.array(z.string().max(1200)).max(30).default([]),
+      nextAction: z.string().max(2000).default(""),
+      expiresInMinutes: z.number().int().min(1).max(1440).default(30),
+    },
+  }, safe(async ({ expiresInMinutes, ...args }) => {
+    requireIdentity(args.agentId);
+    const result = store.createSessionCheckpoint({ ...args, expiresInMs: expiresInMinutes * 60_000 });
+    return withInbox(args.agentId, {
+      ...result,
+      next: "Keep the old session and claim intact. Open a fresh session, connect and join this task, then call devteam_session_takeover with checkpoint.id and the one-time handoffToken.",
+    });
+  }));
+
+  server.registerTool("devteam_session_checkpoint_get", {
+    title: "Read a session checkpoint",
+    description: "Read an authorized task's bounded checkpoint capsule without changing assignment ownership. This never returns a stored handoff-token hash, resume token, claim token, agent secret, or source body.",
+    inputSchema: {
+      agentId: z.string().uuid(),
+      taskId: z.string().uuid(),
+      checkpointId: z.string().uuid(),
+    },
+  }, safe(async (args) => {
+    requireIdentity(args.agentId);
+    return withInbox(args.agentId, store.sessionCheckpointGet(args));
+  }));
+
+  server.registerTool("devteam_session_takeover", {
+    title: "Safely take over a session checkpoint",
+    description: "Use a one-time handoff token from the old session to atomically continue in this intentionally fresh session. DevTeam verifies task membership, expiry, token, checkpoint generation, and the exact claim; then it bumps the claim generation, issues a new fencing token, consumes the handoff token, and retires the old session in one transaction.",
+    inputSchema: {
+      agentId: z.string().uuid(),
+      taskId: z.string().uuid(),
+      checkpointId: z.string().uuid(),
+      handoffToken: z.string().min(16).max(200),
+    },
+  }, safe(async (args) => {
+    requireIdentity(args.agentId);
+    return withInbox(args.agentId, store.takeoverSessionCheckpoint(args));
+  }));
+
+  server.registerTool("devteam_session_checkpoint_cancel", {
+    title: "Cancel a session checkpoint",
+    description: "Cancel this session's unused checkpoint without releasing its active assignment claim. The one-time handoff token is invalidated immediately.",
+    inputSchema: {
+      agentId: z.string().uuid(),
+      taskId: z.string().uuid(),
+      checkpointId: z.string().uuid(),
+      reason: z.string().max(800).default("Session rotation cancelled."),
+    },
+  }, safe(async (args) => {
+    requireIdentity(args.agentId);
+    return withInbox(args.agentId, store.cancelSessionCheckpoint(args));
+  }));
+
   server.registerTool("devteam_message", {
     title: "Post a team message",
     description: "Post a focused progress note, design decision, review finding, or question. Omit target to post a timeline note the whole room can read; set target to a teammate's name to send a directed message that is pushed to them. Pass replyTo (a timeline event id from devteam_state) to answer a specific message as a thread.",

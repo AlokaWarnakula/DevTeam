@@ -196,11 +196,15 @@ function renderTask(task) {
     const release = item.status === "claimed" && item.requires_write
       ? `<button class="mini release" data-release="${item.id}" data-release-title="${escapeHtml(item.title)}" title="Force-release this stuck write lease (asks you to confirm the title)">Release lease</button>`
       : "";
+    const checkpoint = item.status === "claimed" && item.agent_id
+      ? `<button class="mini checkpoint" data-checkpoint-assignment="${item.id}" title="Create a bounded checkpoint and fresh-session invitation without releasing this claim">Checkpoint & rotate</button>`
+      : "";
     const blockedBy = item.blockedBy?.length
       ? `<div class="dependency-wait"><strong>Waiting for</strong>${item.blockedBy.map((dependency) => `<span>${escapeHtml(dependency.title)} · ${escapeHtml(dependency.status)}</span>`).join("")}</div>`
       : "";
-    return `<div class="assignment"><div class="assignment-top"><strong>${escapeHtml(item.title)}</strong><span class="role">${escapeHtml(item.role)}</span></div><p>${escapeHtml(item.agent_name ? `${item.agent_name} · ${item.status}` : item.status)}${item.requires_write ? " · write lease" : ""}</p>${blockedBy}${scope}${checklist}${release}</div>`;
+    return `<div class="assignment"><div class="assignment-top"><strong>${escapeHtml(item.title)}</strong><span class="role">${escapeHtml(item.role)}</span></div><p>${escapeHtml(item.agent_name ? `${item.agent_name} · ${item.status}` : item.status)}${item.requires_write ? " · write lease" : ""}</p>${blockedBy}${scope}${checklist}<div class="assignment-actions">${checkpoint}${release}</div></div>`;
   }).join("") || `<p class="hint">Waiting for the plan</p>`;
+  renderSessionCheckpoints(task);
   renderBlackboard(task);
   const approvals = task.approvals.length;
   $("#approval-label").textContent = `${approvals} / ${task.required_approvals}`;
@@ -226,6 +230,21 @@ function renderTask(task) {
   const canAccept = openAssignments === 0 && ["review"].includes(task.status);
   $("#accept-task").classList.toggle("hidden", !canAccept);
   if (nearBottom) requestAnimationFrame(() => eventList.scrollTo({ top: eventList.scrollHeight, behavior: "smooth" }));
+}
+
+function renderSessionCheckpoints(task) {
+  const checkpoints = Array.isArray(task.sessionCheckpoints) ? task.sessionCheckpoints : [];
+  const section = $("#checkpoint-section");
+  section.classList.toggle("hidden", checkpoints.length === 0);
+  $("#checkpoint-count").textContent = checkpoints.length;
+  $("#checkpoint-list").innerHTML = checkpoints.slice(0, 8).map((checkpoint) => {
+    const bytes = checkpoint.capsuleMeta?.bytes ? `${(checkpoint.capsuleMeta.bytes / 1024).toFixed(1)} KiB` : "bounded";
+    const expiry = checkpoint.status === "ready" ? `expires ${time(checkpoint.expiresAt)}` : checkpoint.status;
+    const cancel = checkpoint.status === "ready"
+      ? `<button class="mini" data-cancel-checkpoint="${checkpoint.id}" aria-label="Cancel checkpoint from ${escapeHtml(checkpoint.fromAgentName)}">Cancel</button>`
+      : "";
+    return `<div class="checkpoint-card"><div class="checkpoint-top"><strong>${escapeHtml(checkpoint.fromAgentName)}</strong><span class="checkpoint-status ${escapeHtml(checkpoint.status)}">${escapeHtml(checkpoint.status)}</span></div><p>${escapeHtml(checkpoint.nextAction || "Task state checkpointed")}</p><small>generation ${checkpoint.checkpointGeneration} · ${escapeHtml(bytes)} · ${escapeHtml(expiry)}</small>${cancel}</div>`;
+  }).join("");
 }
 
 function renderTaskDescription(description) {
@@ -591,6 +610,33 @@ document.addEventListener("click", async (event) => {
     catch (error) { toast(error.message); }
     return;
   }
+  const checkpointButton = event.target.closest("[data-checkpoint-assignment]");
+  if (checkpointButton) {
+    const task = state?.selectedTask;
+    const assignment = task?.assignments.find((item) => item.id === checkpointButton.dataset.checkpointAssignment);
+    if (!task || !assignment || assignment.status !== "claimed") return;
+    const form = $("#checkpoint-form");
+    form.reset();
+    form.dataset.taskId = task.id;
+    form.elements.assignmentId.value = assignment.id;
+    $("#checkpoint-assignment-summary").textContent = `${assignment.agent_name} will hand off “${assignment.title}” at claim generation ${assignment.claim_generation}.`;
+    $("#checkpoint-result").classList.add("hidden");
+    $("#checkpoint-invitation").value = "";
+    $("#create-checkpoint").classList.remove("hidden");
+    $("#checkpoint-dialog").showModal();
+    form.elements.nextAction.focus();
+    return;
+  }
+  const cancelCheckpointButton = event.target.closest("[data-cancel-checkpoint]");
+  if (cancelCheckpointButton) {
+    if (!selectedTaskId || !confirm("Cancel this unused session handoff?\n\nThe old session keeps its assignment claim, and the one-time handoff token will stop working immediately.")) return;
+    try {
+      await api(`/api/tasks/${selectedTaskId}/checkpoints/${cancelCheckpointButton.dataset.cancelCheckpoint}/cancel`, { method: "POST", body: JSON.stringify({}) });
+      await refresh();
+      toast("Checkpoint cancelled; the old claim was kept");
+    } catch (error) { toast(error.message); }
+    return;
+  }
   const voteButton = event.target.closest("[data-vote-proposal]");
   if (voteButton) {
     const actions = voteButton.closest(".proposal-actions");
@@ -628,6 +674,52 @@ $("#project-form").addEventListener("submit", async (event) => {
     const project = await api("/api/projects", { method: "POST", body: JSON.stringify(Object.fromEntries(new FormData(event.target))) });
     selectedProjectId = project.id; event.target.reset(); event.target.closest("dialog").close(); await refresh(); toast("Project added");
   } catch (error) { toast(error.message); }
+});
+
+const checkpointLines = (value) => String(value || "").split("\n").map((line) => line.trim()).filter(Boolean);
+
+$("#checkpoint-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.target;
+  const taskId = form.dataset.taskId;
+  if (!taskId || !form.elements.assignmentId.value) return;
+  const submit = $("#create-checkpoint");
+  submit.disabled = true;
+  try {
+    const values = Object.fromEntries(new FormData(form));
+    const result = await api(`/api/tasks/${taskId}/checkpoints`, {
+      method: "POST",
+      body: JSON.stringify({
+        assignmentId: values.assignmentId,
+        nextAction: values.nextAction,
+        decisions: checkpointLines(values.decisions),
+        blockers: checkpointLines(values.blockers),
+        checks: checkpointLines(values.checks),
+        failedApproaches: checkpointLines(values.failedApproaches),
+        expiresInMinutes: Number(values.expiresInMinutes),
+      }),
+    });
+    $("#checkpoint-invitation").value = result.invitation;
+    $("#checkpoint-result").classList.remove("hidden");
+    submit.classList.add("hidden");
+    await refresh();
+    try { await navigator.clipboard.writeText(result.invitation); toast("Checkpoint created and invitation copied"); }
+    catch { toast("Checkpoint created — copy the one-time invitation now"); }
+  } catch (error) { toast(error.message); }
+  finally { submit.disabled = false; }
+});
+
+$("#copy-checkpoint-invitation").addEventListener("click", async () => {
+  const invitation = $("#checkpoint-invitation").value;
+  if (!invitation) return;
+  try { await navigator.clipboard.writeText(invitation); toast("Fresh-session invitation copied"); }
+  catch { $("#checkpoint-invitation").select(); toast("Invitation selected — copy it now"); }
+});
+
+$("#checkpoint-dialog").addEventListener("close", () => {
+  $("#checkpoint-invitation").value = "";
+  $("#checkpoint-result").classList.add("hidden");
+  $("#create-checkpoint").classList.remove("hidden");
 });
 
 $("#edit-task").addEventListener("click", () => {

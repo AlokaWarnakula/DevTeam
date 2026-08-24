@@ -77,6 +77,12 @@
       <div class="panel-title"><h3>Work queue</h3><span id="assignment-count" class="count">0</span></div>
       <div id="assignment-list" class="assignment-list"></div>
       <div class="divider"></div>
+      <div id="checkpoint-section" class="checkpoint-section hidden">
+        <div class="panel-title"><h3>Session handoffs</h3><span id="checkpoint-count" class="count">0</span></div>
+        <p class="memory-scope">Bounded, one-time checkpoints for moving work to a fresh session without releasing the old claim first.</p>
+        <div id="checkpoint-list" class="checkpoint-list" aria-live="polite"></div>
+        <div class="divider"></div>
+      </div>
       <div id="project-blackboard-section" class="blackboard-section hidden">
         <div class="panel-title"><h3>Project memory</h3><span id="project-blackboard-count" class="count">0</span></div>
         <p class="memory-scope">Shared by every DevTeam task in this project.</p>
@@ -180,6 +186,27 @@
       </div>
       <p class="hint">Agents vote on their next check. Adopted only when every connected teammate agrees; a role proposal creates the assignment automatically.</p>
       <div class="dialog-actions"><button type="button" class="secondary close">Cancel</button><button class="primary" value="submit">Send proposal</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="checkpoint-dialog" class="checkpoint-dialog">
+    <form id="checkpoint-form" method="dialog">
+      <div class="dialog-head"><div><span class="eyebrow">SAFE SESSION HANDOFF</span><h2>Create checkpoint & invitation</h2></div><button type="button" class="close">×</button></div>
+      <input type="hidden" name="assignmentId">
+      <p id="checkpoint-assignment-summary" class="checkpoint-assignment-summary"></p>
+      <p class="hint">The current agent keeps its claim until a fresh connected session uses the one-time token successfully. Creating this checkpoint does not disconnect or force-release anyone.</p>
+      <label>Next concrete action<textarea name="nextAction" rows="3" maxlength="2000" placeholder="Inspect the current diff, run the focused test, then continue…"></textarea></label>
+      <label>Decisions <small>one per line</small><textarea name="decisions" rows="3" placeholder="Keep ownership transfer in one database transaction"></textarea></label>
+      <label>Blockers or risks <small>one per line</small><textarea name="blockers" rows="3"></textarea></label>
+      <label>Checks already run <small>one per line</small><textarea name="checks" rows="3" placeholder="node --test test/example.test.mjs — passed"></textarea></label>
+      <label>Failed approaches <small>one per line</small><textarea name="failedApproaches" rows="3"></textarea></label>
+      <label>Invitation expiry<select name="expiresInMinutes"><option value="30">30 minutes</option><option value="60">1 hour</option><option value="240">4 hours</option><option value="1440">24 hours</option></select></label>
+      <div id="checkpoint-result" class="checkpoint-result hidden">
+        <label>Fresh-session invitation<textarea id="checkpoint-invitation" rows="10" readonly aria-label="Fresh-session invitation"></textarea></label>
+        <p class="hint">This is the only display of the raw handoff token. Copy it now; DevTeam stores only its hash and cannot recreate the invitation.</p>
+        <button id="copy-checkpoint-invitation" class="secondary" type="button">Copy invitation</button>
+      </div>
+      <div class="dialog-actions"><button type="button" class="secondary close">Close</button><button id="create-checkpoint" class="primary" value="submit">Create checkpoint</button></div>
     </form>
   </dialog>
 

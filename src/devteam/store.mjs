@@ -1,11 +1,17 @@
 import { EventEmitter } from "node:events";
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { mkdirSync, statSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { CodeGraph } from "./codegraph.mjs";
 import { KnowledgeVault } from "./knowledge.mjs";
 import { buildBudgetedBrief, clipUtf8, DEFAULT_BRIEF_BUDGET } from "./brief.mjs";
+import {
+  boundedCheckpointText,
+  buildCheckpointCapsule,
+  DEFAULT_CHECKPOINT_BUDGET_BYTES,
+} from "./checkpoint.mjs";
 
 const now = () => new Date().toISOString();
 const json = (value) => JSON.stringify(value ?? null);
@@ -18,7 +24,7 @@ const fromJson = (value, fallback = null) => {
 };
 
 export class DevTeamStore extends EventEmitter {
-  constructor(dataDir, { liveness = {}, knowledge = {}, codegraph = {} } = {}) {
+  constructor(dataDir, { liveness = {}, knowledge = {}, codegraph = {}, checkpoint = {} } = {}) {
     super();
     this.dataDir = path.resolve(dataDir);
     mkdirSync(this.dataDir, { recursive: true });
@@ -46,6 +52,13 @@ export class DevTeamStore extends EventEmitter {
       forgetMs: 86_400_000,       // gone this long (disconnected, or unresponsive holding no write lease): purge the row so ghosts stop lingering as "online"
       ...liveness,
     };
+    this.checkpoint = {
+      capsuleBytes: DEFAULT_CHECKPOINT_BUDGET_BYTES,
+      ttlMs: 30 * 60 * 1000,
+      maxTtlMs: 24 * 60 * 60 * 1000,
+      ...checkpoint,
+    };
+    this.#expireSessionCheckpoints();
     this.#recoverOrphanedClaims("Recovered an orphaned assignment during server startup.");
     this.#syncAllTaskStatuses();
   }
@@ -205,6 +218,23 @@ export class DevTeamStore extends EventEmitter {
         PRIMARY KEY (project_id, key)
       );
 
+      CREATE TABLE IF NOT EXISTS session_checkpoints (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        assignment_id TEXT NULL REFERENCES assignments(id) ON DELETE SET NULL,
+        from_agent_id TEXT NOT NULL,
+        from_agent_name TEXT NOT NULL,
+        task_version INTEGER NOT NULL,
+        checkpoint_generation INTEGER NOT NULL,
+        capsule TEXT NOT NULL,
+        status TEXT NOT NULL,
+        handoff_token_hash TEXT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        claimed_by_agent_id TEXT NULL,
+        claimed_at TEXT NULL
+      );
+
       CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project_id, status);
       CREATE INDEX IF NOT EXISTS idx_assignments_queue ON assignments(status, target_agent_name, created_at);
       CREATE INDEX IF NOT EXISTS idx_assignments_task_status ON assignments(task_id, status);
@@ -214,18 +244,11 @@ export class DevTeamStore extends EventEmitter {
       CREATE INDEX IF NOT EXISTS idx_receipts_agent ON message_receipts(agent_id, delivered_at, seen_at);
       CREATE INDEX IF NOT EXISTS idx_proposals_task_status ON proposals(task_id, status);
       CREATE INDEX IF NOT EXISTS idx_task_members_agent ON task_members(agent_id);
+      CREATE INDEX IF NOT EXISTS idx_checkpoints_task_status
+        ON session_checkpoints(task_id, status, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_checkpoints_assignment_status
+        ON session_checkpoints(assignment_id, status, checkpoint_generation DESC);
       PRAGMA optimize;
-    `);
-    // One agent may hold at most one claimed assignment at a time. Self-heal any legacy
-    // double-claims (keep the earliest) before enforcing it at the schema level, so the
-    // unique index can be created even on a database that predates this rule.
-    this.db.exec(`
-      UPDATE assignments SET status = 'queued', agent_id = NULL, claimed_at = NULL
-      WHERE status = 'claimed' AND agent_id IS NOT NULL AND rowid NOT IN (
-        SELECT MIN(rowid) FROM assignments WHERE status = 'claimed' AND agent_id IS NOT NULL GROUP BY agent_id
-      );
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_one_claim_per_agent
-        ON assignments(agent_id) WHERE status = 'claimed' AND agent_id IS NOT NULL;
     `);
     // Additive columns for databases created before consensus snapshots/quorum/timeout existed.
     for (const [table, column, ddl] of [
@@ -238,6 +261,17 @@ export class DevTeamStore extends EventEmitter {
     ]) {
       try { this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`); } catch { /* already present */ }
     }
+    // One agent may hold at most one claimed assignment at a time. Self-heal any legacy
+    // double-claims (keep the earliest) before enforcing it at the schema level, so the
+    // unique index can be created even on a database that predates this rule.
+    this.db.exec(`
+      UPDATE assignments SET status = 'queued', agent_id = NULL, claimed_at = NULL, claim_token_hash = NULL
+      WHERE status = 'claimed' AND agent_id IS NOT NULL AND rowid NOT IN (
+        SELECT MIN(rowid) FROM assignments WHERE status = 'claimed' AND agent_id IS NOT NULL GROUP BY agent_id
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_one_claim_per_agent
+        ON assignments(agent_id) WHERE status = 'claimed' AND agent_id IS NOT NULL;
+    `);
   }
 
   #getOrCreateToken() {
@@ -332,7 +366,7 @@ export class DevTeamStore extends EventEmitter {
       SELECT DISTINCT task_id FROM assignments WHERE agent_id = ? AND status = 'claimed'
     `).all(agent.id).map((row) => row.task_id);
     const released = this.db.prepare(`
-      UPDATE assignments SET status = 'queued', agent_id = NULL, claimed_at = NULL
+      UPDATE assignments SET status = 'queued', agent_id = NULL, claimed_at = NULL, claim_token_hash = NULL
       WHERE agent_id = ? AND status = 'claimed'
     `).run(agent.id).changes;
     this.db.prepare(`
@@ -385,7 +419,7 @@ export class DevTeamStore extends EventEmitter {
           AND ag.status IN ('unresponsive', 'disconnected') AND ag.last_seen < ?
       `).all(staleWorkBefore);
       for (const row of recoverable) {
-        this.db.prepare("UPDATE assignments SET status = 'queued', agent_id = NULL, claimed_at = NULL WHERE id = ?").run(row.id);
+        this.db.prepare("UPDATE assignments SET status = 'queued', agent_id = NULL, claimed_at = NULL, claim_token_hash = NULL WHERE id = ?").run(row.id);
         this.#event(row.task_id, null, "assignment.released", `${row.agent_name}'s read-only assignment was recovered after a long silence.`, { assignmentId: row.id, reason: "stale-readonly-recovery" });
         this.#syncTaskStatus(row.task_id, stamp);
         affectedTasks.add(row.task_id);
@@ -424,7 +458,7 @@ export class DevTeamStore extends EventEmitter {
     const stamp = now();
     this.#transaction(() => {
       this.db.prepare(`
-        UPDATE assignments SET status = 'queued', agent_id = NULL, claimed_at = NULL
+        UPDATE assignments SET status = 'queued', agent_id = NULL, claimed_at = NULL, claim_token_hash = NULL
         WHERE status = 'claimed' AND (
           agent_id IS NULL OR agent_id IN (SELECT id FROM agents WHERE status = 'disconnected')
         )
@@ -814,7 +848,8 @@ export class DevTeamStore extends EventEmitter {
       if (assignment) {
         const target = details.targetAgentName?.trim() || null;
         if (assignment.status === "claimed") {
-          this.db.prepare("UPDATE assignments SET target_agent_name = ?, status = 'queued', agent_id = NULL, claimed_at = NULL WHERE id = ?").run(target, assignment.id);
+          this.#cancelReadyCheckpointsForAssignment(assignment.id);
+          this.db.prepare("UPDATE assignments SET target_agent_name = ?, status = 'queued', agent_id = NULL, claimed_at = NULL, claim_token_hash = NULL WHERE id = ?").run(target, assignment.id);
         } else {
           this.db.prepare("UPDATE assignments SET target_agent_name = ? WHERE id = ?").run(target, assignment.id);
         }
@@ -1050,6 +1085,463 @@ export class DevTeamStore extends EventEmitter {
     return createHash("sha256").update(String(token)).digest("hex");
   }
 
+  #tokenHashMatches(token, expectedHash) {
+    if (!expectedHash || !token) return false;
+    const actual = Buffer.from(this.#hashToken(token), "hex");
+    const expected = Buffer.from(String(expectedHash), "hex");
+    return actual.length === expected.length && timingSafeEqual(actual, expected);
+  }
+
+  #repositoryHead(projectRoot) {
+    try {
+      const result = spawnSync("git", ["-C", projectRoot, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+        timeout: 2_000,
+        windowsHide: true,
+      });
+      const head = result.status === 0 ? String(result.stdout || "").trim() : "";
+      return /^[0-9a-f]{40,64}$/i.test(head) ? head.toLowerCase() : null;
+    } catch {
+      return null;
+    }
+  }
+
+  #checkpointRecord(row, { includeCapsule = false } = {}) {
+    if (!row) return null;
+    const capsule = fromJson(row.capsule, {});
+    return {
+      id: row.id,
+      taskId: row.task_id,
+      assignmentId: row.assignment_id || null,
+      fromAgentId: row.from_agent_id,
+      fromAgentName: row.from_agent_name,
+      taskVersion: Number(row.task_version),
+      checkpointGeneration: Number(row.checkpoint_generation),
+      status: row.status,
+      createdAt: row.created_at,
+      expiresAt: row.expires_at,
+      claimedByAgentId: row.claimed_by_agent_id || null,
+      claimedAt: row.claimed_at || null,
+      capsuleMeta: capsule.capsuleMeta || null,
+      nextAction: capsule.nextAction || null,
+      repositoryFingerprint: capsule.repositoryFingerprint || null,
+      ...(includeCapsule ? { capsule } : {}),
+    };
+  }
+
+  #cancelReadyCheckpointsForAssignment(assignmentId) {
+    if (!assignmentId) return 0;
+    return this.db.prepare(`
+      UPDATE session_checkpoints SET status = 'cancelled', handoff_token_hash = NULL
+      WHERE assignment_id = ? AND status = 'ready'
+    `).run(assignmentId).changes;
+  }
+
+  #cancelReadyCheckpointsForAgent(agentId) {
+    if (!agentId) return 0;
+    return this.db.prepare(`
+      UPDATE session_checkpoints SET status = 'cancelled', handoff_token_hash = NULL
+      WHERE from_agent_id = ? AND status = 'ready'
+    `).run(agentId).changes;
+  }
+
+  #expireSessionCheckpoints() {
+    const stamp = now();
+    const expired = this.db.prepare(`
+      SELECT id, task_id FROM session_checkpoints
+      WHERE status = 'ready' AND expires_at <= ?
+    `).all(stamp);
+    if (!expired.length) return [];
+    this.#transaction(() => {
+      for (const checkpoint of expired) {
+        this.db.prepare(`
+          UPDATE session_checkpoints
+          SET status = 'expired', handoff_token_hash = NULL
+          WHERE id = ? AND status = 'ready'
+        `).run(checkpoint.id);
+        this.#event(checkpoint.task_id, null, "session.checkpoint_expired", "A session checkpoint expired without transferring ownership.", {
+          checkpointId: checkpoint.id,
+        });
+      }
+    });
+    for (const taskId of new Set(expired.map((item) => item.task_id))) this.#changed("session.checkpoint_expired", taskId);
+    return expired;
+  }
+
+  #checkpointInput(values, maxItems, maxBytes, counters, key) {
+    return [...new Set((Array.isArray(values) ? values : [])
+      .map((value) => boundedCheckpointText(value, maxBytes, counters, key))
+      .filter(Boolean))].slice(0, maxItems);
+  }
+
+  createSessionCheckpoint({
+    agentId,
+    taskId,
+    assignmentId = null,
+    decisions = [],
+    blockers = [],
+    checks = [],
+    failedApproaches = [],
+    nextAction = "",
+    expiresInMs = null,
+  }) {
+    const agent = this.getAgent(agentId);
+    if (agent.status === "disconnected") throw new Error("A disconnected session cannot create a checkpoint.");
+    this.assertMembership(agentId, taskId);
+    const task = this.getTask(taskId);
+    if (!task) throw new Error("Task not found.");
+    let assignment = assignmentId
+      ? this.db.prepare("SELECT * FROM assignments WHERE id = ? AND task_id = ?").get(assignmentId, taskId)
+      : this.db.prepare("SELECT * FROM assignments WHERE task_id = ? AND agent_id = ? AND status = 'claimed' LIMIT 1").get(taskId, agentId);
+    if (assignmentId && !assignment) throw new Error("The assignment does not belong to this task.");
+    if (assignment && (assignment.status !== "claimed" || assignment.agent_id !== agentId)) {
+      throw new Error("Only the session that owns an active assignment may checkpoint that claim.");
+    }
+    const counters = { clipped: {}, redacted: 0 };
+    const safe = (value, bytes, key) => boundedCheckpointText(value, bytes, counters, key);
+    const supplied = {
+      decisions: this.#checkpointInput(decisions, 30, 800, counters, "decisions"),
+      blockers: this.#checkpointInput(blockers, 30, 800, counters, "blockers"),
+      checks: this.#checkpointInput(checks, 50, 600, counters, "checks"),
+      failedApproaches: this.#checkpointInput(failedApproaches, 30, 800, counters, "failedApproaches"),
+    };
+    const eventRows = this.db.prepare(`
+      SELECT id, type, message, metadata, created_at FROM events
+      WHERE task_id = ? ORDER BY id DESC LIMIT 200
+    `).all(taskId).map((event) => ({ ...event, metadata: fromJson(event.metadata, {}) }));
+    const automaticDecisions = eventRows
+      .filter((event) => ["agent.decision", "proposal.adopted"].includes(event.type))
+      .map((event) => safe(event.message, 800, "automaticDecisions"));
+    const repliedTo = new Set(eventRows.map((event) => Number(event.metadata?.replyTo || 0)).filter(Boolean));
+    const unresolvedQuestions = eventRows
+      .filter((event) => event.type === "agent.question" && !repliedTo.has(event.id))
+      .map((event) => safe(event.message, 800, "unresolvedQuestions"));
+    const reports = eventRows.filter((event) => ["assignment.completed", "assignment.blocked"].includes(event.type));
+    const changedFiles = reports.flatMap((event) => Array.isArray(event.metadata.changedFiles) ? event.metadata.changedFiles : [])
+      .map((file) => safe(file, 400, "changedFiles"));
+    const automaticChecks = reports.flatMap((event) => Array.isArray(event.metadata.checks) ? event.metadata.checks : [])
+      .map((check) => safe(check, 600, "automaticChecks"));
+    const automaticBlockers = eventRows
+      .filter((event) => ["assignment.blocked", "task.blocked"].includes(event.type))
+      .map((event) => safe(event.message, 800, "automaticBlockers"));
+    const memoryKeys = [
+      ...this.db.prepare("SELECT key FROM blackboard WHERE task_id = ? ORDER BY key ASC LIMIT 100").all(taskId)
+        .map((row) => ({ scope: "task", key: safe(row.key, 240, "taskMemoryKeys") })),
+      ...this.db.prepare("SELECT key FROM project_blackboard WHERE project_id = ? ORDER BY key ASC LIMIT 100").all(task.project_id)
+        .map((row) => ({ scope: "project", key: safe(row.key, 240, "projectMemoryKeys") })),
+    ];
+    let codeContext = [];
+    try { codeContext = this.codegraph.enabled ? this.codegraph.codeContext(taskId, { assignmentId: assignment?.id || null, maxBytes: 4_096 }) : []; }
+    catch { codeContext = []; }
+    const codePaths = [...new Set(codeContext.flatMap((module) => [module.path, ...(module.imports || []), ...(module.importedBy || [])])
+      .map((file) => safe(file, 400, "codePaths")))];
+    const knowledge = this.knowledge.relevant(task.project_id, taskId, 20, {
+      taskTitle: task.title,
+      taskDescription: task.description,
+      taskVersion: task.version,
+      assignmentTitle: assignment?.title,
+      assignmentDescription: assignment?.description,
+      role: assignment?.role,
+      declaredPaths: assignment?.requires_write ? this.#writeScopeFor(assignment.id) : [],
+      codePaths,
+    }).map((note) => ({
+      id: note.id,
+      title: safe(note.title, 360, "knowledgeTitles"),
+      status: note.status,
+      whyIncluded: safe(note.whyIncluded, 300, "knowledgeReasons"),
+      relatedFiles: (note.relatedFiles || []).slice(0, 12).map((file) => safe(file, 300, "knowledgePaths")),
+    }));
+    const dependencies = assignment ? this.#dependenciesFor(assignment.id) : [];
+    const derivedNextAction = nextAction || (assignment
+      ? `Continue ${assignment.title}: ${assignment.description}`
+      : `Inspect the task state and continue toward: ${task.title}`);
+    const ttl = expiresInMs == null
+      ? Math.max(1, Number(this.checkpoint.ttlMs) || 30 * 60 * 1000)
+      : Math.min(Math.max(60_000, Number(expiresInMs) || 0), Math.max(60_000, Number(this.checkpoint.maxTtlMs) || 24 * 60 * 60 * 1000));
+    const checkpointId = randomUUID();
+    const handoffToken = randomBytes(24).toString("base64url");
+    const stamp = now();
+    const expiresAt = new Date(Date.parse(stamp) + ttl).toISOString();
+    const repositoryHead = this.#repositoryHead(task.project_root);
+    let checkpointRow;
+    this.#transaction(() => {
+      const liveTask = this.getTask(taskId);
+      if (!liveTask) throw new Error("Task not found.");
+      if (assignment) {
+        const liveAssignment = this.db.prepare("SELECT * FROM assignments WHERE id = ?").get(assignment.id);
+        if (!liveAssignment || liveAssignment.status !== "claimed" || liveAssignment.agent_id !== agentId
+          || liveAssignment.claim_generation !== assignment.claim_generation) {
+          throw new Error("The assignment claim changed while the checkpoint was being created. Re-read the task and try again.");
+        }
+        assignment = liveAssignment;
+      }
+      const generation = Number(this.db.prepare(`
+        SELECT COALESCE(MAX(checkpoint_generation), 0) + 1 AS generation
+        FROM session_checkpoints WHERE task_id = ?
+      `).get(taskId).generation);
+      const capsule = buildCheckpointCapsule({
+        limitBytes: this.checkpoint.capsuleBytes,
+        counters,
+        core: {
+          schemaVersion: 1,
+          checkpoint: { id: checkpointId, generation, fromAgent: { id: agent.id, name: safe(agent.name, 200, "agentName") } },
+          task: {
+            id: task.id,
+            title: safe(task.title, 500, "taskTitle"),
+            goal: safe(task.description, 1_600, "taskGoal"),
+            status: task.status,
+            version: Number(task.version),
+            project: {
+              id: task.project_id,
+              name: safe(task.project_name, 300, "projectName"),
+              root: safe(task.project_root, 1_200, "projectRoot"),
+            },
+          },
+          assignment: assignment ? {
+            id: assignment.id,
+            title: safe(assignment.title, 500, "assignmentTitle"),
+            description: safe(assignment.description, 1_200, "assignmentDescription"),
+            role: safe(assignment.role, 100, "assignmentRole"),
+            requiresWrite: Boolean(assignment.requires_write),
+            writeScope: (assignment.requires_write ? this.#writeScopeFor(assignment.id) : []).slice(0, 30).map((item) => safe(item, 300, "writeScope")),
+            checklist: this.#checklistFor(assignment.id).slice(0, 30).map((item) => safe(item, 300, "checklist")),
+            dependsOn: dependencies.slice(0, 30).map((item) => ({ id: item.id, title: safe(item.title, 300, "dependencyTitles"), status: item.status })),
+            claimGeneration: Number(assignment.claim_generation),
+          } : null,
+          nextAction: safe(derivedNextAction, 1_200, "nextAction"),
+          currentRuntime: { provider: safe(agent.provider, 200, "agentProvider"), profile: null },
+          nextSessionRecommendation: null,
+          repositoryFingerprint: { taskVersion: Number(task.version), gitHead: repositoryHead },
+        },
+        sections: [
+          { key: "decisions", items: [...supplied.decisions, ...automaticDecisions], maxItems: 30 },
+          { key: "unresolvedQuestions", items: unresolvedQuestions, maxItems: 20 },
+          { key: "changedFiles", items: [...new Set(changedFiles)], maxItems: 100 },
+          { key: "checks", items: [...supplied.checks, ...automaticChecks], maxItems: 60 },
+          { key: "blockers", items: [...supplied.blockers, ...automaticBlockers], maxItems: 30 },
+          { key: "failedApproaches", items: supplied.failedApproaches, maxItems: 30 },
+          { key: "memoryKeys", items: memoryKeys, maxItems: 60 },
+          { key: "knowledge", items: knowledge, maxItems: 12 },
+          { key: "codePaths", items: codePaths, maxItems: 40 },
+        ],
+      });
+      this.db.prepare(`
+        UPDATE session_checkpoints
+        SET status = 'cancelled', handoff_token_hash = NULL
+        WHERE task_id = ? AND from_agent_id = ? AND status = 'ready'
+      `).run(taskId, agentId);
+      this.db.prepare(`
+        INSERT INTO session_checkpoints (
+          id, task_id, assignment_id, from_agent_id, from_agent_name, task_version,
+          checkpoint_generation, capsule, status, handoff_token_hash, created_at, expires_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?)
+      `).run(
+        checkpointId, taskId, assignment?.id || null, agentId, agent.name, task.version,
+        generation, json(capsule), this.#hashToken(handoffToken), stamp, expiresAt,
+      );
+      this.#event(taskId, agentId, "session.checkpoint_created", `${agent.name} created a bounded session checkpoint.`, {
+        checkpointId,
+        assignmentId: assignment?.id || null,
+        checkpointGeneration: generation,
+        taskVersion: Number(task.version),
+        capsuleBytes: capsule.capsuleMeta.bytes,
+        expiresAt,
+      });
+      this.db.prepare("UPDATE agents SET last_seen = ? WHERE id = ?").run(stamp, agentId);
+      checkpointRow = this.db.prepare("SELECT * FROM session_checkpoints WHERE id = ?").get(checkpointId);
+    });
+    this.#changed("session.checkpoint_created", taskId);
+    return { checkpoint: this.#checkpointRecord(checkpointRow, { includeCapsule: true }), handoffToken };
+  }
+
+  sessionCheckpointsForTask(taskId, { limit = 20 } = {}) {
+    if (!this.getTask(taskId)) throw new Error("Task not found.");
+    this.#expireSessionCheckpoints();
+    return this.db.prepare(`
+      SELECT * FROM session_checkpoints WHERE task_id = ?
+      ORDER BY checkpoint_generation DESC LIMIT ?
+    `).all(taskId, Math.max(1, Math.min(100, Number(limit) || 20)))
+      .map((row) => this.#checkpointRecord(row));
+  }
+
+  sessionCheckpointGet({ agentId = null, taskId, checkpointId }) {
+    if (agentId) {
+      this.getAgent(agentId);
+      this.assertMembership(agentId, taskId);
+    }
+    this.#expireSessionCheckpoints();
+    const row = this.db.prepare("SELECT * FROM session_checkpoints WHERE id = ? AND task_id = ?").get(checkpointId, taskId);
+    if (!row) throw new Error("Session checkpoint not found for this task.");
+    return this.#checkpointRecord(row, { includeCapsule: true });
+  }
+
+  cancelSessionCheckpoint({ agentId = null, taskId, checkpointId, reason = "Session rotation cancelled." }) {
+    if (agentId) {
+      this.getAgent(agentId);
+      this.assertMembership(agentId, taskId);
+    }
+    const row = this.db.prepare("SELECT * FROM session_checkpoints WHERE id = ? AND task_id = ?").get(checkpointId, taskId);
+    if (!row) throw new Error("Session checkpoint not found for this task.");
+    if (agentId && row.from_agent_id !== agentId) throw new Error("Only the checkpointing session may cancel its handoff.");
+    if (row.status !== "ready") throw new Error(`Only a ready checkpoint can be cancelled; this checkpoint is ${row.status}.`);
+    const message = boundedCheckpointText(reason, 800);
+    this.#transaction(() => {
+      this.db.prepare(`
+        UPDATE session_checkpoints SET status = 'cancelled', handoff_token_hash = NULL
+        WHERE id = ? AND status = 'ready'
+      `).run(checkpointId);
+      this.#event(taskId, agentId, "session.checkpoint_cancelled", message || "Session rotation cancelled.", { checkpointId });
+    });
+    this.#changed("session.checkpoint_cancelled", taskId);
+    return this.#checkpointRecord(this.db.prepare("SELECT * FROM session_checkpoints WHERE id = ?").get(checkpointId));
+  }
+
+  takeoverSessionCheckpoint({ agentId, taskId, checkpointId, handoffToken }) {
+    const agent = this.getAgent(agentId);
+    if (agent.status === "disconnected") throw new Error("A disconnected session cannot take over work.");
+    this.assertMembership(agentId, taskId);
+    if (!this.#claimableTaskIds(agentId).includes(taskId)) throw new Error("Observers cannot take over an assignment claim.");
+    if (!handoffToken || !String(handoffToken).trim()) throw new Error("A handoff token is required.");
+    const token = String(handoffToken).trim();
+    const stamp = now();
+    let outcome;
+    this.#transaction(() => {
+      const checkpoint = this.db.prepare("SELECT * FROM session_checkpoints WHERE id = ? AND task_id = ?").get(checkpointId, taskId);
+      if (!checkpoint) {
+        outcome = { error: "The checkpoint or handoff token is invalid for this task." };
+        return;
+      }
+      if (checkpoint.status !== "ready") {
+        outcome = { error: "This checkpoint is no longer ready. Handoff tokens are one-time and cannot be replayed." };
+        return;
+      }
+      if (checkpoint.from_agent_id === agentId) {
+        outcome = { error: "Session takeover requires a distinct fresh agent session. Use devteam_resume only when restoring the same conversation." };
+        return;
+      }
+      if (checkpoint.expires_at <= stamp) {
+        this.db.prepare("UPDATE session_checkpoints SET status = 'expired', handoff_token_hash = NULL WHERE id = ?").run(checkpoint.id);
+        this.#event(taskId, null, "session.checkpoint_expired", "A session checkpoint expired without transferring ownership.", { checkpointId });
+        outcome = { error: "This checkpoint has expired. The original claim was not transferred.", expired: true };
+        return;
+      }
+      if (!this.#tokenHashMatches(token, checkpoint.handoff_token_hash)) {
+        outcome = { error: "The checkpoint or handoff token is invalid for this task." };
+        return;
+      }
+      const task = this.getTask(taskId);
+      if (!task || ["accepted", "blocked", "cancelled"].includes(task.status)) {
+        outcome = { error: "This task is not active, so its checkpoint cannot transfer ownership." };
+        return;
+      }
+      const existingClaim = this.db.prepare("SELECT id FROM assignments WHERE agent_id = ? AND status = 'claimed' LIMIT 1").get(agentId);
+      if (existingClaim) {
+        outcome = { error: "Finish or release this fresh session's existing assignment before taking over another." };
+        return;
+      }
+      const capsule = fromJson(checkpoint.capsule, {});
+      const expectedClaimGeneration = Number(capsule.assignment?.claimGeneration ?? -1);
+      const oldLiveClaim = this.db.prepare("SELECT id FROM assignments WHERE agent_id = ? AND status = 'claimed' LIMIT 1").get(checkpoint.from_agent_id);
+      if ((checkpoint.assignment_id && oldLiveClaim && oldLiveClaim.id !== checkpoint.assignment_id)
+        || (!checkpoint.assignment_id && oldLiveClaim)) {
+        outcome = { error: "The original session moved to different work after this checkpoint. Create a new checkpoint." };
+        return;
+      }
+      let assignmentResult = null;
+      let claimToken = null;
+      if (checkpoint.assignment_id) {
+        const assignment = this.db.prepare(`
+          SELECT a.*, t.project_id, p.root AS project_root
+          FROM assignments a JOIN tasks t ON t.id = a.task_id JOIN projects p ON p.id = t.project_id
+          WHERE a.id = ? AND a.task_id = ?
+        `).get(checkpoint.assignment_id, taskId);
+        const transferableLiveClaim = assignment?.status === "claimed"
+          && assignment.agent_id === checkpoint.from_agent_id
+          && Number(assignment.claim_generation) === expectedClaimGeneration;
+        const recoverableReleasedClaim = assignment?.status === "queued"
+          && assignment.agent_id == null
+          && Number(assignment.claim_generation) === expectedClaimGeneration;
+        if (!transferableLiveClaim && !recoverableReleasedClaim) {
+          outcome = { error: "The checkpoint's assignment claim is stale or has moved. Ownership was not transferred." };
+          return;
+        }
+        if (recoverableReleasedClaim && assignment.requires_write) {
+          const scopes = this.#resolveScopesOnDisk(assignment.project_root, this.#writeScopeFor(assignment.id));
+          const conflict = this.#heldWriteLeases().some((lease) => lease.id !== assignment.id
+            && lease.projectId === assignment.project_id
+            && lease.scopes.some((held) => scopes.some((wanted) => this.#scopesOverlap(held, wanted))));
+          if (conflict) {
+            outcome = { error: "The released assignment now conflicts with another active write lease. Ownership was not transferred." };
+            return;
+          }
+        }
+        claimToken = randomBytes(18).toString("base64url");
+        this.db.prepare(`
+          UPDATE assignments
+          SET status = 'claimed', agent_id = ?, claimed_at = ?, claim_generation = claim_generation + 1,
+              claim_token_hash = ?
+          WHERE id = ?
+        `).run(agentId, stamp, this.#hashToken(claimToken), assignment.id);
+        const claimed = this.db.prepare("SELECT * FROM assignments WHERE id = ?").get(assignment.id);
+        assignmentResult = {
+          ...claimed,
+          checklist: this.#checklistFor(claimed.id),
+          writeScope: claimed.requires_write ? this.#writeScopeFor(claimed.id) : [],
+          dependsOn: this.#dependenciesFor(claimed.id).map((item) => item.id),
+          claimGeneration: Number(claimed.claim_generation),
+          claimToken,
+        };
+      }
+      this.db.prepare(`
+        UPDATE session_checkpoints
+        SET status = 'claimed', handoff_token_hash = NULL, claimed_by_agent_id = ?, claimed_at = ?
+        WHERE id = ? AND status = 'ready'
+      `).run(agentId, stamp, checkpoint.id);
+      this.db.prepare(`
+        UPDATE session_checkpoints
+        SET status = 'cancelled', handoff_token_hash = NULL
+        WHERE id != ? AND task_id = ? AND from_agent_id = ? AND status = 'ready'
+      `).run(checkpoint.id, taskId, checkpoint.from_agent_id);
+      this.db.prepare(`
+        UPDATE agents SET status = ?, current_task_id = ?, last_seen = ?, disconnected_at = NULL WHERE id = ?
+      `).run(assignmentResult ? "busy" : "waiting", assignmentResult ? taskId : null, stamp, agentId);
+      this.db.prepare(`
+        UPDATE agents
+        SET status = 'disconnected', current_task_id = NULL, last_seen = ?, disconnected_at = ?, resume_token_hash = NULL
+        WHERE id = ? AND id != ?
+      `).run(stamp, stamp, checkpoint.from_agent_id, agentId);
+      this.#event(taskId, agentId, "session.checkpoint_claimed", `${agent.name} safely took over a session checkpoint.`, {
+        checkpointId: checkpoint.id,
+        assignmentId: checkpoint.assignment_id || null,
+        fromAgentId: checkpoint.from_agent_id,
+        claimGeneration: assignmentResult?.claimGeneration || null,
+      });
+      this.#syncTaskStatus(taskId, stamp);
+      outcome = {
+        checkpoint: this.#checkpointRecord(this.db.prepare("SELECT * FROM session_checkpoints WHERE id = ?").get(checkpoint.id), { includeCapsule: true }),
+        assignment: assignmentResult,
+        oldSessionRetired: checkpoint.from_agent_id !== agentId,
+        taskVersionNow: Number(task.version),
+      };
+    });
+    if (outcome.expired) this.#changed("session.checkpoint_expired", taskId);
+    if (outcome.error) throw new Error(outcome.error);
+    const currentHead = this.#repositoryHead(this.getTask(taskId).project_root);
+    const fingerprint = outcome.checkpoint.capsule?.repositoryFingerprint || {};
+    const warnings = [];
+    if (Number(fingerprint.taskVersion) !== Number(outcome.taskVersionNow)) warnings.push("The task version changed since the checkpoint. Re-read the task and inspect the current files before writing.");
+    if (fingerprint.gitHead && currentHead && fingerprint.gitHead !== currentHead) warnings.push("Git HEAD changed since the checkpoint. Inspect the repository diff before writing.");
+    this.#changed("session.checkpoint_claimed", taskId);
+    return {
+      takenOver: true,
+      taskId,
+      ...outcome,
+      repositoryFingerprintNow: { taskVersion: outcome.taskVersionNow, gitHead: currentHead },
+      warnings,
+      next: "Read the bounded capsule, verify the repository and task state, then continue under the newly issued claim token.",
+    };
+  }
+
   connectAgent({ name, provider, capabilities = [] }) {
     const cleanName = name.trim();
     const cleanProvider = provider.trim();
@@ -1126,6 +1618,7 @@ export class DevTeamStore extends EventEmitter {
       // and bumping the generation so the retired session's old token can no longer complete it.
       const priorClaim = this.db.prepare("SELECT id FROM assignments WHERE agent_id = ? AND status = 'claimed' LIMIT 1").get(prior.id);
       if (priorClaim) {
+        this.#cancelReadyCheckpointsForAssignment(priorClaim.id);
         claimToken = randomBytes(18).toString("base64url");
         reclaimed = this.db.prepare(`
           UPDATE assignments
@@ -1335,9 +1828,10 @@ export class DevTeamStore extends EventEmitter {
     const claimedTaskIds = this.db.prepare(
       "SELECT DISTINCT task_id FROM assignments WHERE agent_id = ? AND status = 'claimed'",
     ).all(agentId).map((row) => row.task_id);
+    this.#cancelReadyCheckpointsForAgent(agentId);
     if (claimedTaskIds.length) {
       this.db.prepare(
-        "UPDATE assignments SET status = 'queued', agent_id = NULL, claimed_at = NULL WHERE agent_id = ? AND status = 'claimed'",
+        "UPDATE assignments SET status = 'queued', agent_id = NULL, claimed_at = NULL, claim_token_hash = NULL WHERE agent_id = ? AND status = 'claimed'",
       ).run(agentId);
       for (const taskId of claimedTaskIds) {
         this.#event(taskId, null, "assignment.released", `${name}'s work returned to the queue when the agent was removed.`, { reason: "agent-forgotten" });
@@ -1363,7 +1857,8 @@ export class DevTeamStore extends EventEmitter {
     }
     const stamp = now();
     this.#transaction(() => {
-      this.db.prepare("UPDATE assignments SET status = 'queued', agent_id = NULL, claimed_at = NULL WHERE id = ?").run(assignmentId);
+      this.#cancelReadyCheckpointsForAssignment(assignmentId);
+      this.db.prepare("UPDATE assignments SET status = 'queued', agent_id = NULL, claimed_at = NULL, claim_token_hash = NULL WHERE id = ?").run(assignmentId);
       this.#event(assignment.task_id, assignment.agent_id, "assignment.released", reason, { assignmentId, reason: "force-release", requiresWrite: Boolean(assignment.requires_write) });
       this.#syncTaskStatus(assignment.task_id, stamp);
     });
@@ -1566,7 +2061,7 @@ export class DevTeamStore extends EventEmitter {
       WHERE a.status = 'claimed' AND a.requires_write = 1
         AND ag.status != 'disconnected'
         AND t.status NOT IN ('accepted', 'blocked', 'cancelled')
-    `).all().map((row) => ({ projectId: row.projectId, scopes: this.#resolveScopesOnDisk(row.root, this.#writeScopeFor(row.id)) }));
+    `).all().map((row) => ({ id: row.id, projectId: row.projectId, scopes: this.#resolveScopesOnDisk(row.root, this.#writeScopeFor(row.id)) }));
   }
 
   // Normalize a declared write path to a canonical, comparable prefix so path aliases can't
@@ -1734,6 +2229,7 @@ export class DevTeamStore extends EventEmitter {
     let followUpAssignmentId = null;
     this.#transaction(() => {
       const stamp = now();
+      this.#cancelReadyCheckpointsForAssignment(assignmentId);
       this.db.prepare("UPDATE assignments SET status = ?, completed_at = ?, claim_token_hash = NULL WHERE id = ?")
         .run(status === "blocked" ? "blocked" : "done", stamp, assignmentId);
       if (cleanChanged.length) {
@@ -1915,9 +2411,13 @@ export class DevTeamStore extends EventEmitter {
     this.#transaction(() => {
       this.db.prepare("UPDATE tasks SET status = 'blocked', updated_at = ? WHERE id = ?").run(stamp, taskId);
       this.db.prepare(`
-        UPDATE assignments SET status = 'blocked', completed_at = COALESCE(completed_at, ?)
+        UPDATE assignments SET status = 'blocked', completed_at = COALESCE(completed_at, ?), claim_token_hash = NULL
         WHERE task_id = ? AND status IN ('queued', 'claimed')
       `).run(stamp, taskId);
+      this.db.prepare(`
+        UPDATE session_checkpoints SET status = 'cancelled', handoff_token_hash = NULL
+        WHERE task_id = ? AND status = 'ready'
+      `).run(taskId);
       this.#event(taskId, agentId, "task.blocked", reason.trim(), {});
       this.#standDownTaskAgents(taskId, stamp, "Task was blocked; co-workers were released to other work.");
     });
@@ -2223,8 +2723,9 @@ export class DevTeamStore extends EventEmitter {
       SELECT status, COUNT(*) AS count FROM knowledge_notes WHERE project_id = ? GROUP BY status
     `).all(task.project_id)) knowledgeLifecycle[row.status] = Number(row.count);
     const codeGraphState = this.codegraph.projectState(task.project_id);
+    const sessionCheckpoints = this.sessionCheckpointsForTask(taskId);
     return {
-      ...task, assignments, approvals, events, proposals, blackboard, projectBlackboard, knowledge, members,
+      ...task, assignments, approvals, events, proposals, blackboard, projectBlackboard, knowledge, members, sessionCheckpoints,
       knowledgeVault: {
         automated: this.knowledge.enabled,
         path: path.join(task.project_root, "knowledge"),
@@ -2499,6 +3000,10 @@ export class DevTeamStore extends EventEmitter {
       body: clip(note.body, 1_400, "knowledgeBodies"),
       relatedFiles: (note.relatedFiles || []).slice(0, 20).map((file) => clip(file, 400, "knowledgePaths")),
     }));
+    const sessionCheckpoint = this.db.prepare(`
+      SELECT * FROM session_checkpoints WHERE task_id = ? AND status IN ('ready', 'claimed')
+      ORDER BY CASE status WHEN 'ready' THEN 0 ELSE 1 END, checkpoint_generation DESC LIMIT 1
+    `).get(taskId);
     const brief = buildBudgetedBrief({
       core: {
         ...responseCore,
@@ -2514,6 +3019,7 @@ export class DevTeamStore extends EventEmitter {
             root: clip(task.project_root, 2_000, "projectRoot"),
           },
         },
+        sessionCheckpoint: sessionCheckpoint ? this.#checkpointRecord(sessionCheckpoint) : null,
         [assignmentKey]: currentAssignment,
         claimInstructions: "Retain the claim token privately, inspect the current project state before writing, stay inside the declared write scope, and pass the token to devteam_report so stale work is fenced.",
       },

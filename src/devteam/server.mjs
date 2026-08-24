@@ -43,9 +43,10 @@ export async function startDevTeamServer({
   liveness = {},
   knowledge = { enabled: true },
   codegraph = { enabled: true },
+  checkpoint = {},
 } = {}) {
   if (!dataDir) throw new Error("dataDir is required.");
-  const store = new DevTeamStore(dataDir, { liveness, knowledge, codegraph });
+  const store = new DevTeamStore(dataDir, { liveness, knowledge, codegraph, checkpoint });
   const attachmentRoot = path.resolve(dataDir, "attachments");
   const root = requireDirectory(workspaceRoot);
   store.ensureProject(path.basename(root), root);
@@ -112,6 +113,18 @@ export async function startDevTeamServer({
     return res.status(401).json({ error: "This action requires the DevTeam dashboard session or bearer token." });
   };
   app.use("/api", (req, res, next) => (MUTATING_METHODS.has(req.method) ? requireControlAuth(req, res, next) : next()));
+
+  const checkpointInvitation = (task, result) => [
+    `Continue DevTeam task “${result.checkpoint.capsule?.task?.title || task.id}” in a fresh session.`,
+    "",
+    "Use the DevTeam skill and connect as a new agent session. Join the task room below, then call devteam_session_takeover exactly once with:",
+    "",
+    `taskId: ${task.id}`,
+    `checkpointId: ${result.checkpoint.id}`,
+    `handoffToken: ${result.handoffToken}`,
+    "",
+    "After takeover, read the bounded capsule, inspect the repository and current task state, and continue only under the newly issued claim token. Do not use devteam_resume: this is an intentional fresh-session takeover. The handoff token is single-use and expires at " + result.checkpoint.expiresAt + ".",
+  ].join("\n");
 
   const mcpPost = asyncRoute(async (req, res) => {
     const sessionId = req.get("mcp-session-id");
@@ -205,6 +218,40 @@ export async function startDevTeamServer({
   app.post("/api/tasks/:taskId/assignments", (req, res) => {
     requireFields(req.body, ["title", "description"]);
     res.status(201).json(store.createAssignment({ ...req.body, taskId: req.params.taskId }));
+  });
+  app.post("/api/tasks/:taskId/checkpoints", (req, res) => {
+    const task = store.getTask(req.params.taskId);
+    if (!task) return res.status(404).json({ error: "Task not found." });
+    const assignmentId = typeof req.body?.assignmentId === "string" ? req.body.assignmentId : null;
+    const assignment = assignmentId
+      ? store.db.prepare("SELECT * FROM assignments WHERE id = ? AND task_id = ?").get(assignmentId, task.id)
+      : null;
+    if (assignmentId && !assignment) throw new Error("The assignment does not belong to this task.");
+    const fromAgentId = assignment?.agent_id || (typeof req.body?.fromAgentId === "string" ? req.body.fromAgentId : null);
+    if (!fromAgentId) throw new Error("Choose an active agent or claimed assignment to checkpoint.");
+    const expiresInMinutes = Math.max(1, Math.min(1440, Number(req.body?.expiresInMinutes) || 30));
+    const result = store.createSessionCheckpoint({
+      agentId: fromAgentId,
+      taskId: task.id,
+      assignmentId,
+      decisions: req.body?.decisions,
+      blockers: req.body?.blockers,
+      checks: req.body?.checks,
+      failedApproaches: req.body?.failedApproaches,
+      nextAction: req.body?.nextAction,
+      expiresInMs: expiresInMinutes * 60_000,
+    });
+    res.status(201).json({ ...result, invitation: checkpointInvitation(task, result) });
+  });
+  app.get("/api/tasks/:taskId/checkpoints/:checkpointId", requireControlAuth, (req, res) => {
+    res.json(store.sessionCheckpointGet({ taskId: req.params.taskId, checkpointId: req.params.checkpointId }));
+  });
+  app.post("/api/tasks/:taskId/checkpoints/:checkpointId/cancel", (req, res) => {
+    res.json(store.cancelSessionCheckpoint({
+      taskId: req.params.taskId,
+      checkpointId: req.params.checkpointId,
+      reason: req.body?.reason || "Human cancelled session rotation from the dashboard.",
+    }));
   });
   app.post("/api/tasks/:taskId/messages", (req, res) => {
     requireFields(req.body, ["message"]);
