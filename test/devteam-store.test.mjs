@@ -82,9 +82,10 @@ test("DevTeam coordinates plan, write lease, review, versioning, and consensus",
   store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Plan dispatched." });
   assert.equal(store.getTask(task.id).status, "active");
 
+  assert.equal(store.claimNextAssignment(reviewerA.id), null, "review waits while an unrelated write remains queued");
   const implementation = store.claimNextAssignment(writer.id);
   assert.equal(implementation.requires_write, 1);
-  assert.equal(store.claimNextAssignment(reviewerA.id), null, "review waits until pending writes finish");
+  assert.equal(store.claimNextAssignment(reviewerA.id), null, "review waits while an unrelated write is claimed");
   assert.equal(store.claimNextAssignment(planner.id), null, "an untargeted agent cannot take targeted work");
   const completed = store.completeAssignment({ agentId: writer.id, assignmentId: implementation.id, message: "Implemented.", changedFiles: ["src/example.js"], checks: ["npm test"] });
   assert.equal(completed.version, 2);
@@ -527,6 +528,45 @@ test("assignment dependencies hold queued work until every same-task prerequisit
   store.joinTask(planner.id, otherTask.id);
   assert.throws(() => store.createAssignment({ agentId: planner.id, taskId: otherTask.id, title: "Cross-task", description: "Invalid.", dependsOn: [parent.id] }), /same task/);
   assert.throws(() => store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Missing", description: "Invalid.", dependsOn: ["00000000-0000-4000-8000-000000000000"] }), /existing assignment/);
+});
+
+test("review stages do not deadlock behind a transitive downstream writer", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-review-dependencies-"));
+  const store = new DevTeamStore(dataDir);
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Staged review", process.cwd());
+  const task = store.createTask({ projectId: project.id, title: "Ship staged changes", description: "Implement, review, fix, and test." });
+  const planner = store.connectAgent({ name: "Planner", provider: "test" });
+  const implementer = store.connectAgent({ name: "Implementer", provider: "test" });
+  const reviewer = store.connectAgent({ name: "Reviewer", provider: "test" });
+  const securityReviewer = store.connectAgent({ name: "Security Reviewer", provider: "test" });
+  const fixer = store.connectAgent({ name: "Fixer", provider: "test" });
+  const tester = store.connectAgent({ name: "Tester", provider: "test" });
+
+  const plan = store.claimNextAssignment(planner.id);
+  const implementation = store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Implement", description: "Build the change.", role: "implementer", requiresWrite: true, targetAgentName: "Implementer" });
+  const review = store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Review", description: "Review the implementation.", role: "reviewer", targetAgentName: "Reviewer", dependsOn: [implementation.id] });
+  const securityReview = store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Security review", description: "Review security.", role: "security-reviewer", targetAgentName: "Security Reviewer", dependsOn: [review.id] });
+  const fix = store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Fix findings", description: "Apply review findings.", role: "implementer", requiresWrite: true, targetAgentName: "Fixer", dependsOn: [securityReview.id] });
+  const testAssignment = store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Test", description: "Verify the final change.", role: "tester", targetAgentName: "Tester", dependsOn: [fix.id] });
+  store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Staged workflow planned." });
+
+  assert.equal(store.claimNextAssignment(implementer.id).id, implementation.id);
+  assert.equal(store.claimNextAssignment(reviewer.id), null, "review still waits for its upstream writer");
+  store.completeAssignment({ agentId: implementer.id, assignmentId: implementation.id, message: "Implemented.", changedFiles: ["src/feature.mjs"] });
+
+  assert.equal(store.claimNextAssignment(reviewer.id)?.id, review.id, "review ignores the transitive downstream fixer");
+  assert.equal(store.claimNextAssignment(securityReviewer.id), null, "security review waits for review");
+  store.completeAssignment({ agentId: reviewer.id, assignmentId: review.id, message: "Reviewed." });
+
+  assert.equal(store.claimNextAssignment(securityReviewer.id)?.id, securityReview.id, "security review ignores its direct downstream fixer");
+  store.completeAssignment({ agentId: securityReviewer.id, assignmentId: securityReview.id, message: "Security reviewed." });
+
+  assert.equal(store.claimNextAssignment(fixer.id)?.id, fix.id);
+  assert.equal(store.claimNextAssignment(tester.id), null, "tester waits for the upstream fixer");
+  store.completeAssignment({ agentId: fixer.id, assignmentId: fix.id, message: "Findings fixed.", changedFiles: ["src/feature.mjs"] });
+
+  assert.equal(store.claimNextAssignment(tester.id)?.id, testAssignment.id);
 });
 
 test("an assignment blocker queues triage without stopping sibling work or the task", async (t) => {
@@ -1289,7 +1329,7 @@ test("continueTask during review advances the version and clears the in-progress
 
 test("forgetAgent removes an unresponsive ghost, returns its work, and refuses a live agent", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-forget-"));
-  const store = new DevTeamStore(dataDir, { liveness: { presenceMs: 1 } });
+  const store = new DevTeamStore(dataDir, { liveness: { presenceMs: 100 } });
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Ghost project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Hold a lease", description: "Exercise ghost removal." });
@@ -1304,7 +1344,7 @@ test("forgetAgent removes an unresponsive ghost, returns its work, and refuses a
   const write = store.claimNextAssignment(writer.id);
   assert.equal(write.requires_write, 1, "the writer holds a write lease");
 
-  await new Promise((resolve) => setTimeout(resolve, 15));
+  await new Promise((resolve) => setTimeout(resolve, 125));
   store.reapAndRecover();
   assert.equal(store.getAgent(writer.id).status, "unresponsive", "a silent busy writer becomes unresponsive but keeps its claim");
 
@@ -1318,7 +1358,7 @@ test("forgetAgent removes an unresponsive ghost, returns its work, and refuses a
 
 test("long-gone agents are auto-purged, but a ghost still holding a write lease is kept", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-purge-"));
-  const store = new DevTeamStore(dataDir, { liveness: { presenceMs: 1, forgetMs: 1 } });
+  const store = new DevTeamStore(dataDir, { liveness: { presenceMs: 100, forgetMs: 1 } });
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Purge project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Reap the ghosts", description: "Exercise auto-purge." });
@@ -1331,7 +1371,7 @@ test("long-gone agents are auto-purged, but a ghost still holding a write lease 
   store.claimNextAssignment(writer.id); // Writer now holds a write lease.
   store.disconnectAgent(idler.id); // Idler leaves for good, holding nothing.
 
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  await new Promise((resolve) => setTimeout(resolve, 125));
   store.reapAndRecover();
   const names = store.listAgents().map((agent) => agent.name);
   assert.ok(!names.includes("Idler"), "a long-disconnected agent is purged from the roster");

@@ -1453,6 +1453,15 @@ export class DevTeamStore extends EventEmitter {
       // no longer project-wide: we resolve it per path below so non-overlapping writers run
       // in parallel.
       const candidates = this.db.prepare(`
+        WITH RECURSIVE dependency_closure(assignment_id, prerequisite_id) AS (
+          SELECT assignment_id, depends_on_assignment_id
+          FROM assignment_dependencies
+          UNION
+          SELECT dependency_closure.assignment_id, dependency_link.depends_on_assignment_id
+          FROM dependency_closure
+          JOIN assignment_dependencies dependency_link
+            ON dependency_link.assignment_id = dependency_closure.prerequisite_id
+        )
         SELECT a.*, t.project_id, t.title AS task_title, t.description AS task_description,
           t.version AS task_version, t.required_approvals, p.root AS project_root, p.name AS project_name
         FROM assignments a
@@ -1474,6 +1483,11 @@ export class DevTeamStore extends EventEmitter {
               WHERE pending_write.task_id = a.task_id
                 AND pending_write.requires_write = 1
                 AND pending_write.status IN ('queued', 'claimed')
+                AND NOT EXISTS (
+                  SELECT 1 FROM dependency_closure
+                  WHERE dependency_closure.assignment_id = pending_write.id
+                    AND dependency_closure.prerequisite_id = a.id
+                )
             )
           )
         ORDER BY CASE WHEN a.target_agent_name IS NOT NULL THEN 0 ELSE 1 END, a.created_at ASC
