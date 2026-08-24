@@ -14,6 +14,7 @@
       <button class="drawer-close" type="button" data-close-panel="sidebar" aria-label="Close navigation">×</button>
       <div class="brand"><img src="/devteam-logo.jpg" alt="DevTeam — local AI collaboration workspace" class="brand-logo"><div><strong>DevTeam</strong><small>local workspace</small></div></div>
       <button class="primary full" data-dialog="task-dialog"><span>＋</span> New task</button>
+      <button id="open-search" class="secondary search-trigger" type="button" data-dialog="search-dialog"><span>⌕ Search workspace</span><kbd>Ctrl K</kbd></button>
       <nav>
         <div class="section-label"><span>Projects</span><button class="icon-button" title="Add project" data-dialog="project-dialog">＋</button></div>
         <div id="project-list" class="project-list"></div>
@@ -25,6 +26,7 @@
         <div><strong>Local server</strong><small id="server-address">checking…</small></div>
         <button id="copy-setup" class="icon-button" title="Copy MCP setup">⧉</button>
       </div>
+      <div class="panel-resizer sidebar-resizer" data-resize-panel="sidebar" role="separator" aria-orientation="vertical" aria-label="Resize navigation panel" aria-controls="sidebar" tabindex="0"></div>
     </aside>
 
     <main class="workspace">
@@ -35,7 +37,7 @@
           <h1 id="task-title">Bring your AI team together</h1>
           <p id="task-description">Create a task, connect agents through MCP, and watch the plan, implementation, tests, and review happen in one place.</p>
         </div>
-        <div class="header-actions"><span id="task-version" class="version">v1</span><button id="toggle-description" class="secondary hidden" type="button" aria-expanded="false">More</button><button id="copy-task-invite" class="secondary" title="Copy a task-specific agent prompt">Invite agent</button><button id="edit-task" class="secondary hidden" type="button" title="Edit this task's title, description, or approvals">Edit task</button><button class="secondary" data-dialog="task-dialog">New task</button><button id="toggle-team" class="panel-toggle" type="button" aria-label="Toggle team panel" aria-expanded="true" aria-controls="team-panel" title="Toggle team panel">◧</button></div>
+        <div class="header-actions"><span id="task-version" class="version">v1</span><button id="open-task-brief" class="secondary hidden" type="button" data-dialog="task-brief-dialog" aria-haspopup="dialog">Task brief</button><button id="copy-task-invite" class="secondary" title="Copy a task-specific agent prompt">Invite agent</button><button id="edit-task" class="secondary hidden" type="button" title="Edit this task's title, description, or approvals">Edit task</button><button class="secondary" data-dialog="task-dialog">New task</button><button id="toggle-team" class="panel-toggle" type="button" aria-label="Toggle team panel" aria-expanded="true" aria-controls="team-panel" title="Toggle team panel">◧</button></div>
       </header>
 
       <section id="empty-state" class="empty-state">
@@ -46,6 +48,17 @@
       </section>
 
       <section id="conversation" class="conversation hidden">
+        <div class="timeline-toolbar">
+          <div id="timeline-filters" class="timeline-filters" role="toolbar" aria-label="Filter timeline">
+            <button class="active" type="button" data-timeline-filter="all" aria-pressed="true">All</button>
+            <button type="button" data-timeline-filter="chat" aria-pressed="false">Chat</button>
+            <button type="button" data-timeline-filter="work" aria-pressed="false">Work</button>
+            <button type="button" data-timeline-filter="decisions" aria-pressed="false">Decisions</button>
+            <button type="button" data-timeline-filter="findings" aria-pressed="false">Findings</button>
+            <button type="button" data-timeline-filter="system" aria-pressed="false">System</button>
+          </div>
+          <button id="jump-latest" class="jump-latest hidden" type="button">Jump to latest</button>
+        </div>
         <div id="event-list" class="event-list" role="log" aria-label="Team chat history"></div>
         <form id="message-form" class="composer">
           <div class="composer-head">
@@ -57,12 +70,13 @@
           <div id="reply-context" class="reply-context hidden"></div>
           <textarea name="message" rows="1" aria-label="Message the team" aria-describedby="composer-hint composer-shortcut" placeholder="Message the team, or paste/drop an image or PDF…"></textarea>
           <div id="attachment-preview" class="attachment-preview hidden" aria-live="polite"></div>
-          <div class="composer-footer"><div class="composer-guidance"><span id="composer-hint">Delivered live to connected agents on their next check.</span><span id="composer-shortcut" class="composer-shortcut"><kbd>Shift + Enter</kbd> new line</span></div><div class="composer-actions"><label class="attach-button" title="Attach images or PDFs"><span aria-hidden="true">＋</span><span class="sr-only">Attach images or PDFs</span><input id="attachment-input" type="file" accept="image/png,image/jpeg,image/gif,image/webp,application/pdf" multiple></label><button class="send" title="Send message" aria-label="Send message">↑</button></div></div>
+          <div class="composer-footer"><div class="composer-guidance"><span id="composer-hint">Delivered live to connected agents on their next check.</span><span id="draft-status" class="draft-status" aria-live="polite"></span><span id="composer-shortcut" class="composer-shortcut"><kbd>Shift + Enter</kbd> new line</span></div><div class="composer-actions"><label class="attach-button" title="Attach images or PDFs"><span aria-hidden="true">＋</span><span class="sr-only">Attach images or PDFs</span><input id="attachment-input" type="file" accept="image/png,image/jpeg,image/gif,image/webp,application/pdf" multiple></label><button class="send" title="Send message" aria-label="Send message">↑</button></div></div>
         </form>
       </section>
     </main>
 
     <aside class="team-panel" id="team-panel">
+      <div class="panel-resizer team-resizer" data-resize-panel="team" role="separator" aria-orientation="vertical" aria-label="Resize team panel" aria-controls="team-panel" tabindex="0"></div>
       <button class="drawer-close" type="button" data-close-panel="team" aria-label="Close team panel">×</button>
       <div class="panel-head"><div><span class="eyebrow">LIVE ROOM</span><h2>Team</h2></div><span id="online-count" class="online-count">0 online</span></div>
       <div id="agent-list" class="agent-list"></div>
@@ -141,6 +155,19 @@
       <label>Session policy<select name="sessionPolicy"><option value="per_task" selected>Fresh session per task (recommended)</option><option value="adaptive">Adaptive</option><option value="manual">Manual</option><option value="per_assignment">Per assignment (experimental)</option></select></label>
       <div class="dialog-actions"><button type="button" class="secondary close">Cancel</button><button class="primary" value="submit">Start task</button></div>
     </form>
+  </dialog>
+
+  <dialog id="task-brief-dialog" class="task-brief-dialog" aria-labelledby="task-brief-title">
+    <div class="dialog-head"><div><span class="eyebrow">TASK BRIEF</span><h2 id="task-brief-title">Task brief</h2></div><button type="button" class="close" aria-label="Close task brief">×</button></div>
+    <div id="task-brief-content" class="task-brief-content"></div>
+    <div class="dialog-actions"><button type="button" class="secondary close">Close</button><button id="edit-task-from-brief" type="button" class="primary">Edit task</button></div>
+  </dialog>
+
+  <dialog id="search-dialog" class="search-dialog" aria-labelledby="search-dialog-title">
+    <div class="dialog-head"><div><span class="eyebrow">WORKSPACE SEARCH</span><h2 id="search-dialog-title">Find anything</h2></div><button type="button" class="close" aria-label="Close search">×</button></div>
+    <label class="search-field"><span class="sr-only">Search tasks, chat, work, decisions, and knowledge</span><input id="workspace-search" type="search" autocomplete="off" maxlength="120" placeholder="Search tasks, chat, work, decisions, and knowledge…"></label>
+    <div class="search-scope"><label><input id="search-current-project" type="checkbox"> Current project only</label><span><kbd>Ctrl K</kbd> opens search</span></div>
+    <div id="search-results" class="search-results" aria-live="polite"><p class="search-empty">Type at least two characters to search the workspace.</p></div>
   </dialog>
 
   <dialog id="project-dialog">

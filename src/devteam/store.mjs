@@ -1062,6 +1062,52 @@ export class DevTeamStore extends EventEmitter {
     return rows;
   }
 
+  workspaceSearch(query, { projectId = null, limit = 40 } = {}) {
+    const clean = String(query || "").trim().slice(0, 120);
+    if (clean.length < 2) return [];
+    const boundedLimit = Math.max(1, Math.min(100, Number(limit) || 40));
+    const perGroup = Math.max(5, Math.ceil(boundedLimit / 2));
+    const escaped = clean.replace(/[\\%_]/g, (character) => `\\${character}`);
+    const pattern = `%${escaped}%`;
+    const projectClause = projectId ? " AND t.project_id = ?" : "";
+    const projectArgs = projectId ? [projectId] : [];
+    const taskRows = this.db.prepare(`
+      SELECT 'task' AS kind, t.id AS task_id, NULL AS event_id, t.project_id, p.name AS project_name,
+        t.title, t.description AS snippet, t.status AS subtype, t.updated_at AS occurred_at
+      FROM tasks t JOIN projects p ON p.id = t.project_id
+      WHERE (t.title LIKE ? ESCAPE '\\' OR t.description LIKE ? ESCAPE '\\')${projectClause}
+      ORDER BY t.updated_at DESC LIMIT ?
+    `).all(pattern, pattern, ...projectArgs, perGroup);
+    const eventRows = this.db.prepare(`
+      SELECT 'event' AS kind, t.id AS task_id, e.id AS event_id, t.project_id, p.name AS project_name,
+        t.title, e.message AS snippet, e.type AS subtype, e.created_at AS occurred_at
+      FROM events e JOIN tasks t ON t.id = e.task_id JOIN projects p ON p.id = t.project_id
+      WHERE e.message LIKE ? ESCAPE '\\'${projectClause}
+      ORDER BY e.id DESC LIMIT ?
+    `).all(pattern, ...projectArgs, perGroup);
+    const assignmentRows = this.db.prepare(`
+      SELECT 'assignment' AS kind, t.id AS task_id, NULL AS event_id, t.project_id, p.name AS project_name,
+        a.title, a.description AS snippet, a.status AS subtype, a.created_at AS occurred_at
+      FROM assignments a JOIN tasks t ON t.id = a.task_id JOIN projects p ON p.id = t.project_id
+      WHERE (a.title LIKE ? ESCAPE '\\' OR a.description LIKE ? ESCAPE '\\')${projectClause}
+      ORDER BY a.created_at DESC LIMIT ?
+    `).all(pattern, pattern, ...projectArgs, perGroup);
+    const knowledgeProjectClause = projectId ? " AND k.project_id = ?" : "";
+    const knowledgeRows = this.db.prepare(`
+      SELECT 'knowledge' AS kind, k.source_task_id AS task_id, k.source_event_id AS event_id,
+        k.project_id, p.name AS project_name, k.title, k.body AS snippet, k.status AS subtype,
+        k.updated_at AS occurred_at
+      FROM knowledge_notes k JOIN projects p ON p.id = k.project_id
+      WHERE (k.title LIKE ? ESCAPE '\\' OR k.body LIKE ? ESCAPE '\\')${knowledgeProjectClause}
+      ORDER BY k.updated_at DESC LIMIT ?
+    `).all(pattern, pattern, ...projectArgs, perGroup);
+    return [...taskRows, ...eventRows, ...assignmentRows, ...knowledgeRows]
+      .map((row) => ({ ...row, snippet: String(row.snippet || "").replace(/\s+/g, " ").trim().slice(0, 260) }))
+      .sort((left, right) => String(right.occurred_at).localeCompare(String(left.occurred_at))
+        || String(left.kind).localeCompare(String(right.kind)))
+      .slice(0, boundedLimit);
+  }
+
   // Edit a task's own information (title, description, or how many independent approvals it needs)
   // after creation, so a typo or a sharpened spec no longer means deleting and recreating the room.
   // This is metadata only: it does not touch the version, existing approvals, assignments, or the

@@ -1486,3 +1486,29 @@ test("updateProject renames a project and repoints its root with validation", as
   assert.equal(moved.root, path.resolve(rootA));
   assert.throws(() => store.updateProject(second.id, { name: "  " }), /name cannot be empty/);
 });
+
+test("workspaceSearch spans tasks, timeline messages, assignments, and knowledge safely", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-workspace-search-"));
+  const store = new DevTeamStore(dataDir, { knowledge: { enabled: true } });
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Search project", process.cwd());
+  const task = store.createTask({ projectId: project.id, title: "Searchable nebula task", description: "Investigate a quartz boundary." });
+  const otherRoot = await mkdtemp(path.join(os.tmpdir(), "devteam-search-other-"));
+  t.after(async () => { await rm(otherRoot, { recursive: true, force: true }); });
+  const otherProject = store.ensureProject("Other search project", otherRoot);
+  store.humanMessage(task.id, "Timeline contains the cobalt phrase.", "all");
+  store.createAssignment({ taskId: task.id, title: "Inspect vermilion module", description: "Search assignment coverage." });
+  const stamp = new Date().toISOString();
+  store.db.prepare(`INSERT INTO knowledge_notes
+    (id, project_id, category, slug, title, body, status, confidence, source_task_id, related_files, provenance, created_at, updated_at)
+    VALUES (?, ?, 'decisions', 'indigo-search', 'Indigo architecture decision', 'Knowledge contains an indigo phrase.', 'verified', 'high', ?, '[]', '{}', ?, ?)`)
+    .run("indigo-search-note", project.id, task.id, stamp, stamp);
+
+  assert.ok(store.workspaceSearch("nebula").some((result) => result.kind === "task" && result.task_id === task.id));
+  assert.ok(store.workspaceSearch("cobalt").some((result) => result.kind === "event" && result.task_id === task.id));
+  assert.ok(store.workspaceSearch("vermilion").some((result) => result.kind === "assignment" && result.task_id === task.id));
+  assert.ok(store.workspaceSearch("indigo").some((result) => result.kind === "knowledge" && result.task_id === task.id));
+  assert.equal(store.workspaceSearch("nebula", { projectId: otherProject.id }).length, 0, "project-scoped search cannot cross into another project");
+  assert.deepEqual(store.workspaceSearch("x"), [], "one-character scans are rejected");
+  assert.doesNotThrow(() => store.workspaceSearch("%' OR 1=1 --"), "search text stays parameterized and escaped");
+});

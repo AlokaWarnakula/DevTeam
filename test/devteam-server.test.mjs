@@ -20,13 +20,24 @@ test("dashboard API and authenticated MCP endpoint work together", async (t) => 
   assert.match(homeHtml, /knowledge-filter/);
   assert.match(homeHtml, /role="log" aria-label="Team chat history"/, "chat history has accessible log semantics");
   assert.match(homeHtml, /Shift \+ Enter<\/kbd> new line/, "multiline drafting shortcut is visible");
+  assert.match(homeHtml, /id="task-brief-dialog"/, "long task briefs have a dedicated dialog");
+  assert.match(homeHtml, /data-timeline-filter="decisions"/, "timeline categories are directly filterable");
+  assert.match(homeHtml, /data-resize-panel="sidebar"/, "workspace panels expose an accessible resize separator");
+  assert.match(homeHtml, /id="search-dialog"/, "workspace search is available from the dashboard");
   const dashboardScript = await fetch(`${instance.url}/app.js`).then((response) => response.text());
   const dashboardStyles = await fetch(`${instance.url}/overrides.css`).then((response) => response.text());
+  const dashboardUtilities = await fetch(`${instance.url}/ui-utils.js`).then((response) => response.text());
   assert.match(dashboardScript, /function resizeMessageField\(/, "the message composer grows with multiline drafts");
   assert.match(dashboardScript, /!event\.isComposing/, "IME composition does not submit a partial message");
-  assert.match(dashboardScript, /if \(messageSending\) return;/, "duplicate sends are guarded while a post is in flight");
+  assert.match(dashboardScript, /if \(messageSending\)/, "duplicate sends are guarded while a post is in flight");
+  assert.match(dashboardScript, /Draft saved locally/, "per-task draft recovery is wired into chat");
+  assert.match(dashboardScript, /data-retry-send/, "failed optimistic sends expose retry state");
+  assert.match(dashboardScript, /if \(narrow\)[\s\S]*sidebar-collapsed", "panel-collapsed/, "narrow screens start with both overlay drawers closed");
+  assert.match(dashboardScript, /window\.innerWidth - peerWidth - 460/, "panel resizing preserves usable chat width");
+  assert.match(dashboardUtilities, /export function renderSafeMarkdown/, "safe message formatting ships as a testable module");
   assert.match(dashboardStyles, /#task-description[\s\S]*white-space: break-spaces;/, "task descriptions preserve authored whitespace");
-  assert.match(dashboardStyles, /#task-description\.is-long\.expanded[\s\S]*overflow-y: auto;/, "expanded long briefs stay bounded and scrollable");
+  assert.match(dashboardStyles, /\.task-brief-content[\s\S]*overflow: auto;/, "long briefs stay bounded and scrollable in the dialog");
+  assert.match(dashboardStyles, /@media \(max-width: 1050px\)[\s\S]*\.panel-resizer \{ display: none;/, "resize handles are removed when panels become narrow-screen drawers");
   const config = await fetch(`${instance.url}/api/config`).then((response) => response.json());
   assert.equal(config.mcpUrl, instance.mcpUrl);
   const state = await fetch(`${instance.url}/api/state`).then((response) => response.json());
@@ -42,6 +53,8 @@ test("dashboard API and authenticated MCP endpoint work together", async (t) => 
   });
   assert.equal(taskResponse.status, 201);
   const createdTask = await taskResponse.json();
+  const search = await fetch(`${instance.url}/api/search?q=MCP%20integration`).then((response) => response.json());
+  assert.ok(search.results.some((result) => result.kind === "task" && result.task_id === createdTask.id), "workspace search finds persisted task content");
 
   const transport = new StreamableHTTPClientTransport(new URL(instance.mcpUrl), {
     requestInit: { headers: { Authorization: `Bearer ${instance.store.token}` } },

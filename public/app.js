@@ -1,7 +1,6 @@
+import { escapeHtml, eventMatchesTimelineFilter, renderSafeMarkdown, unreadTimelineCount } from "/ui-utils.js";
+
 const $ = (selector) => document.querySelector(selector);
-const escapeHtml = (value = "") => String(value).replace(/[&<>'"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[char]));
-// Keep timeline markup deliberately small: escape first, then allow only balanced **bold** spans.
-const renderMessageText = (value = "") => escapeHtml(value).replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
 const time = (stamp) => new Intl.DateTimeFormat([], { hour: "numeric", minute: "2-digit" }).format(new Date(stamp));
 const relativeTime = (stamp) => {
   if (!stamp) return "";
@@ -45,10 +44,14 @@ let pendingAttachments = [];
 let proposalTaskId = null;
 let proposalStatuses = new Map();
 let renderedTaskId = null;
-let descriptionExpanded = false;
 let messageSending = false;
+let timelineFilter = "all";
+let pendingSends = [];
+let pendingJumpEventId = null;
+let searchGeneration = 0;
 const ATTACHMENT_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf"]);
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+const DRAFT_LIMIT = 50_000;
 
 function syncTaskUrl() {
   const url = new URL(location.href);
@@ -62,6 +65,76 @@ async function api(url, options = {}) {
   const body = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(body.error || `Request failed (${response.status})`);
   return body;
+}
+
+function storageGet(key) {
+  try { return localStorage.getItem(key); } catch { return null; }
+}
+
+function storageSet(key, value) {
+  try {
+    if (value == null) localStorage.removeItem(key);
+    else localStorage.setItem(key, value);
+    return true;
+  } catch {
+    return false; // Private browsing or a full storage quota must not break chat.
+  }
+}
+
+const draftKey = (taskId) => `devteam:draft:${taskId}`;
+const readKey = (taskId) => `devteam:last-read:${taskId}`;
+
+function readDraft(taskId) {
+  try { return JSON.parse(storageGet(draftKey(taskId)) || "null"); } catch { return null; }
+}
+
+function updateDraftStatus(message = "") {
+  const status = $("#draft-status");
+  if (status) status.textContent = message;
+}
+
+function saveMessageDraft(taskId = selectedTaskId) {
+  if (!taskId) return;
+  const form = $("#message-form");
+  const message = form.elements.message.value.slice(0, DRAFT_LIMIT);
+  const target = form.elements.target?.value || "all";
+  if (!message) {
+    storageSet(draftKey(taskId), null);
+    updateDraftStatus("");
+    return;
+  }
+  const saved = storageSet(draftKey(taskId), JSON.stringify({ message, target, savedAt: new Date().toISOString() }));
+  updateDraftStatus(saved ? "Draft saved locally" : "Draft could not be saved locally");
+}
+
+function clearMessageDraft(taskId) {
+  storageSet(draftKey(taskId), null);
+  if (taskId === selectedTaskId) updateDraftStatus("");
+}
+
+function restoreMessageDraft(taskId) {
+  const field = $("#message-form").elements.message;
+  const draft = readDraft(taskId);
+  field.value = draft?.message || "";
+  resizeMessageField(field);
+  updateDraftStatus(draft?.message ? "Draft restored" : "");
+}
+
+function lastReadEventId(taskId) {
+  const value = Number(storageGet(readKey(taskId)));
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function latestReadableEventId(task) {
+  return Math.max(0, ...task.events.filter((event) => event.agent_id).map((event) => Number(event.id) || 0));
+}
+
+function markTimelineRead(task = state?.selectedTask) {
+  if (!task || timelineFilter !== "all") return;
+  const latest = latestReadableEventId(task);
+  if (latest) storageSet(readKey(task.id), String(latest));
+  const button = $("#jump-latest");
+  if (button) button.classList.add("hidden");
 }
 
 function toast(message) {
@@ -125,7 +198,7 @@ function renderEvent(event) {
   if (event.type === "proposal.vote") return "";
   if (SYSTEM_EVENTS.includes(event.type)) {
     const icon = event.type === "proposal.adopted" ? "✓ " : event.type === "proposal.declined" ? "✕ " : event.type.startsWith("proposal") ? "⇄ " : "";
-    return `<div class="system-event ${event.type.replace(".", "-")}">${icon}${escapeHtml(event.message)} <span class="provider">· ${time(event.created_at)}</span></div>`;
+    return `<div id="event-${event.id}" class="system-event ${event.type.replace(".", "-")}">${icon}${escapeHtml(event.message)} <span class="provider">· ${time(event.created_at)}</span></div>`;
   }
   const human = !event.agent_id;
   const name = human ? "You" : event.agent_name || "Agent";
@@ -141,9 +214,64 @@ function renderEvent(event) {
     ? `<div class="reply-quote">↳ ${escapeHtml(parent.agent_id ? (parent.agent_name || "Agent") : "You")}: ${escapeHtml((parent.message || "").slice(0, 100))}</div>`
     : "";
   const parsed = parseAttachmentMarkers(event.message);
-  const body = parsed.message ? `<div class="event-body">${renderMessageText(parsed.message)}</div>` : "";
+  const body = parsed.message ? `<div class="event-body markdown">${renderSafeMarkdown(parsed.message)}</div>` : "";
   const attachments = parsed.attachments.length ? `<div class="message-attachments">${parsed.attachments.map(renderMessageAttachment).join("")}</div>` : "";
-  return `<article class="event ${human ? "from-human" : ""}"><div class="avatar ${human ? "human" : ""}">${initials(name)}</div><div class="event-main"><div class="event-top"><span class="event-name">${escapeHtml(name)}</span><span class="provider">${escapeHtml(human ? "you" : event.agent_provider || event.type)}</span>${badge}<span class="event-time">${time(event.created_at)}</span><button class="reply-btn" data-reply="${event.id}" title="Reply to this message" aria-label="Reply">↩</button></div>${quote}${body}${attachments}${meta.length ? `<div class="event-meta">${meta.map((item) => `<span class="chip">${escapeHtml(item)}</span>`).join("")}</div>` : ""}${human ? deliveryLine(event) : ""}</div></article>`;
+  return `<article id="event-${event.id}" class="event ${human ? "from-human" : ""}"><div class="avatar ${human ? "human" : ""}">${initials(name)}</div><div class="event-main"><div class="event-top"><span class="event-name">${escapeHtml(name)}</span><span class="provider">${escapeHtml(human ? "you" : event.agent_provider || event.type)}</span>${badge}<span class="event-time">${time(event.created_at)}</span><button class="reply-btn" data-reply="${event.id}" title="Reply to this message" aria-label="Reply">↩</button></div>${quote}${body}${attachments}${meta.length ? `<div class="event-meta">${meta.map((item) => `<span class="chip">${escapeHtml(item)}</span>`).join("")}</div>` : ""}${human ? deliveryLine(event) : ""}</div></article>`;
+}
+
+function renderPendingSend(item) {
+  const failed = item.status === "failed";
+  const files = item.files.length ? `<div class="pending-file-names">${item.files.map((file) => escapeHtml(file.name)).join(" · ")}</div>` : "";
+  const status = failed
+    ? `<div class="delivery failed" role="status"><span class="delivery-dot failed"></span>Failed — ${escapeHtml(item.error || "message was not sent")}<button class="retry-send" type="button" data-retry-send="${item.id}">Retry</button></div>`
+    : `<div class="delivery" role="status"><span class="delivery-dot pending"></span>Sending…</div>`;
+  return `<article class="event from-human pending-send ${failed ? "failed" : ""}"><div class="avatar human">Y</div><div class="event-main"><div class="event-top"><span class="event-name">You</span><span class="provider">pending</span></div>${item.message ? `<div class="event-body markdown">${renderSafeMarkdown(item.message)}</div>` : ""}${files}${status}</div></article>`;
+}
+
+function renderTimeline(task, { taskChanged = false, wasNearBottom = false } = {}) {
+  const eventList = $("#event-list");
+  let marker = lastReadEventId(task.id);
+  const latest = latestReadableEventId(task);
+  if (marker === null && latest) {
+    marker = latest;
+    storageSet(readKey(task.id), String(latest));
+  }
+  const unread = unreadTimelineCount(task.events, marker);
+  const visible = task.events.filter((event) => eventMatchesTimelineFilter(event, timelineFilter));
+  const parts = [];
+  let separatorAdded = false;
+  for (const event of visible) {
+    if (!separatorAdded && unread && event.agent_id && Number(event.id) > (marker || 0)) {
+      parts.push(`<div id="unread-separator" class="unread-separator"><span>${unread} unread</span></div>`);
+      separatorAdded = true;
+    }
+    const rendered = renderEvent(event);
+    if (rendered) parts.push(rendered);
+  }
+  if (["all", "chat"].includes(timelineFilter)) {
+    parts.push(...pendingSends.filter((item) => item.taskId === task.id).map(renderPendingSend));
+  }
+  eventList.innerHTML = parts.join("") || `<p class="timeline-empty">No ${timelineFilter === "all" ? "timeline" : timelineFilter} items yet.</p>`;
+  for (const button of $("#timeline-filters").querySelectorAll("[data-timeline-filter]")) {
+    const active = button.dataset.timelineFilter === timelineFilter;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  }
+  const jump = $("#jump-latest");
+  jump.textContent = unread ? `${unread} unread · Jump to latest` : "Jump to latest";
+  jump.classList.toggle("hidden", !unread && (taskChanged || wasNearBottom));
+  requestAnimationFrame(() => {
+    if (pendingJumpEventId) {
+      const target = $(`#event-${pendingJumpEventId}`);
+      if (target) target.scrollIntoView({ block: "center" });
+      pendingJumpEventId = null;
+    } else if (taskChanged && unread) {
+      $("#unread-separator")?.scrollIntoView({ block: "start" });
+    } else if (taskChanged || wasNearBottom) {
+      eventList.scrollTo({ top: eventList.scrollHeight, behavior: taskChanged ? "auto" : "smooth" });
+      markTimelineRead(task);
+    }
+  });
 }
 
 function parseAttachmentMarkers(message) {
@@ -170,7 +298,6 @@ function renderMessageAttachment(attachment) {
 
 function renderTask(task) {
   const taskChanged = renderedTaskId !== task.id;
-  if (taskChanged) descriptionExpanded = false;
   $("#project-name").textContent = task.project_name;
   $("#task-status").textContent = `${task.status} · ${(task.session_policy || "manual").replace("_", " ")}`;
   $("#task-title").textContent = task.title;
@@ -178,12 +305,13 @@ function renderTask(task) {
   $("#task-version").textContent = `v${task.version}`;
   $("#copy-task-invite").textContent = task.session_policy === "manual" ? "Invite agent" : "Fresh-session invite";
   const eventList = $("#event-list");
-  const nearBottom = taskChanged || eventList.scrollHeight - eventList.scrollTop - eventList.clientHeight < 220;
+  const nearBottom = eventList.scrollHeight - eventList.scrollTop - eventList.clientHeight < 220;
   renderedTaskId = task.id;
   eventLookup = new Map(task.events.map((event) => [event.id, event]));
   if (replyTo && !eventLookup.has(replyTo.id)) { replyTo = null; }
   renderReplyContext();
-  eventList.innerHTML = task.events.map(renderEvent).join("");
+  renderTimeline(task, { taskChanged, wasNearBottom: nearBottom });
+  if (taskChanged) restoreMessageDraft(task.id);
   renderMembers(task);
   renderProposals(task);
   const openAssignments = task.assignments.filter((item) => ["queued", "claimed"].includes(item.status)).length;
@@ -239,7 +367,6 @@ function renderTask(task) {
   $("#consensus-copy").textContent = consensusCopy;
   const canAccept = openAssignments === 0 && ["review"].includes(task.status);
   $("#accept-task").classList.toggle("hidden", !canAccept);
-  if (nearBottom) requestAnimationFrame(() => eventList.scrollTo({ top: eventList.scrollHeight, behavior: "smooth" }));
 }
 
 function renderSessionCheckpoints(task) {
@@ -259,16 +386,16 @@ function renderSessionCheckpoints(task) {
 
 function renderTaskDescription(description) {
   const element = $("#task-description");
-  const button = $("#toggle-description");
+  const button = $("#open-task-brief");
   const text = String(description || "");
   const long = text.length > 220 || text.split("\n").length > 3;
-  if (element.textContent !== text) element.textContent = text;
+  const preview = long ? text.replace(/\s+/g, " ").trim() : text;
+  if (element.textContent !== preview) element.textContent = preview;
   element.classList.toggle("is-long", long);
-  element.classList.toggle("collapsed", long && !descriptionExpanded);
-  element.classList.toggle("expanded", long && descriptionExpanded);
+  element.classList.toggle("collapsed", long);
   button.classList.toggle("hidden", !long);
-  button.textContent = descriptionExpanded ? "Less" : "More";
-  button.setAttribute("aria-expanded", String(long && descriptionExpanded));
+  $("#task-brief-content").textContent = text;
+  $("#task-brief-title").textContent = state?.selectedTask?.title || "Task brief";
 }
 
 function resizeMessageField(field) {
@@ -525,7 +652,8 @@ async function uploadAttachment(file, taskId) {
 function populateMessageTargets(connected) {
   const select = $("#message-target");
   if (select) {
-    const previous = select.value || "all";
+    const savedTarget = selectedTaskId ? readDraft(selectedTaskId)?.target : null;
+    const previous = savedTarget || select.value || "all";
     const options = [`<option value="all">All agents${connected.length ? ` (${connected.length})` : ""}</option>`]
       .concat(connected.map((agent) => `<option value="${escapeHtml(agent.name)}">${escapeHtml(agent.name)} · ${escapeHtml(agent.provider)}</option>`));
     select.innerHTML = options.join("");
@@ -549,6 +677,24 @@ function populateProposalAgents(connected) {
 }
 
 document.addEventListener("click", async (event) => {
+  const retrySend = event.target.closest("[data-retry-send]");
+  if (retrySend) {
+    const pending = pendingSends.find((item) => item.id === retrySend.dataset.retrySend);
+    if (pending) await processPendingSend(pending);
+    return;
+  }
+  const searchResult = event.target.closest("[data-search-task]");
+  if (searchResult) {
+    const taskId = searchResult.dataset.searchTask || state.tasks.find((task) => task.project_id === searchResult.dataset.searchProject)?.id;
+    if (!taskId) { toast("That knowledge note is not attached to a task yet"); return; }
+    selectedTaskId = taskId;
+    selectedProjectId = searchResult.dataset.searchProject || null;
+    timelineFilter = "all";
+    pendingJumpEventId = Number(searchResult.dataset.searchEvent) || null;
+    $("#search-dialog").close();
+    await refresh();
+    return;
+  }
   const removeAttachment = event.target.closest("[data-remove-attachment]");
   if (removeAttachment) {
     const index = pendingAttachments.findIndex((item) => item.id === removeAttachment.dataset.removeAttachment);
@@ -568,6 +714,8 @@ document.addEventListener("click", async (event) => {
     if (!task || !confirm(`Delete the task history “${task.title}” from DevTeam?\n\nMessages, assignments, and approvals for this task will be deleted. Project files will not be touched.`)) return;
     try {
       await api(`/api/tasks/${task.id}`, { method: "DELETE", body: JSON.stringify({ confirmTaskId: task.id }) });
+      storageSet(draftKey(task.id), null);
+      storageSet(readKey(task.id), null);
       const currentTask = state.tasks.find((item) => item.id === selectedTaskId && item.id !== task.id);
       const nextTask = state.tasks.find((item) => item.project_id === task.project_id && item.id !== task.id);
       selectedTaskId = currentTask?.id || nextTask?.id || null;
@@ -821,7 +969,7 @@ $("#checkpoint-dialog").addEventListener("close", () => {
   $("#create-checkpoint").classList.remove("hidden");
 });
 
-$("#edit-task").addEventListener("click", () => {
+function openTaskEditor() {
   const task = state?.selectedTask;
   if (!task) return;
   const form = $("#task-edit-form");
@@ -831,6 +979,12 @@ $("#edit-task").addEventListener("click", () => {
   form.elements.requiredApprovals.value = String(task.required_approvals);
   form.elements.sessionPolicy.value = task.session_policy || "manual";
   $("#task-edit-dialog").showModal();
+}
+
+$("#edit-task").addEventListener("click", openTaskEditor);
+$("#edit-task-from-brief").addEventListener("click", () => {
+  $("#task-brief-dialog").close();
+  openTaskEditor();
 });
 
 $("#task-edit-form").addEventListener("submit", async (event) => {
@@ -857,31 +1011,64 @@ $("#project-edit-form").addEventListener("submit", async (event) => {
   } catch (error) { toast(error.message); }
 });
 
-$("#message-form").addEventListener("submit", async (event) => {
-  event.preventDefault(); if (!selectedTaskId) return;
-  if (messageSending) return;
-  const field = event.target.elements.message;
-  const target = event.target.elements.target?.value || "all";
-  const message = field.value.trim();
-  const taskId = selectedTaskId;
-  if (!message && pendingAttachments.length === 0) { toast("Write a message or attach a file"); return; }
-  const sendButton = event.target.querySelector(".send");
+async function processPendingSend(item) {
+  if (messageSending) { toast("Wait for the current message to finish sending"); return; }
+  const sendButton = $("#message-form .send");
   messageSending = true;
+  item.status = "sending";
+  item.error = "";
   sendButton.disabled = true;
+  if (state?.selectedTask?.id === item.taskId) renderTimeline(state.selectedTask, { wasNearBottom: true });
   try {
-    const uploaded = await Promise.all(pendingAttachments.map((item) => uploadAttachment(item.file, taskId)));
-    const markers = uploaded.map((attachment) => `[[devteam-attachment ${JSON.stringify(attachment)}]]`);
-    const body = { message: [message, ...markers].filter(Boolean).join("\n"), target };
-    if (replyTo) body.replyTo = replyTo.id;
-    await api(`/api/tasks/${taskId}/messages`, { method: "POST", body: JSON.stringify(body) });
-    field.value = "";
-    resizeMessageField(field);
-    clearPendingAttachments();
-    replyTo = null;
-    renderReplyContext();
-    await refresh();
-  } catch (error) { toast(error.message); }
-  finally { messageSending = false; sendButton.disabled = false; }
+    item.uploaded ||= await Promise.all(item.files.map((file) => uploadAttachment(file, item.taskId)));
+    const markers = item.uploaded.map((attachment) => `[[devteam-attachment ${JSON.stringify(attachment)}]]`);
+    const body = { message: [item.message, ...markers].filter(Boolean).join("\n"), target: item.target };
+    if (item.replyTo) body.replyTo = item.replyTo;
+    await api(`/api/tasks/${item.taskId}/messages`, { method: "POST", body: JSON.stringify(body) });
+    pendingSends = pendingSends.filter((pending) => pending.id !== item.id);
+    const stored = readDraft(item.taskId);
+    if (!stored || stored.message === item.message) clearMessageDraft(item.taskId);
+    try { await refresh(); }
+    catch (error) { toast(`Message sent, but the timeline refresh failed: ${error.message}`); }
+  } catch (error) {
+    item.status = "failed";
+    item.error = error.message;
+    if (!readDraft(item.taskId)) storageSet(draftKey(item.taskId), JSON.stringify({ message: item.message, target: item.target, savedAt: new Date().toISOString() }));
+    if (state?.selectedTask?.id === item.taskId) {
+      updateDraftStatus("Failed message kept for retry");
+      renderTimeline(state.selectedTask, { wasNearBottom: true });
+    }
+    toast(`Message failed: ${error.message}`);
+  } finally {
+    messageSending = false;
+    sendButton.disabled = false;
+  }
+}
+
+$("#message-form").addEventListener("submit", async (event) => {
+  event.preventDefault(); if (!selectedTaskId || messageSending) return;
+  const field = event.target.elements.message;
+  const message = field.value.trim();
+  if (!message && pendingAttachments.length === 0) { toast("Write a message or attach a file"); return; }
+  const item = {
+    id: crypto.randomUUID(),
+    taskId: selectedTaskId,
+    message,
+    target: event.target.elements.target?.value || "all",
+    replyTo: replyTo?.id || null,
+    files: pendingAttachments.map((attachment) => attachment.file),
+    uploaded: null,
+    status: "sending",
+    error: "",
+  };
+  pendingSends.push(item);
+  field.value = "";
+  resizeMessageField(field);
+  clearPendingAttachments();
+  updateDraftStatus("Sending…");
+  replyTo = null;
+  renderReplyContext();
+  await processPendingSend(item);
 });
 
 $("#message-form").addEventListener("keydown", (event) => {
@@ -891,7 +1078,11 @@ $("#message-form").addEventListener("keydown", (event) => {
   }
 });
 
-$("#message-form").elements.message.addEventListener("input", (event) => resizeMessageField(event.target));
+$("#message-form").elements.message.addEventListener("input", (event) => {
+  resizeMessageField(event.target);
+  saveMessageDraft();
+});
+$("#message-target").addEventListener("change", () => saveMessageDraft());
 
 $("#attachment-input").addEventListener("change", (event) => {
   addAttachments(event.target.files || []);
@@ -962,30 +1153,154 @@ $("#copy-task-invite").addEventListener("click", async () => {
   catch { toast(agentInvite()); }
 });
 
-$("#toggle-description").addEventListener("click", () => {
-  descriptionExpanded = !descriptionExpanded;
-  if (state?.selectedTask) renderTaskDescription(state.selectedTask.description);
-});
-
 $("#knowledge-filter")?.addEventListener("change", () => {
   if (state?.selectedTask) renderKnowledge(state.selectedTask);
 });
+
+$("#timeline-filters").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-timeline-filter]");
+  if (!button || !state?.selectedTask) return;
+  timelineFilter = button.dataset.timelineFilter;
+  renderTimeline(state.selectedTask, { wasNearBottom: false });
+});
+
+$("#jump-latest").addEventListener("click", () => {
+  if (!state?.selectedTask) return;
+  timelineFilter = "all";
+  renderTimeline(state.selectedTask, { wasNearBottom: true });
+});
+
+let timelineScrollFrame = 0;
+$("#event-list").addEventListener("scroll", () => {
+  cancelAnimationFrame(timelineScrollFrame);
+  timelineScrollFrame = requestAnimationFrame(() => {
+    const list = $("#event-list");
+    const nearBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 90;
+    if (nearBottom) markTimelineRead();
+    else $("#jump-latest").classList.remove("hidden");
+  });
+});
+
+function searchResultMarkup(result) {
+  const occurred = result.occurred_at ? relativeTime(result.occurred_at) : "";
+  return `<button class="search-result" type="button" data-search-task="${escapeHtml(result.task_id || "")}" data-search-project="${escapeHtml(result.project_id || "")}" data-search-event="${Number(result.event_id) || ""}"><span class="search-kind">${escapeHtml(result.kind)}</span><span class="search-copy"><strong>${escapeHtml(result.title)}</strong><span>${escapeHtml(result.snippet || "No preview")}</span><small>${escapeHtml(result.project_name)} · ${escapeHtml(result.subtype || result.kind)}</small></span><time>${escapeHtml(occurred)}</time></button>`;
+}
+
+async function performWorkspaceSearch() {
+  const input = $("#workspace-search");
+  const results = $("#search-results");
+  const query = input.value.trim();
+  const generation = ++searchGeneration;
+  if (query.length < 2) {
+    results.innerHTML = `<p class="search-empty">Type at least two characters to search the workspace.</p>`;
+    return;
+  }
+  results.innerHTML = `<p class="search-empty">Searching…</p>`;
+  const project = $("#search-current-project").checked ? selectedProjectId : null;
+  try {
+    const params = new URLSearchParams({ q: query, limit: "50" });
+    if (project) params.set("projectId", project);
+    const response = await api(`/api/search?${params}`);
+    if (generation !== searchGeneration) return;
+    results.innerHTML = response.results.length
+      ? response.results.map(searchResultMarkup).join("")
+      : `<p class="search-empty">No workspace results for “${escapeHtml(query)}”.</p>`;
+  } catch (error) {
+    if (generation === searchGeneration) results.innerHTML = `<p class="search-empty">Search failed: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+let searchTimer = 0;
+$("#workspace-search").addEventListener("input", () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(performWorkspaceSearch, 180);
+});
+$("#search-current-project").addEventListener("change", performWorkspaceSearch);
+$("#open-search").addEventListener("click", () => setTimeout(() => $("#workspace-search").focus(), 0));
+document.addEventListener("keydown", (event) => {
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+    event.preventDefault();
+    if (!$("#search-dialog").open) $("#search-dialog").showModal();
+    $("#workspace-search").focus();
+  }
+});
+
+function initPanelResizers() {
+  const shell = $(".app-shell");
+  const widths = {
+    sidebar: Math.max(190, Math.min(420, Number(storageGet("dt-sidebar-width")) || 260)),
+    team: Math.max(240, Math.min(520, Number(storageGet("dt-panel-width")) || 300)),
+  };
+  const applyWidth = (panel, width) => {
+    const minimum = panel === "sidebar" ? 190 : 240;
+    const hardMaximum = panel === "sidebar" ? 420 : 520;
+    const peerWidth = widths[panel === "sidebar" ? "team" : "sidebar"];
+    const layoutMaximum = window.innerWidth > 1050 ? Math.max(minimum, window.innerWidth - peerWidth - 460) : hardMaximum;
+    widths[panel] = Math.round(Math.max(minimum, Math.min(hardMaximum, layoutMaximum, width)));
+    shell.style.setProperty(panel === "sidebar" ? "--sidebar-open-w" : "--panel-open-w", `${widths[panel]}px`);
+    storageSet(panel === "sidebar" ? "dt-sidebar-width" : "dt-panel-width", String(widths[panel]));
+  };
+  applyWidth("sidebar", widths.sidebar);
+  applyWidth("team", widths.team);
+  window.addEventListener("resize", () => {
+    applyWidth("sidebar", widths.sidebar);
+    applyWidth("team", widths.team);
+  });
+  for (const handle of document.querySelectorAll("[data-resize-panel]")) {
+    const panel = handle.dataset.resizePanel;
+    handle.setAttribute("aria-valuemin", panel === "sidebar" ? "190" : "240");
+    handle.setAttribute("aria-valuemax", panel === "sidebar" ? "420" : "520");
+    const syncValue = () => handle.setAttribute("aria-valuenow", String(widths[panel]));
+    syncValue();
+    handle.addEventListener("pointerdown", (event) => {
+      if (window.innerWidth <= 1050) return;
+      event.preventDefault();
+      handle.setPointerCapture(event.pointerId);
+      document.body.classList.add("resizing-panel");
+    });
+    handle.addEventListener("pointermove", (event) => {
+      if (!handle.hasPointerCapture(event.pointerId)) return;
+      const raw = panel === "sidebar" ? event.clientX : window.innerWidth - event.clientX;
+      applyWidth(panel, Math.max(panel === "sidebar" ? 190 : 240, Math.min(panel === "sidebar" ? 420 : 520, raw)));
+      syncValue();
+    });
+    const stop = (event) => {
+      if (handle.hasPointerCapture(event.pointerId)) handle.releasePointerCapture(event.pointerId);
+      document.body.classList.remove("resizing-panel");
+    };
+    handle.addEventListener("pointerup", stop);
+    handle.addEventListener("pointercancel", stop);
+    handle.addEventListener("keydown", (event) => {
+      if (!["ArrowLeft", "ArrowRight"].includes(event.key)) return;
+      event.preventDefault();
+      const direction = event.key === "ArrowRight" ? 1 : -1;
+      const delta = panel === "sidebar" ? direction * 12 : direction * -12;
+      applyWidth(panel, Math.max(panel === "sidebar" ? 190 : 240, Math.min(panel === "sidebar" ? 420 : 520, widths[panel] + delta)));
+      syncValue();
+    });
+  }
+}
 
 function initPanelToggles() {
   const shell = $(".app-shell");
   const sidebarBtn = $("#toggle-sidebar");
   const teamBtn = $("#toggle-team");
   const narrow = window.innerWidth <= 1050;
-  if (localStorage.getItem("dt-sidebar") === "collapsed" || (narrow && !localStorage.getItem("dt-sidebar"))) shell.classList.add("sidebar-collapsed");
-  if (localStorage.getItem("dt-panel") === "collapsed" || (narrow && !localStorage.getItem("dt-panel"))) shell.classList.add("panel-collapsed");
-  if (narrow && !shell.classList.contains("sidebar-collapsed") && !shell.classList.contains("panel-collapsed")) shell.classList.add("panel-collapsed");
-  const sync = () => {
+  if (narrow) {
+    shell.classList.add("sidebar-collapsed", "panel-collapsed");
+  } else {
+    if (storageGet("dt-sidebar") === "collapsed") shell.classList.add("sidebar-collapsed");
+    if (storageGet("dt-panel") === "collapsed") shell.classList.add("panel-collapsed");
+  }
+  const sync = (persist = true) => {
     const sidebarOpen = !shell.classList.contains("sidebar-collapsed");
     const panelOpen = !shell.classList.contains("panel-collapsed");
     sidebarBtn.setAttribute("aria-expanded", String(sidebarOpen));
     teamBtn.setAttribute("aria-expanded", String(panelOpen));
-    localStorage.setItem("dt-sidebar", sidebarOpen ? "open" : "collapsed");
-    localStorage.setItem("dt-panel", panelOpen ? "open" : "collapsed");
+    if (persist) {
+      storageSet("dt-sidebar", sidebarOpen ? "open" : "collapsed");
+      storageSet("dt-panel", panelOpen ? "open" : "collapsed");
+    }
   };
   const togglePanel = (panel) => {
     const className = panel === "sidebar" ? "sidebar-collapsed" : "panel-collapsed";
@@ -1009,11 +1324,12 @@ function initPanelToggles() {
     shell.classList.add("sidebar-collapsed", "panel-collapsed");
     sync();
   });
-  sync();
+  sync(false);
 }
 
 async function boot() {
   initPanelToggles();
+  initPanelResizers();
   try {
     config = await api("/api/config"); $("#server-address").textContent = new URL(config.mcpUrl).host;
     await refresh();

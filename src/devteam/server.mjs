@@ -183,6 +183,15 @@ export async function startDevTeamServer({
     const taskId = Object.hasOwn(req.query, "taskId") ? req.query.taskId || null : undefined;
     res.json(store.snapshot(taskId));
   });
+  app.get("/api/search", (req, res) => {
+    res.json({
+      query: String(req.query.q || "").trim().slice(0, 120),
+      results: store.workspaceSearch(req.query.q, {
+        projectId: typeof req.query.projectId === "string" && req.query.projectId ? req.query.projectId : null,
+        limit: Number(req.query.limit) || 40,
+      }),
+    });
+  });
   app.get("/api/tasks/:taskId", (req, res) => {
     const detail = store.taskDetail(req.params.taskId);
     if (!detail) return res.status(404).json({ error: "Task not found." });
