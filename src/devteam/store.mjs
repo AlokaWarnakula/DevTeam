@@ -5,6 +5,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { CodeGraph } from "./codegraph.mjs";
 import { KnowledgeVault } from "./knowledge.mjs";
+import { buildBudgetedBrief, clipUtf8, DEFAULT_BRIEF_BUDGET } from "./brief.mjs";
 
 const now = () => new Date().toISOString();
 const json = (value) => JSON.stringify(value ?? null);
@@ -29,6 +30,7 @@ export class DevTeamStore extends EventEmitter {
     this.knowledgeErrors = new Map();
     this.codegraph = new CodeGraph(this.db, codegraph);
     this.codegraphErrors = new Map();
+    this.briefHealth = new Map();
     this.token = this.#getOrCreateToken();
     // Presence and ownership are different questions. A *busy* agent that goes quiet is
     // presumed to still be working — reasoning and editing make no MCP calls — so it keeps
@@ -1006,6 +1008,7 @@ export class DevTeamStore extends EventEmitter {
     `).get(projectId).count);
     if (connectedAgents) throw new Error("Disconnect agents working on this project before deleting it.");
     const taskCount = Number(this.db.prepare("SELECT COUNT(*) AS count FROM tasks WHERE project_id = ?").get(projectId).count);
+    const deletedTaskIds = this.db.prepare("SELECT id FROM tasks WHERE project_id = ?").all(projectId).map((row) => row.id);
     this.#transaction(() => {
       this.db.prepare(`
         UPDATE agents SET current_task_id = NULL
@@ -1013,6 +1016,7 @@ export class DevTeamStore extends EventEmitter {
       `).run(projectId);
       this.db.prepare("DELETE FROM projects WHERE id = ?").run(projectId);
     });
+    for (const deletedTaskId of deletedTaskIds) this.briefHealth.delete(deletedTaskId);
     this.#changed("project.deleted");
     return { deleted: true, projectId, projectName: project.name, taskCount, filesDeleted: false };
   }
@@ -1031,6 +1035,13 @@ export class DevTeamStore extends EventEmitter {
       this.db.prepare("UPDATE agents SET current_task_id = NULL WHERE current_task_id = ?").run(taskId);
       this.db.prepare("DELETE FROM tasks WHERE id = ?").run(taskId);
     });
+    this.briefHealth.delete(taskId);
+    try {
+      this.knowledge.exportProject(task.project_id);
+      this.knowledgeErrors.delete(`project:${task.project_id}`);
+    } catch (error) {
+      this.knowledgeErrors.set(`project:${task.project_id}`, { message: error.message, at: now() });
+    }
     this.#changed("task.deleted", taskId);
     return { deleted: true, taskId, title: task.title, filesDeleted: false };
   }
@@ -2207,6 +2218,10 @@ export class DevTeamStore extends EventEmitter {
     const projectBlackboard = this.db.prepare("SELECT key, value, version, updated_by_name, updated_at FROM project_blackboard WHERE project_id = ? ORDER BY key ASC")
       .all(task.project_id).map((row) => ({ scope: "project", key: row.key, value: row.value, version: row.version, updatedBy: row.updated_by_name, updatedAt: row.updated_at }));
     const knowledge = this.knowledge.list(task.project_id, { limit: 30 });
+    const knowledgeLifecycle = Object.fromEntries(["verified", "inferred", "disputed", "stale", "archived"].map((status) => [status, 0]));
+    for (const row of this.db.prepare(`
+      SELECT status, COUNT(*) AS count FROM knowledge_notes WHERE project_id = ? GROUP BY status
+    `).all(task.project_id)) knowledgeLifecycle[row.status] = Number(row.count);
     const codeGraphState = this.codegraph.projectState(task.project_id);
     return {
       ...task, assignments, approvals, events, proposals, blackboard, projectBlackboard, knowledge, members,
@@ -2225,13 +2240,39 @@ export class DevTeamStore extends EventEmitter {
         indexedAt: codeGraphState?.indexedAt || null,
         error: this.codegraphErrors.get(`project:${task.project_id}`) || null,
       },
+      memoryHealth: {
+        brief: this.briefHealth.get(taskId) || {
+          version: 1,
+          bytes: null,
+          limitBytes: DEFAULT_BRIEF_BUDGET.totalBytes,
+          truncated: null,
+          included: {},
+          omitted: {},
+          clipped: {},
+          generatedAt: null,
+        },
+        taskMemoryCount: blackboard.length,
+        projectMemoryCount: projectBlackboard.length,
+        knowledge: knowledgeLifecycle,
+        knowledgeError: this.knowledgeErrors.get(taskId) || this.knowledgeErrors.get(`project:${task.project_id}`) || null,
+        graphIndexedAt: codeGraphState?.indexedAt || null,
+        graphTruncated: Boolean(codeGraphState?.truncated),
+        graphError: this.codegraphErrors.get(`project:${task.project_id}`) || null,
+      },
     };
   }
 
-  taskBrief(agentId, taskId) {
+  taskBrief(agentId, taskId, {
+    currentAssignment: assignmentOverride = null,
+    assignmentKey = "currentAssignment",
+    responseCore = {},
+    pendingMessages = [],
+    pendingProposals = [],
+  } = {}) {
     this.getAgent(agentId);
     this.assertMembership(agentId, taskId);
     const task = this.getTask(taskId);
+    if (!task) throw new Error("Task not found.");
     const errorKey = task ? `project:${task.project_id}` : null;
     try {
       this.codegraph.reconcileTask(taskId);
@@ -2240,71 +2281,270 @@ export class DevTeamStore extends EventEmitter {
       if (errorKey) this.codegraphErrors.set(errorKey, { message: error.message, at: now() });
       this.emit("codegraph-error", { taskId, type: "codegraph.brief", error });
     }
-    const detail = this.taskDetail(taskId);
-    if (!detail) throw new Error("Task not found.");
-    const clip = (value, max) => {
-      const text = String(value || "");
-      return text.length > max ? `${text.slice(0, max)}…` : text;
+    const clipped = {};
+    const clip = (value, maxBytes, key) => {
+      const result = clipUtf8(value, maxBytes);
+      if (result.truncated) clipped[key] = (clipped[key] || 0) + 1;
+      return result.value;
     };
-    const summarizeNote = (note) => ({
-      scope: note.scope,
-      key: note.key,
-      value: clip(note.value, 2_000),
-      version: note.version,
-      updatedBy: note.updatedBy,
-      updatedAt: note.updatedAt,
+    const boundedPendingMessages = (Array.isArray(pendingMessages) ? pendingMessages : []).slice(0, 50).map((message) => ({
+      id: message.id,
+      taskId: message.taskId,
+      message: clip(message.message, 1_200, "pendingMessageBodies"),
+      from: clip(message.from, 200, "pendingMessageAuthors"),
+      target: clip(message.target, 200, "pendingMessageTargets"),
+      broadcast: Boolean(message.broadcast),
+      at: message.at,
+    }));
+    const boundedPendingProposals = (Array.isArray(pendingProposals) ? pendingProposals : []).slice(0, 20).map((proposal) => ({
+      id: proposal.id,
+      taskId: proposal.taskId,
+      kind: proposal.kind,
+      summary: clip(proposal.summary, 800, "pendingProposalSummaries"),
+      proposer: proposal.proposer ? clip(proposal.proposer, 200, "pendingProposalAuthors") : null,
+      details: proposal.details,
+    }));
+    const assignmentRows = this.db.prepare(`
+      SELECT a.id, a.task_id, substr(a.title, 1, 1200) AS title,
+             substr(a.description, 1, 2400) AS description, a.role, a.requires_write,
+             a.target_agent_name, a.agent_id, a.status, a.created_at, a.claimed_at,
+             a.claim_generation, ag.name AS agent_name
+      FROM assignments a LEFT JOIN agents ag ON ag.id = a.agent_id
+      WHERE a.task_id = ? AND a.status IN ('queued', 'claimed')
+      ORDER BY a.created_at ASC LIMIT 80
+    `).all(taskId);
+    const assignmentTotal = Number(this.db.prepare(`
+      SELECT COUNT(*) AS count FROM assignments WHERE task_id = ? AND status IN ('queued', 'claimed')
+    `).get(taskId).count);
+    const dependencySummary = (assignmentId, maxItems = 12) => {
+      const dependencies = this.#dependenciesFor(assignmentId);
+      return {
+        dependsOn: dependencies.slice(0, maxItems).map((item) => item.id),
+        blockedBy: dependencies.filter((item) => item.status !== "done").slice(0, maxItems).map((item) => ({
+          id: item.id,
+          title: clip(item.title, 240, "assignmentDependencyTitles"),
+          status: item.status,
+          role: item.role,
+        })),
+        omitted: Math.max(0, dependencies.length - maxItems),
+      };
+    };
+    const openAssignments = assignmentRows.map((assignment) => {
+      const dependencies = dependencySummary(assignment.id, 8);
+      return {
+        id: assignment.id,
+        title: clip(assignment.title, 360, "assignmentTitles"),
+        description: clip(assignment.description, 900, "assignmentDescriptions"),
+        role: clip(assignment.role, 100, "assignmentRoles"),
+        status: assignment.status,
+        agent: assignment.agent_name ? clip(assignment.agent_name, 200, "assignmentAgentNames") : null,
+        dependsOn: dependencies.dependsOn,
+        blockedBy: dependencies.blockedBy,
+      };
     });
-    const relevantTypes = new Set(["human.message", "agent.decision", "agent.finding", "task.blocked", "task.unblocked", "task.accepted"]);
-    const recent = detail.events.filter((event) => relevantTypes.has(event.type)).slice(-12).map((event) => ({
+    let currentSource = assignmentOverride;
+    if (!currentSource) {
+      currentSource = this.db.prepare(`
+        SELECT a.*, ag.name AS agent_name FROM assignments a
+        LEFT JOIN agents ag ON ag.id = a.agent_id
+        WHERE a.task_id = ? AND a.agent_id = ? AND a.status = 'claimed' LIMIT 1
+      `).get(taskId, agentId) || null;
+    }
+    const mandatoryOmitted = {};
+    let currentAssignment = null;
+    if (currentSource) {
+      const dependencies = dependencySummary(currentSource.id, 20);
+      const checklist = (Array.isArray(currentSource.checklist) ? currentSource.checklist : this.#checklistFor(currentSource.id));
+      const writeScope = currentSource.requires_write
+        ? (Array.isArray(currentSource.writeScope) ? currentSource.writeScope : this.#writeScopeFor(currentSource.id))
+        : [];
+      mandatoryOmitted.currentAssignmentChecklist = Math.max(0, checklist.length - 12);
+      mandatoryOmitted.currentAssignmentWriteScope = Math.max(0, writeScope.length - 12);
+      mandatoryOmitted.currentAssignmentDependencies = dependencies.omitted;
+      currentAssignment = {
+        id: currentSource.id,
+        task_id: currentSource.task_id,
+        taskId: currentSource.task_id,
+        title: clip(currentSource.title, 500, "currentAssignmentTitle"),
+        description: clip(currentSource.description, 1_600, "currentAssignmentDescription"),
+        role: clip(currentSource.role, 100, "currentAssignmentRole"),
+        status: currentSource.status,
+        requires_write: Number(Boolean(currentSource.requires_write)),
+        requiresWrite: Boolean(currentSource.requires_write),
+        target_agent_name: currentSource.target_agent_name || null,
+        agent_id: currentSource.agent_id || null,
+        agent: currentSource.agent_name ? clip(currentSource.agent_name, 200, "currentAssignmentAgent") : null,
+        claimed_at: currentSource.claimed_at || null,
+        checklist: checklist.slice(0, 12).map((item) => clip(item, 180, "currentAssignmentChecklistItems")),
+        writeScope: writeScope.slice(0, 12).map((item) => clip(item, 300, "currentAssignmentWriteScopeItems")),
+        dependsOn: dependencies.dependsOn,
+        blockedBy: dependencies.blockedBy,
+        task_title: clip(currentSource.task_title || task.title, 600, "currentAssignmentTaskTitle"),
+        task_description: clip(currentSource.task_description || task.description, 2_003, "currentAssignmentTaskDescription"),
+        task_version: Number(currentSource.task_version ?? task.version),
+        required_approvals: Number(currentSource.required_approvals ?? task.required_approvals),
+        project_root: clip(currentSource.project_root || task.project_root, 2_000, "currentAssignmentProjectRoot"),
+        project_name: clip(currentSource.project_name || task.project_name, 400, "currentAssignmentProjectName"),
+        claimGeneration: Number(currentSource.claimGeneration ?? currentSource.claim_generation ?? 0),
+        ...(currentSource.claimToken ? { claimToken: currentSource.claimToken } : {}),
+      };
+    }
+    const taskMemoryTotal = Number(this.db.prepare("SELECT COUNT(*) AS count FROM blackboard WHERE task_id = ?").get(taskId).count);
+    const taskMemory = this.db.prepare(`
+      SELECT key, substr(value, 1, 4096) AS value, version, updated_by_name, updated_at
+      FROM blackboard WHERE task_id = ? ORDER BY key ASC LIMIT 80
+    `).all(taskId).map((note) => ({
+      scope: "task",
+      key: clip(note.key, 300, "taskMemoryKeys"),
+      value: clip(note.value, 2_003, "taskMemoryValues"),
+      version: note.version,
+      updatedBy: note.updated_by_name ? clip(note.updated_by_name, 200, "taskMemoryAuthors") : null,
+      updatedAt: note.updated_at,
+    }));
+    const projectMemoryTotal = Number(this.db.prepare("SELECT COUNT(*) AS count FROM project_blackboard WHERE project_id = ?").get(task.project_id).count);
+    const projectMemory = this.db.prepare(`
+      SELECT key, substr(value, 1, 4096) AS value, version, updated_by_name, updated_at
+      FROM project_blackboard WHERE project_id = ? ORDER BY key ASC LIMIT 80
+    `).all(task.project_id).map((note) => ({
+      scope: "project",
+      key: clip(note.key, 300, "projectMemoryKeys"),
+      value: clip(note.value, 2_003, "projectMemoryValues"),
+      version: note.version,
+      updatedBy: note.updated_by_name ? clip(note.updated_by_name, 200, "projectMemoryAuthors") : null,
+      updatedAt: note.updated_at,
+    }));
+    const knowledgeTotal = Number(this.db.prepare(`
+      SELECT COUNT(*) AS count FROM knowledge_notes
+      WHERE project_id = ? AND status IN ('verified', 'inferred')
+    `).get(task.project_id)?.count || 0);
+    const openProposalTotal = Number(this.db.prepare("SELECT COUNT(*) AS count FROM proposals WHERE task_id = ? AND status = 'open'").get(taskId).count);
+    const pendingProposalIds = new Set(boundedPendingProposals.filter((proposal) => proposal.taskId === taskId).map((proposal) => proposal.id));
+    const openProposals = this.db.prepare(`
+      SELECT id, kind, substr(summary, 1, 1600) AS summary FROM proposals
+      WHERE task_id = ? AND status = 'open' ORDER BY created_at ASC LIMIT 30
+    `).all(taskId).filter((proposal) => !pendingProposalIds.has(proposal.id)).map((proposal) => ({
+      id: proposal.id,
+      kind: proposal.kind,
+      summary: clip(proposal.summary, 800, "proposalSummaries"),
+      votes: this.db.prepare(`
+        SELECT voter_name, vote, substr(comment, 1, 600) AS comment, created_at
+        FROM proposal_votes WHERE proposal_id = ? ORDER BY created_at ASC LIMIT 20
+      `).all(proposal.id).map((vote) => ({ ...vote, comment: vote.comment ? clip(vote.comment, 300, "proposalVoteComments") : null })),
+    }));
+    const recentTypes = ["human.message", "agent.decision", "agent.finding", "task.blocked", "task.unblocked", "task.accepted"];
+    const typePlaceholders = recentTypes.map(() => "?").join(", ");
+    const recentTotal = Number(this.db.prepare(`SELECT COUNT(*) AS count FROM events WHERE task_id = ? AND type IN (${typePlaceholders})`).get(taskId, ...recentTypes).count);
+    const recent = this.db.prepare(`
+      SELECT recent.*, ag.name AS agent_name FROM (
+        SELECT id, agent_id, type, substr(message, 1, 1600) AS message, created_at
+        FROM events WHERE task_id = ? AND type IN (${typePlaceholders})
+        ORDER BY id DESC LIMIT 12
+      ) recent LEFT JOIN agents ag ON ag.id = recent.agent_id ORDER BY recent.id ASC
+    `).all(taskId, ...recentTypes).map((event) => ({
       id: event.id,
       type: event.type,
-      from: event.agent_name || "human",
-      message: clip(event.message, 800),
+      from: event.agent_name ? clip(event.agent_name, 200, "activityAuthors") : "human",
+      message: clip(event.message, 800, "activityMessages"),
       at: event.created_at,
     }));
-    const repliedTo = new Set(detail.events.map((event) => Number(event.metadata?.replyTo || 0)).filter(Boolean));
-    const unresolvedQuestions = detail.events
-      .filter((event) => event.type === "agent.question" && !repliedTo.has(event.id))
-      .slice(-10)
-      .map((event) => ({ id: event.id, from: event.agent_name || "agent", message: clip(event.message, 800), at: event.created_at }));
-    const openAssignments = detail.assignments
-      .filter((assignment) => ["queued", "claimed"].includes(assignment.status))
-      .map((assignment) => ({
-        id: assignment.id,
-        title: assignment.title,
-        description: clip(assignment.description, 600),
-        role: assignment.role,
-        status: assignment.status,
-        agent: assignment.agent_name || null,
-        dependsOn: assignment.dependsOn,
-        blockedBy: assignment.blockedBy,
-      }));
-    const currentAssignment = openAssignments.find((assignment) => detail.assignments.find((item) => item.id === assignment.id)?.agent_id === agentId) || null;
+    const unresolvedWhere = `
+      q.task_id = ? AND q.type = 'agent.question' AND NOT EXISTS (
+        SELECT 1 FROM events reply
+        WHERE reply.task_id = q.task_id AND CAST(json_extract(reply.metadata, '$.replyTo') AS INTEGER) = q.id
+      )
+    `;
+    const unresolvedTotal = Number(this.db.prepare(`SELECT COUNT(*) AS count FROM events q WHERE ${unresolvedWhere}`).get(taskId).count);
+    const unresolvedQuestions = this.db.prepare(`
+      SELECT recent.*, ag.name AS agent_name FROM (
+        SELECT q.id, q.agent_id, substr(q.message, 1, 1600) AS message, q.created_at
+        FROM events q WHERE ${unresolvedWhere} ORDER BY q.id DESC LIMIT 10
+      ) recent LEFT JOIN agents ag ON ag.id = recent.agent_id ORDER BY recent.id ASC
+    `).all(taskId).map((event) => ({
+      id: event.id,
+      from: event.agent_name ? clip(event.agent_name, 200, "questionAuthors") : "agent",
+      message: clip(event.message, 800, "questionMessages"),
+      at: event.created_at,
+    }));
     let codeContext = this.codegraph.enabled ? [] : null;
-    try { codeContext = this.codegraph.codeContext(taskId, { assignmentId: currentAssignment?.id || null }); }
+    try { codeContext = this.codegraph.codeContext(taskId, { assignmentId: currentAssignment?.id || null, maxBytes: DEFAULT_BRIEF_BUDGET.codeContextBytes }); }
     catch (error) {
       if (errorKey) this.codegraphErrors.set(errorKey, { message: error.message, at: now() });
       this.emit("codegraph-error", { taskId, type: "codegraph.context", error });
     }
-    return {
-      task: {
-        id: detail.id,
-        title: detail.title,
-        description: clip(detail.description, 2_000),
-        status: detail.status,
-        version: detail.version,
-        project: { id: detail.project_id, name: detail.project_name, root: detail.project_root },
+    const recentChangedFiles = this.db.prepare(`
+      SELECT metadata FROM events WHERE task_id = ?
+        AND type IN ('assignment.completed', 'assignment.blocked') ORDER BY id DESC LIMIT 30
+    `).all(taskId).flatMap((event) => {
+      const metadata = fromJson(event.metadata, {});
+      return Array.isArray(metadata.changedFiles) ? metadata.changedFiles : [];
+    });
+    const codePaths = (codeContext || []).flatMap((module) => [module.path, ...(module.imports || []), ...(module.importedBy || [])]);
+    const projectKnowledge = this.knowledge.relevant(task.project_id, taskId, 30, {
+      taskTitle: task.title,
+      taskDescription: task.description,
+      taskVersion: task.version,
+      taskUpdatedAt: task.updated_at,
+      assignmentTitle: currentAssignment?.title,
+      assignmentDescription: currentAssignment?.description,
+      role: currentAssignment?.role,
+      checklist: currentAssignment?.checklist || [],
+      declaredPaths: [...(currentAssignment?.writeScope || []), ...recentChangedFiles],
+      codePaths,
+      memoryKeys: [...taskMemory.map((note) => note.key), ...projectMemory.map((note) => note.key)],
+      unresolvedQuestions: unresolvedQuestions.map((question) => question.message),
+      blockers: (currentAssignment?.blockedBy || []).map((blocker) => blocker.title),
+    }).map((note) => ({
+      ...note,
+      title: clip(note.title, 360, "knowledgeTitles"),
+      body: clip(note.body, 1_400, "knowledgeBodies"),
+      relatedFiles: (note.relatedFiles || []).slice(0, 20).map((file) => clip(file, 400, "knowledgePaths")),
+    }));
+    const brief = buildBudgetedBrief({
+      core: {
+        ...responseCore,
+        task: {
+          id: task.id,
+          title: clip(task.title, 600, "taskTitle"),
+          description: clip(task.description, 2_003, "taskDescription"),
+          status: task.status,
+          version: task.version,
+          project: {
+            id: task.project_id,
+            name: clip(task.project_name, 400, "projectName"),
+            root: clip(task.project_root, 2_000, "projectRoot"),
+          },
+        },
+        [assignmentKey]: currentAssignment,
+        claimInstructions: "Retain the claim token privately, inspect the current project state before writing, stay inside the declared write scope, and pass the token to devteam_report so stale work is fenced.",
       },
-      currentAssignment,
-      openAssignments,
-      taskMemory: detail.blackboard.map(summarizeNote),
-      projectMemory: detail.projectBlackboard.map(summarizeNote),
-      projectKnowledge: this.knowledge.relevant(detail.project_id, taskId, 12),
-      codeContext,
-      openProposals: detail.proposals.filter((proposal) => proposal.status === "open").map((proposal) => ({ id: proposal.id, kind: proposal.kind, summary: clip(proposal.summary, 800), votes: proposal.votes })),
-      recent,
-      unresolvedQuestions,
+      clipped,
+      omitted: mandatoryOmitted,
+      sections: [
+        { key: "openAssignments", group: "assignments", items: openAssignments, totalCount: assignmentTotal, maxItems: 30, maxBytes: DEFAULT_BRIEF_BUDGET.assignmentBytes },
+        { key: "taskMemory", group: "taskMemory", items: taskMemory, totalCount: taskMemoryTotal, maxItems: 20, maxBytes: DEFAULT_BRIEF_BUDGET.taskMemoryBytes },
+        { key: "projectMemory", group: "projectMemory", items: projectMemory, totalCount: projectMemoryTotal, maxItems: 16, maxBytes: DEFAULT_BRIEF_BUDGET.projectMemoryBytes },
+        { key: "projectKnowledge", group: "knowledge", items: projectKnowledge, totalCount: knowledgeTotal, maxItems: 12, maxBytes: DEFAULT_BRIEF_BUDGET.knowledgeBytes },
+        { key: "codeContext", group: "codeContext", items: codeContext || [], emptyValue: this.codegraph.enabled ? [] : null, totalCount: codeContext?.length || 0, maxItems: 30, maxBytes: DEFAULT_BRIEF_BUDGET.codeContextBytes },
+        { key: "pendingMessages", group: "activity", items: boundedPendingMessages, totalCount: Array.isArray(pendingMessages) ? pendingMessages.length : 0, maxItems: 20, maxBytes: DEFAULT_BRIEF_BUDGET.activityBytes },
+        { key: "pendingProposals", group: "activity", items: boundedPendingProposals, totalCount: Array.isArray(pendingProposals) ? pendingProposals.length : 0, maxItems: 10, maxBytes: DEFAULT_BRIEF_BUDGET.activityBytes },
+        { key: "openProposals", group: "activity", items: openProposals, totalCount: Math.max(0, openProposalTotal - pendingProposalIds.size), maxItems: 10, maxBytes: DEFAULT_BRIEF_BUDGET.activityBytes },
+        { key: "recent", group: "activity", items: recent, totalCount: recentTotal, maxItems: 12, maxBytes: DEFAULT_BRIEF_BUDGET.activityBytes },
+        { key: "unresolvedQuestions", group: "activity", items: unresolvedQuestions, totalCount: unresolvedTotal, maxItems: 10, maxBytes: DEFAULT_BRIEF_BUDGET.activityBytes },
+      ],
+    });
+    const health = {
+      ...brief.briefMeta,
+      generatedAt: now(),
+      assignmentId: currentAssignment?.id || null,
+      delivery: assignmentKey === "assignment" ? "automatic" : "requested",
     };
+    const previous = this.briefHealth.get(taskId);
+    this.briefHealth.set(taskId, health);
+    if (!previous || previous.bytes !== health.bytes || previous.truncated !== health.truncated
+      || JSON.stringify(previous.omitted) !== JSON.stringify(health.omitted)) {
+      this.emit("change", { type: "brief.health", taskId, at: health.generatedAt });
+    }
+    return brief;
   }
 
   snapshot(taskId = undefined) {

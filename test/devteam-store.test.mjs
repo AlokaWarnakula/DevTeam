@@ -61,6 +61,71 @@ test("automatic knowledge vault exports safe Obsidian notes and feeds task brief
   assert.match(search.notes[0].title, /serialized knowledge exporter/i);
 });
 
+test("file-linked knowledge becomes stale or superseded without affecting unrelated notes", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-lifecycle-data-"));
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "devteam-lifecycle-project-"));
+  await mkdir(path.join(projectRoot, "src"), { recursive: true });
+  await writeFile(path.join(projectRoot, "src", "shared.js"), "export const shared = 1;\n", "utf8");
+  await writeFile(path.join(projectRoot, "src", "unrelated.js"), "export const unrelated = 1;\n", "utf8");
+  const store = new DevTeamStore(dataDir, { knowledge: { enabled: true }, codegraph: { enabled: false } });
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); await rm(projectRoot, { recursive: true, force: true }); });
+  const lifecycleColumns = new Set(store.db.prepare("PRAGMA table_info(knowledge_notes)").all().map((column) => column.name));
+  for (const column of ["superseded_by", "stale_reason", "status_changed_at", "last_validated_at", "last_validated_version"]) {
+    assert.equal(lifecycleColumns.has(column), true, `knowledge migration adds ${column}`);
+  }
+  const project = store.ensureProject("Lifecycle", projectRoot);
+  const task = store.createTask({ projectId: project.id, title: "Refresh implementation facts", description: "Change the same file twice." });
+  const agent = store.connectAgent({ name: "Writer", provider: "test" });
+  const planner = store.claimNextAssignment(agent.id);
+  const firstWork = store.createAssignment({ agentId: agent.id, taskId: task.id, title: "First shared implementation", description: "Implement shared.", role: "implementer", requiresWrite: true, paths: ["src/shared.js"] });
+  store.completeAssignment({ agentId: agent.id, assignmentId: planner.id, claimToken: planner.claimToken, message: "Planned." });
+  const firstClaim = store.claimNextAssignment(agent.id);
+  assert.equal(firstClaim.id, firstWork.id);
+  store.completeAssignment({ agentId: agent.id, assignmentId: firstClaim.id, claimToken: firstClaim.claimToken, message: "First shared behavior.", changedFiles: ["src/shared.js"] });
+
+  const secondWork = store.createAssignment({ agentId: agent.id, taskId: task.id, title: "Replace shared implementation", description: "Replace shared.", role: "implementer", requiresWrite: true, paths: ["src/shared.js"] });
+  const secondClaim = store.claimNextAssignment(agent.id);
+  assert.equal(secondClaim.id, secondWork.id);
+  store.completeAssignment({ agentId: agent.id, assignmentId: secondClaim.id, claimToken: secondClaim.claimToken, message: "Current shared behavior.", changedFiles: ["src/shared.js"] });
+
+  const thirdWork = store.createAssignment({ agentId: agent.id, taskId: task.id, title: "Unrelated implementation", description: "Change an unrelated module.", role: "implementer", requiresWrite: true, paths: ["src/unrelated.js"] });
+  const thirdClaim = store.claimNextAssignment(agent.id);
+  assert.equal(thirdClaim.id, thirdWork.id);
+  store.completeAssignment({ agentId: agent.id, assignmentId: thirdClaim.id, claimToken: thirdClaim.claimToken, message: "Unrelated behavior.", changedFiles: ["src/unrelated.js"] });
+
+  const escapedWork = store.createAssignment({ agentId: agent.id, taskId: task.id, title: "Escaped report", description: "A malformed changed path must not invalidate knowledge.", role: "implementer", requiresWrite: true, paths: ["src"] });
+  const escapedClaim = store.claimNextAssignment(agent.id);
+  assert.equal(escapedClaim.id, escapedWork.id);
+  store.completeAssignment({ agentId: agent.id, assignmentId: escapedClaim.id, claimToken: escapedClaim.claimToken, message: "Malformed report.", changedFiles: ["../outside.js"] });
+
+  const componentNotes = store.db.prepare(`
+    SELECT * FROM knowledge_notes WHERE project_id = ? AND category = 'components' ORDER BY source_event_id ASC
+  `).all(project.id);
+  assert.equal(componentNotes.length, 3);
+  assert.equal(componentNotes[0].status, "stale");
+  assert.equal(componentNotes[0].superseded_by, componentNotes[1].id);
+  assert.match(componentNotes[0].stale_reason, /src\/shared\.js/);
+  assert.equal(componentNotes[1].status, "verified", "an unrelated change does not stale current shared knowledge");
+  assert.equal(componentNotes[2].status, "verified");
+  const lifecycleEvent = store.taskDetail(task.id).events.find((event) => event.type === "knowledge.superseded");
+  assert.equal(lifecycleEvent.metadata.supersededBy, componentNotes[1].id);
+
+  const brief = store.taskBrief(agent.id, task.id);
+  assert.equal(brief.projectKnowledge.some((note) => note.id === componentNotes[0].id), false);
+  const staleSearch = store.knowledgeSearch({ agentId: agent.id, taskId: task.id, status: "stale" });
+  assert.equal(staleSearch.notes.some((note) => note.id === componentNotes[0].id), true);
+  const staleExport = await readFile(path.join(projectRoot, "knowledge", "components", `${componentNotes[0].slug}.md`), "utf8");
+  assert.match(staleExport, /status: stale/);
+  assert.match(staleExport, new RegExp(`superseded_by: "${componentNotes[1].id}"`));
+
+  const sessions = path.join(projectRoot, "knowledge", "sessions");
+  const generatedSession = (await readdir(sessions)).find((name) => name.endsWith(`${task.id.slice(0, 8)}.md`));
+  await writeFile(path.join(sessions, "human-note.md"), "# Keep this human note\n", "utf8");
+  store.deleteTask(task.id, task.id);
+  assert.equal((await readdir(sessions)).includes(generatedSession), false, "deleted task session view is reconciled");
+  assert.equal(await readFile(path.join(sessions, "human-note.md"), "utf8"), "# Keep this human note\n");
+});
+
 test("DevTeam coordinates plan, write lease, review, versioning, and consensus", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-store-"));
   const store = new DevTeamStore(dataDir);

@@ -260,8 +260,37 @@ function renderMembers(task) {
 function renderBlackboard(task) {
   renderMemoryScope("blackboard", task.blackboard || []);
   renderMemoryScope("project-blackboard", task.projectBlackboard || []);
+  renderMemoryHealth(task);
   renderCodeGraph(task);
   renderKnowledge(task);
+}
+
+function renderMemoryHealth(task) {
+  const target = $("#memory-health-summary");
+  if (!target) return;
+  const health = task.memoryHealth || {};
+  const brief = health.brief || {};
+  const limit = Number(brief.limitBytes || 32 * 1024);
+  const bytes = brief.bytes == null ? null : Number(brief.bytes);
+  const percentage = bytes == null || !limit ? 0 : Math.min(100, Math.round((bytes / limit) * 100));
+  const formatBytes = (value) => value == null ? "Not generated yet" : `${(Number(value) / 1024).toFixed(1)} KiB`;
+  $("#brief-budget-status").textContent = bytes == null ? `${Math.round(limit / 1024)} KiB limit` : `${percentage}% used`;
+  const omitted = Object.entries(brief.omitted || {}).filter(([, count]) => Number(count) > 0);
+  const lifecycle = health.knowledge || {};
+  const errors = [health.knowledgeError?.message, health.graphError?.message].filter(Boolean);
+  target.innerHTML = `
+    <div class="brief-meter" role="meter" aria-label="Briefing byte use" aria-valuemin="0" aria-valuemax="${limit}" aria-valuenow="${bytes || 0}"><span style="width:${percentage}%"></span></div>
+    <div class="memory-health-grid">
+      <span><strong>${escapeHtml(formatBytes(bytes))}</strong> of ${escapeHtml(formatBytes(limit))}</span>
+      <span><strong>${brief.truncated == null ? "Pending" : brief.truncated ? "Bounded" : "Complete"}</strong> context</span>
+      <span><strong>${Number(lifecycle.stale || 0)}</strong> stale notes</span>
+      <span><strong>${Number(lifecycle.disputed || 0)}</strong> disputed notes</span>
+    </div>
+    ${omitted.length ? `<p class="memory-omissions"><strong>Fetch on demand:</strong> ${omitted.map(([key, count]) => `${escapeHtml(key)} ${Number(count)}`).join(" · ")}</p>` : ""}
+    ${brief.generatedAt ? `<small>Last ${escapeHtml(brief.delivery || "requested")} brief ${relativeTime(brief.generatedAt)}.</small>` : `<small>The first agent briefing will populate actual usage.</small>`}
+    ${health.graphIndexedAt ? `<small>CodeGraph indexed ${relativeTime(health.graphIndexedAt)}${health.graphTruncated ? " at its safety cap" : ""}.</small>` : ""}
+    ${errors.map((message) => `<p class="knowledge-error">${escapeHtml(message)}</p>`).join("")}
+  `;
 }
 
 function renderCodeGraph(task) {
@@ -279,14 +308,19 @@ function renderKnowledge(task) {
   const section = $("#knowledge-section");
   if (!section) return;
   const notes = task.knowledge || [];
+  const filter = $("#knowledge-filter")?.value || "current";
+  const visible = notes.filter((note) => filter === "current" ? ["verified", "inferred"].includes(note.status) : note.status === filter);
+  const notesById = new Map(notes.map((note) => [note.id, note]));
   section.classList.toggle("hidden", !task.knowledgeVault?.automated && notes.length === 0);
-  $("#knowledge-count").textContent = notes.length;
+  $("#knowledge-count").textContent = visible.length;
   const error = task.knowledgeVault?.error;
-  $("#knowledge-list").innerHTML = `${error ? `<p class="knowledge-error">Export needs attention: ${escapeHtml(error.message)}</p>` : ""}${notes.slice(0, 10).map((note) => `
+  $("#knowledge-list").innerHTML = `${error ? `<p class="knowledge-error">Export needs attention: ${escapeHtml(error.message)}</p>` : ""}${visible.slice(0, 10).map((note) => `
     <div class="knowledge-note">
       <div><span class="knowledge-category">${escapeHtml(note.category)}</span><span class="knowledge-status ${escapeHtml(note.status)}">${escapeHtml(note.status)}</span></div>
       <strong>${escapeHtml(note.title)}</strong>
       <small>${escapeHtml(note.link)} · r${note.revision} · ${relativeTime(note.updated_at)}</small>
+      ${note.stale_reason ? `<small class="knowledge-reason">${escapeHtml(note.stale_reason)}</small>` : ""}
+      ${note.superseded_by ? `<small class="knowledge-reason">Superseded by ${escapeHtml(notesById.get(note.superseded_by)?.title || note.superseded_by)}</small>` : ""}
     </div>`).join("") || '<p class="memory-scope">Ready — notes appear as the team completes work.</p>'}`;
 }
 
@@ -734,6 +768,10 @@ $("#copy-task-invite").addEventListener("click", async () => {
 $("#toggle-description").addEventListener("click", () => {
   descriptionExpanded = !descriptionExpanded;
   if (state?.selectedTask) renderTaskDescription(state.selectedTask.description);
+});
+
+$("#knowledge-filter")?.addEventListener("change", () => {
+  if (state?.selectedTask) renderKnowledge(state.selectedTask);
 });
 
 function initPanelToggles() {

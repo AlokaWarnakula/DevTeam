@@ -83,6 +83,12 @@
         <div id="project-blackboard-list" class="blackboard-list"></div>
         <div class="divider"></div>
       </div>
+      <div id="memory-health-section" class="blackboard-section">
+        <div class="panel-title"><h3>Memory health</h3><span id="brief-budget-status" class="count">32 KiB</span></div>
+        <p class="memory-scope">Actual automatic briefing use, omissions, and knowledge freshness.</p>
+        <div id="memory-health-summary" class="memory-health-summary"></div>
+        <div class="divider"></div>
+      </div>
       <div id="codegraph-section" class="blackboard-section hidden">
         <div class="panel-title"><h3>Code graph</h3><span id="codegraph-count" class="count">0</span></div>
         <p class="memory-scope">Automatically maps local modules and import relationships.</p>
@@ -92,6 +98,13 @@
       <div id="knowledge-section" class="blackboard-section hidden">
         <div class="panel-title"><h3>Knowledge vault</h3><span id="knowledge-count" class="count">0</span></div>
         <p class="memory-scope">Automatically maintained as Obsidian-compatible Markdown.</p>
+        <select id="knowledge-filter" class="knowledge-filter" aria-label="Filter knowledge lifecycle">
+          <option value="current">Current</option>
+          <option value="inferred">Inferred</option>
+          <option value="disputed">Disputed</option>
+          <option value="stale">Stale</option>
+          <option value="archived">Archived</option>
+        </select>
         <div id="knowledge-list" class="knowledge-list"></div>
         <div class="divider"></div>
       </div>

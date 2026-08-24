@@ -38,7 +38,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
   // Reachability: piggyback any directed/broadcast messages waiting for this agent onto whatever
   // call it just made, so a *busy* agent (not sitting in devteam_wait) is still reached promptly
   // instead of only when it next goes idle.
-  const withInbox = (agentId, result) => {
+  const takeInbox = (agentId) => {
     let pendingMessages = [];
     let pendingProposals = [];
     try { pendingMessages = store.deliverDirectedMessages(agentId); } catch { pendingMessages = []; }
@@ -46,6 +46,10 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
     // vote on any call it makes instead of a unanimity decision silently stalling until it next goes
     // idle. Only proposals in its rooms that it has not yet voted on are returned.
     try { pendingProposals = store.openProposalsForAgent(store.getAgent(agentId)); } catch { pendingProposals = []; }
+    return { pendingMessages, pendingProposals };
+  };
+  const withInbox = (agentId, result) => {
+    const { pendingMessages, pendingProposals } = takeInbox(agentId);
     if (!pendingMessages.length && !pendingProposals.length) return result;
     return {
       ...result,
@@ -153,14 +157,15 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
       }
       const assignment = store.claimNextAssignment(agentId);
       if (assignment) {
-        const codeContext = store.codeContextForAssignment(agentId, assignment.task_id, assignment.id);
-        return {
-          status: "assigned",
-          assignment,
-          codeContext,
-          keepWaiting: true,
-          instructions: "Inspect the current project state before acting. Complete this bounded assignment, then call devteam_report — pass back assignment.claimToken so a stale report is fenced if your lease moved. Use devteam_assign to delegate follow-up implementation, testing, or independent review.",
-        };
+        return store.taskBrief(agentId, assignment.task_id, {
+          currentAssignment: assignment,
+          assignmentKey: "assignment",
+          responseCore: {
+            status: "assigned",
+            keepWaiting: true,
+            instructions: "Inspect the current project state before acting. Complete this bounded assignment, then call devteam_report — pass back assignment.claimToken so a stale report is fenced if your lease moved. Use devteam_assign to delegate follow-up implementation, testing, or independent review.",
+          },
+        });
       }
       store.heartbeat(agentId, "waiting");
       await sleep(Math.min(750, Math.max(0, deadline - Date.now())));
@@ -200,7 +205,8 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
   }, safe(async ({ agentId, taskId }) => {
     requireIdentity(agentId);
     store.heartbeat(agentId);
-    return withInbox(agentId, store.taskBrief(agentId, taskId));
+    const { pendingMessages, pendingProposals } = takeInbox(agentId);
+    return store.taskBrief(agentId, taskId, { pendingMessages, pendingProposals });
   }));
 
   server.registerTool("devteam_message", {

@@ -14,7 +14,10 @@ test("dashboard API and authenticated MCP endpoint work together", async (t) => 
 
   const home = await fetch(instance.url);
   assert.equal(home.status, 200);
-  assert.match(await home.text(), /DevTeam/);
+  const homeHtml = await home.text();
+  assert.match(homeHtml, /DevTeam/);
+  assert.match(homeHtml, /Memory health/);
+  assert.match(homeHtml, /knowledge-filter/);
   const config = await fetch(`${instance.url}/api/config`).then((response) => response.json());
   assert.equal(config.mcpUrl, instance.mcpUrl);
   const state = await fetch(`${instance.url}/api/state`).then((response) => response.json());
@@ -46,6 +49,9 @@ test("dashboard API and authenticated MCP endpoint work together", async (t) => 
   const waiting = await client.callTool({ name: "devteam_wait", arguments: { agentId, timeoutSeconds: 1 } });
   assert.equal(waiting.structuredContent.status, "assigned");
   assert.equal(waiting.structuredContent.assignment.role, "planner");
+  const healthState = await fetch(`${instance.url}/api/state?taskId=${createdTask.id}`).then((response) => response.json());
+  assert.equal(healthState.selectedTask.memoryHealth.brief.bytes, waiting.structuredContent.briefMeta.bytes);
+  assert.equal(healthState.selectedTask.memoryHealth.brief.limitBytes, 32 * 1024);
   const disconnected = await client.callTool({ name: "devteam_disconnect", arguments: { agentId, summary: "Integration verified." } });
   assert.equal(disconnected.structuredContent.disconnected, true);
 
@@ -130,9 +136,16 @@ test("MCP assignment dependencies sequence work and devteam_brief stays compact"
   const connected = await client.callTool({ name: "devteam_connect", arguments: { name: "Worker", provider: "test" } });
   const agentId = connected.structuredContent.agent.id;
   const planner = await client.callTool({ name: "devteam_wait", arguments: { agentId, timeoutSeconds: 1 } });
+  assert.equal(planner.structuredContent.briefMeta.bytes, Buffer.byteLength(JSON.stringify(planner.structuredContent), "utf8"));
+  assert.ok(planner.structuredContent.briefMeta.bytes <= 32 * 1024, "automatic assignment context obeys the same hard budget");
   const parent = await client.callTool({ name: "devteam_assign", arguments: { agentId, taskId: task.id, title: "Parent", description: "First." } });
   const child = await client.callTool({ name: "devteam_assign", arguments: { agentId, taskId: task.id, title: "Child", description: "Second.", dependsOn: [parent.structuredContent.id] } });
+  instance.store.humanMessage(task.id, "😀".repeat(50_000), "Worker");
   const brief = await client.callTool({ name: "devteam_brief", arguments: { agentId, taskId: task.id } });
+  assert.equal(brief.structuredContent.briefMeta.bytes, Buffer.byteLength(JSON.stringify(brief.structuredContent), "utf8"));
+  assert.ok(brief.structuredContent.briefMeta.bytes <= 32 * 1024, "pending live messages remain inside the brief budget");
+  assert.equal(brief.structuredContent.pendingMessages.length, 1);
+  assert.ok(Buffer.byteLength(brief.structuredContent.pendingMessages[0].message, "utf8") <= 1_200);
   assert.equal(brief.structuredContent.currentAssignment.id, planner.structuredContent.assignment.id);
   assert.deepEqual(brief.structuredContent.openAssignments.find((item) => item.id === child.structuredContent.id).dependsOn, [parent.structuredContent.id]);
   assert.equal(Object.hasOwn(brief.structuredContent, "agents"), false);

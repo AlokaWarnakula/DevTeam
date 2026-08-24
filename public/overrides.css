@@ -570,6 +570,49 @@
   line-height: 1.4;
 }
 
+.memory-health-summary {
+  display: grid;
+  gap: 10px;
+}
+
+.brief-meter {
+  height: 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #20252c;
+}
+
+.brief-meter > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--blue);
+}
+
+.memory-health-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.memory-health-grid span,
+.memory-health-summary small {
+  display: block;
+}
+
+.memory-health-grid strong {
+  color: var(--text);
+}
+
+.memory-omissions {
+  margin: 0;
+  color: var(--amber);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .blackboard-list {
   display: flex;
   flex-direction: column;
@@ -623,6 +666,12 @@
   margin-top: 10px;
 }
 
+.knowledge-filter {
+  margin: 0 0 9px;
+  padding: 6px 8px;
+  font-size: 11px;
+}
+
 .knowledge-note {
   border: 1px solid var(--line);
   background: #11151b;
@@ -633,6 +682,11 @@
 .knowledge-note strong,
 .knowledge-note small {
   display: block;
+}
+
+.knowledge-note .knowledge-reason {
+  color: var(--amber);
+  line-height: 1.4;
 }
 
 .knowledge-note strong {
