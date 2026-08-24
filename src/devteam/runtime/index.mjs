@@ -59,19 +59,31 @@ export function normalizeRuntimeProfile(input, { observedAt, ttlMs } = {}) {
   const currentEffort = clean(input.currentEffort, 120) || null;
   const advertisedCurrentModel = uniqueModels.find((model) => model.id === currentModel);
   const advertisedCurrentEffort = advertisedCurrentModel?.efforts.find((effort) => effort.id === currentEffort);
+  const suppliedModelClass = oneOf(input.currentModelClass, MODEL_CLASSES);
+  const suppliedEffortClass = oneOf(input.currentEffortClass, EFFORT_CLASSES);
+  const validationIssues = [];
+  if (uniqueModels.length && currentModel && !advertisedCurrentModel) validationIssues.push("current_model_not_advertised");
+  if (advertisedCurrentModel && currentEffort && !advertisedCurrentEffort) validationIssues.push("current_effort_not_advertised");
+  if (advertisedCurrentModel && suppliedModelClass !== "unknown" && suppliedModelClass !== advertisedCurrentModel.class) {
+    validationIssues.push("current_model_class_mismatch");
+  }
+  if (advertisedCurrentEffort && suppliedEffortClass !== "unknown" && suppliedEffortClass !== advertisedCurrentEffort.class) {
+    validationIssues.push("current_effort_class_mismatch");
+  }
   return {
     schemaVersion: RUNTIME_SCHEMA_VERSION,
     providerId,
     currentModel,
     currentEffort,
-    currentModelClass: oneOf(input.currentModelClass || advertisedCurrentModel?.class, MODEL_CLASSES),
-    currentEffortClass: oneOf(input.currentEffortClass || advertisedCurrentEffort?.class, EFFORT_CLASSES),
+    currentModelClass: advertisedCurrentModel?.class || suppliedModelClass,
+    currentEffortClass: advertisedCurrentEffort?.class || suppliedEffortClass,
     availableModels: uniqueModels,
     switchMode: oneOf(input.switchMode, SWITCH_MODES),
     source,
     confidence: SOURCE_CONFIDENCE[source],
     observedAt: seenAt,
     expiresAt,
+    validationIssues,
   };
 }
 
@@ -79,6 +91,9 @@ export function runtimeProfileState(profile, at = Date.now()) {
   if (!profile) return { usable: false, stale: false, reason: "No runtime profile has been supplied for this agent session." };
   if (Date.parse(profile.expiresAt) <= at) return { usable: false, stale: true, reason: "The runtime profile expired and must be confirmed or refreshed." };
   if (profile.source === "agent_estimate") return { usable: false, stale: false, reason: "An agent-estimated runtime profile requires host, adapter, or user confirmation." };
+  if (profile.validationIssues?.length) {
+    return { usable: false, stale: false, reason: `The advertised runtime profile is internally inconsistent (${profile.validationIssues.join(", ")}).` };
+  }
   if (!profile.currentModel || !profile.currentEffort || profile.currentModelClass === "unknown" || profile.currentEffortClass === "unknown") {
     return { usable: false, stale: false, reason: "The current model or effort is not authoritatively mapped to normalized capability classes." };
   }
@@ -163,11 +178,12 @@ export function resolveRuntimeRequirement(requirement, profile) {
   let recommendation = null;
   for (const model of profile.availableModels) {
     if (!modelSatisfies(model.class, requirement.modelClass)) continue;
-    const effort = model.efforts.find((item) => effortSatisfies(item.class, requirement.effortClass));
-    if (!effort) continue;
-    const candidate = { modelId: model.id, modelLabel: model.label, modelClass: model.class, effortId: effort.id, effortLabel: effort.label, effortClass: effort.class };
-    if (!recommendation || (MODEL_RANK.get(candidate.modelClass) < MODEL_RANK.get(recommendation.modelClass))
-      || (candidate.modelClass === recommendation.modelClass && EFFORT_RANK.get(candidate.effortClass) < EFFORT_RANK.get(recommendation.effortClass))) recommendation = candidate;
+    for (const effort of model.efforts) {
+      if (!effortSatisfies(effort.class, requirement.effortClass)) continue;
+      const candidate = { modelId: model.id, modelLabel: model.label, modelClass: model.class, effortId: effort.id, effortLabel: effort.label, effortClass: effort.class };
+      if (!recommendation || (MODEL_RANK.get(candidate.modelClass) < MODEL_RANK.get(recommendation.modelClass))
+        || (candidate.modelClass === recommendation.modelClass && EFFORT_RANK.get(candidate.effortClass) < EFFORT_RANK.get(recommendation.effortClass))) recommendation = candidate;
+    }
   }
   return {
     satisfied: false,

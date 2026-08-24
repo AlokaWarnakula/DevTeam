@@ -59,6 +59,29 @@ test("checkpoint capsules are byte-exact, bounded, redacted, and never expose st
   assert.equal(JSON.stringify(store.listAgents()).includes("resume_token_hash"), false);
 });
 
+test("checkpoint capsules carry compact current runtime facts and the next-session recommendation", async (t) => {
+  const { store, task, oldAgent, assignment } = await fixture(t);
+  store.updateRuntimeProfile({ agentId: oldAgent.id, profile: {
+    providerId: "checkpoint-host",
+    currentModel: "balanced-model",
+    currentEffort: "medium-effort",
+    availableModels: [{ id: "balanced-model", class: "balanced", efforts: [{ id: "medium-effort", class: "medium" }] }],
+    switchMode: "user_required",
+    source: "host",
+    observedAt: new Date().toISOString(),
+  } });
+  const result = store.createSessionCheckpoint({ agentId: oldAgent.id, taskId: task.id, assignmentId: assignment.id });
+  assert.equal(result.checkpoint.capsule.currentRuntime.profile.providerId, "checkpoint-host");
+  assert.equal(result.checkpoint.capsule.currentRuntime.profile.currentModel, "balanced-model");
+  assert.equal(result.checkpoint.capsule.nextSessionRecommendation.level, "base");
+  assert.deepEqual(result.checkpoint.capsule.nextSessionRecommendation.requirements, {
+    modelClass: "balanced", effortClass: "medium", humanApprovalRequired: false,
+  });
+  assert.equal(result.checkpoint.capsule.nextSessionRecommendation.satisfied, true);
+  assert.equal(result.checkpoint.capsule.nextSessionRecommendation.selection.modelId, "balanced-model");
+  assert.ok(result.checkpoint.capsule.capsuleMeta.bytes <= result.checkpoint.capsule.capsuleMeta.limitBytes);
+});
+
 test("takeover atomically moves the claim, bumps fencing, rejects replay, and fences the old report", async (t) => {
   const { store, task, oldAgent, assignment } = await fixture(t);
   const checkpoint = store.createSessionCheckpoint({ agentId: oldAgent.id, taskId: task.id, nextAction: "Finish planning." });

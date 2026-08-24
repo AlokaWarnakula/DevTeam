@@ -71,6 +71,21 @@ test("generic manual adapter normalizes only supplied capabilities and never cre
   assert.equal(adapter.verifyCurrent({ modelId: "fixture-balanced", effortId: "fixture-medium" }), true);
 });
 
+test("runtime recommendations choose the least sufficient advertised effort regardless of host ordering", () => {
+  const profile = normalizeRuntimeProfile(balancedProfile({
+    currentModel: "fixture-frontier",
+    currentEffort: "fixture-medium",
+    availableModels: [{ id: "fixture-frontier", class: "frontier", efforts: [
+      { id: "fixture-max", class: "maximum" },
+      { id: "fixture-high", class: "high" },
+      { id: "fixture-extra", class: "extra_high" },
+      { id: "fixture-medium", class: "medium" },
+    ] }],
+  }));
+  const result = resolveRuntimeRequirement({ modelClass: "frontier", effortClass: "high" }, profile);
+  assert.equal(result.recommendation.effortId, "fixture-high");
+});
+
 test("runtime profiles persist per session with source trust and TTL behavior", async (t) => {
   const { store } = await fixture(t);
   const agent = store.connectAgent({ name: "Profiled", provider: "fixture", runtimeProfile: balancedProfile() });
@@ -79,6 +94,15 @@ test("runtime profiles persist per session with source trust and TTL behavior", 
     agentId: agent.id,
     profile: balancedProfile({ source: "agent_estimate", currentModel: "guess" }),
   }), /outranks/);
+  assert.throws(() => store.updateRuntimeProfile({
+    agentId: agent.id,
+    profile: balancedProfile({ source: "user", currentModelClass: "frontier", currentEffortClass: "maximum" }),
+  }), /outranks/, "a lower-trust source cannot replace fresh host facts while retaining the same ids");
+  const legacyInconsistent = { ...store.runtimeProfile(agent.id), currentModelClass: "frontier" };
+  delete legacyInconsistent.validationIssues;
+  delete legacyInconsistent.stale;
+  store.db.prepare("UPDATE agent_runtime_profiles SET profile = ? WHERE agent_id = ?").run(JSON.stringify(legacyInconsistent), agent.id);
+  assert.ok(store.runtimeProfile(agent.id).validationIssues.includes("current_model_class_mismatch"), "persisted pre-fix profiles are revalidated on read");
   const expired = store.updateRuntimeProfile({
     agentId: agent.id,
     force: true,
@@ -146,6 +170,27 @@ test("assignment and task evidence changes invalidate assessments; exceptional d
   assert.equal(store.runtimeDecision({ agentId: agent.id, assignmentId: assignment.id, assessmentId: exceptional.id, choice: "switched", actor: "human", humanApproved: true }).humanApproved, true);
 });
 
+test("a prior switched decision does not bypass the gate after the advertised runtime is downgraded", async (t) => {
+  const { store, task } = await fixture(t);
+  const planner = store.connectAgent({ name: "Planner", provider: "fixture" });
+  const plan = store.claimNextAssignment(planner.id);
+  store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+  const work = store.createAssignment({
+    taskId: task.id,
+    title: "Protect credentials",
+    description: "Implement authentication and schema migration safety.",
+    role: "implementer",
+  });
+  const agent = store.connectAgent({ name: "Switch then downgrade", provider: "fixture", runtimeProfile: balancedProfile() });
+  const gate = store.claimNextAssignment(agent.id);
+  store.updateRuntimeProfile({ agentId: agent.id, profile: balancedProfile({ currentModel: "fixture-frontier", currentEffort: "fixture-high" }) });
+  store.runtimeDecision({ agentId: agent.id, assignmentId: work.id, assessmentId: gate.assessment.id, choice: "switched" });
+  store.updateRuntimeProfile({ agentId: agent.id, profile: balancedProfile() });
+  const gatedAgain = store.claimNextAssignment(agent.id);
+  assert.equal(gatedAgain.status, "runtime_action_required");
+  assert.equal(gatedAgain.leaseAcquired, false);
+});
+
 test("runtime schema and decisions survive a restart without manufacturing disconnected profiles", async (t) => {
   const { store, dataDir } = await fixture(t);
   const agent = store.connectAgent({ name: "Restart", provider: "fixture", runtimeProfile: balancedProfile() });
@@ -171,4 +216,15 @@ test("malformed or unclassified advertised data is never silently treated as suf
   const result = resolveRuntimeRequirement({ modelClass: "balanced", effortClass: "medium" }, profile);
   assert.equal(result.satisfied, false);
   assert.equal(result.confirmationRequired, true);
+
+  const inconsistent = normalizeRuntimeProfile({
+    providerId: "inconsistent-host", currentModel: "balanced", currentEffort: "medium",
+    currentModelClass: "frontier", currentEffortClass: "maximum",
+    availableModels: [{ id: "balanced", class: "balanced", efforts: [{ id: "medium", class: "medium" }] }],
+    switchMode: "user_required", source: "host",
+  });
+  const inconsistentResult = resolveRuntimeRequirement({ modelClass: "balanced", effortClass: "medium" }, inconsistent);
+  assert.deepEqual(inconsistent.validationIssues.sort(), ["current_effort_class_mismatch", "current_model_class_mismatch"]);
+  assert.equal(inconsistentResult.satisfied, false);
+  assert.equal(inconsistentResult.confirmationRequired, true);
 });

@@ -1334,6 +1334,51 @@ export class DevTeamStore extends EventEmitter {
     const stamp = now();
     const expiresAt = new Date(Date.parse(stamp) + ttl).toISOString();
     const repositoryHead = this.#repositoryHead(task.project_root);
+    const runtimeProfile = this.runtimeProfile(agentId);
+    const runtimeAssessment = assignment ? this.assignmentAssessment({ assignmentId: assignment.id }) : null;
+    const runtimeResolution = runtimeAssessment && runtimeProfile
+      ? resolveRuntimeRequirement(runtimeAssessment.requirements, runtimeProfile)
+      : null;
+    const compactRuntimeProfile = runtimeProfile ? {
+      schemaVersion: Number(runtimeProfile.schemaVersion) || 1,
+      providerId: safe(runtimeProfile.providerId, 120, "runtimeProviderId"),
+      currentModel: runtimeProfile.currentModel ? safe(runtimeProfile.currentModel, 160, "runtimeModel") : null,
+      currentEffort: runtimeProfile.currentEffort ? safe(runtimeProfile.currentEffort, 120, "runtimeEffort") : null,
+      currentModelClass: runtimeProfile.currentModelClass,
+      currentEffortClass: runtimeProfile.currentEffortClass,
+      switchMode: runtimeProfile.switchMode,
+      source: runtimeProfile.source,
+      observedAt: runtimeProfile.observedAt,
+      expiresAt: runtimeProfile.expiresAt,
+      stale: Boolean(runtimeProfile.stale),
+      validationIssues: (runtimeProfile.validationIssues || []).slice(0, 10),
+    } : null;
+    const advertisedRecommendation = runtimeResolution?.recommendation ? {
+      modelId: safe(runtimeResolution.recommendation.modelId, 160, "recommendedModel"),
+      modelLabel: safe(runtimeResolution.recommendation.modelLabel, 200, "recommendedModelLabel"),
+      modelClass: runtimeResolution.recommendation.modelClass,
+      effortId: safe(runtimeResolution.recommendation.effortId, 120, "recommendedEffort"),
+      effortLabel: safe(runtimeResolution.recommendation.effortLabel, 160, "recommendedEffortLabel"),
+      effortClass: runtimeResolution.recommendation.effortClass,
+    } : null;
+    const baseRuntimeProfile = fromJson(task.base_runtime_profile, null);
+    const nextSessionRecommendation = runtimeAssessment ? {
+      assessmentId: runtimeAssessment.id,
+      level: runtimeAssessment.level,
+      requirements: runtimeAssessment.requirements,
+      satisfied: Boolean(runtimeResolution?.satisfied),
+      selection: advertisedRecommendation,
+      reason: runtimeResolution?.reason || "No authoritative runtime profile is available; confirm settings in the fresh session.",
+    } : (baseRuntimeProfile && typeof baseRuntimeProfile === "object" ? {
+      level: "task_base",
+      requirements: {
+        modelClass: safe(baseRuntimeProfile.modelClass || "unknown", 80, "baseRuntimeModelClass"),
+        effortClass: safe(baseRuntimeProfile.effortClass || "unknown", 80, "baseRuntimeEffortClass"),
+      },
+      satisfied: false,
+      selection: null,
+      reason: "Confirm the task's base runtime preference against the fresh session's advertised capabilities.",
+    } : null);
     let checkpointRow;
     this.#transaction(() => {
       const liveTask = this.getTask(taskId);
@@ -1380,8 +1425,8 @@ export class DevTeamStore extends EventEmitter {
             claimGeneration: Number(assignment.claim_generation),
           } : null,
           nextAction: safe(derivedNextAction, 1_200, "nextAction"),
-          currentRuntime: { provider: safe(agent.provider, 200, "agentProvider"), profile: null },
-          nextSessionRecommendation: null,
+          currentRuntime: { provider: safe(agent.provider, 200, "agentProvider"), profile: compactRuntimeProfile },
+          nextSessionRecommendation,
           repositoryFingerprint: { taskVersion: Number(task.version), gitHead: repositoryHead },
         },
         sections: [
@@ -1616,7 +1661,32 @@ export class DevTeamStore extends EventEmitter {
   #runtimeProfileRecord(row) {
     if (!row) return null;
     const profile = fromJson(row.profile, null);
-    return profile ? { ...profile, stale: Date.parse(row.expires_at) <= Date.now() } : null;
+    try {
+      const normalized = normalizeRuntimeProfile({
+        ...profile,
+        source: profile?.source || row.source,
+        observedAt: profile?.observedAt || row.observed_at,
+        expiresAt: profile?.expiresAt || row.expires_at,
+      });
+      return { ...normalized, stale: Date.parse(normalized.expiresAt) <= Date.now() };
+    } catch {
+      return {
+        schemaVersion: Number(row.schema_version) || 0,
+        providerId: "invalid-stored-profile",
+        currentModel: null,
+        currentEffort: null,
+        currentModelClass: "unknown",
+        currentEffortClass: "unknown",
+        availableModels: [],
+        switchMode: "unknown",
+        source: "agent_estimate",
+        confidence: 0,
+        observedAt: row.observed_at,
+        expiresAt: row.expires_at,
+        stale: Date.parse(row.expires_at) <= Date.now(),
+        validationIssues: ["stored_profile_invalid"],
+      };
+    }
   }
 
   runtimeProfile(agentId) {
@@ -1629,8 +1699,7 @@ export class DevTeamStore extends EventEmitter {
     if (agent.status === "disconnected") throw new Error("A disconnected session cannot update its runtime profile.");
     const normalized = normalizeRuntimeProfile(profile);
     const existing = this.runtimeProfile(agentId);
-    if (!force && existing && !existing.stale && existing.confidence > normalized.confidence
-      && (existing.currentModel !== normalized.currentModel || existing.currentEffort !== normalized.currentEffort)) {
+    if (!force && existing && !existing.stale && existing.confidence > normalized.confidence) {
       throw new Error(`A fresh ${existing.source} runtime profile outranks this ${normalized.source} update. Refresh it from the authoritative source or use an explicit human correction.`);
     }
     const stamp = now();
@@ -1798,7 +1867,7 @@ export class DevTeamStore extends EventEmitter {
     const decision = this.#runtimeDecisionRecord(decisionRow);
     if (decision && ["reassign", "cancel"].includes(decision.choice)
       && (!decision.expiresAt || Date.parse(decision.expiresAt) > Date.now())) return { skip: true, decision };
-    if (resolution.satisfied || decision?.choice === "continue" || decision?.choice === "switched") return { allowed: true, assessment, profile, resolution, decision };
+    if (resolution.satisfied || decision?.choice === "continue") return { allowed: true, assessment, profile, resolution, decision };
     const priorRecommendation = this.db.prepare(`
       SELECT id FROM events WHERE task_id = ? AND type = 'runtime.switch_recommended'
         AND json_extract(metadata, '$.assignmentId') = ? AND json_extract(metadata, '$.assessmentId') = ?
@@ -1878,7 +1947,7 @@ export class DevTeamStore extends EventEmitter {
     for (const taskId of rooms) {
       const task = this.getTask(taskId);
       if (!task || !["per_task", "adaptive", "per_assignment"].includes(task.session_policy)) continue;
-      if (task.session_policy !== "per_assignment" && (agent.fresh_task_id === taskId || agent.session_policy_ack_task_id === taskId)) continue;
+      if (agent.fresh_task_id === taskId || agent.session_policy_ack_task_id === taskId) continue;
       const eligible = Number(this.db.prepare("SELECT COUNT(*) AS count FROM assignments WHERE task_id = ? AND status = 'queued'").get(taskId).count);
       if (!eligible) continue;
       return {
@@ -2292,6 +2361,7 @@ export class DevTeamStore extends EventEmitter {
             ON dependency_link.assignment_id = dependency_closure.prerequisite_id
         )
         SELECT a.*, t.project_id, t.title AS task_title, t.description AS task_description,
+          t.session_policy AS task_session_policy,
           t.version AS task_version, t.required_approvals, p.root AS project_root, p.name AS project_name
         FROM assignments a
         JOIN tasks t ON t.id = a.task_id
@@ -2349,8 +2419,14 @@ export class DevTeamStore extends EventEmitter {
         `).run(agentId, stamp, this.#hashToken(claimToken), candidate.id);
         if (!result.changes) continue;
         const claimGeneration = this.db.prepare("SELECT claim_generation FROM assignments WHERE id = ?").get(candidate.id).claim_generation;
-        this.db.prepare("UPDATE agents SET status = 'busy', current_task_id = ?, last_seen = ? WHERE id = ?")
-          .run(candidate.task_id, stamp, agentId);
+        if (candidate.task_session_policy === "per_assignment") {
+          this.db.prepare(`UPDATE agents SET status = 'busy', current_task_id = ?, last_seen = ?,
+            fresh_task_id = NULL, session_policy_ack_task_id = NULL WHERE id = ?`)
+            .run(candidate.task_id, stamp, agentId);
+        } else {
+          this.db.prepare("UPDATE agents SET status = 'busy', current_task_id = ?, last_seen = ? WHERE id = ?")
+            .run(candidate.task_id, stamp, agentId);
+        }
         // Persist the room the moment the agent commits to its work, so an implicit membership
         // survives a second task being created later.
         this.db.prepare(`
