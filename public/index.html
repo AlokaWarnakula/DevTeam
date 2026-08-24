@@ -210,6 +210,27 @@
     </form>
   </dialog>
 
+  <dialog id="runtime-dialog" class="runtime-dialog">
+    <form id="runtime-form" method="dialog">
+      <div class="dialog-head"><div><span class="eyebrow">RUNTIME GATE</span><h2>Switch recommended</h2></div><button type="button" class="close">×</button></div>
+      <input type="hidden" name="assignmentId"><input type="hidden" name="assessmentId">
+      <p id="runtime-assignment-summary" class="runtime-summary"></p>
+      <div id="runtime-reasons" class="runtime-reasons"></div>
+      <label>Agent session<select name="agentId" id="runtime-agent" required></select></label>
+      <label>Current model<select name="modelId" id="runtime-model"></select></label>
+      <label>Current effort<select name="effortId" id="runtime-effort"></select></label>
+      <p class="hint">Desktop recommendations are advisory. Choices shown here come only from the selected session’s advertised profile; DevTeam does not invent availability.</p>
+      <label id="runtime-exceptional-confirm" class="runtime-exceptional hidden"><input type="checkbox" name="humanApproved"> I explicitly approve exceptional/maximum settings.</label>
+      <label>Decision note<input name="reason" maxlength="1000" placeholder="Why this choice is appropriate"></label>
+      <div class="dialog-actions runtime-actions">
+        <button type="button" class="secondary" data-runtime-choice="cancel">Cancel</button>
+        <button type="button" class="secondary" data-runtime-choice="reassign">Reassign</button>
+        <button type="button" class="secondary" data-runtime-choice="continue">Continue anyway</button>
+        <button type="button" class="primary" data-runtime-choice="switched">I switched</button>
+      </div>
+    </form>
+  </dialog>
+
   <div id="toast" class="toast"></div>
   <script type="module" src="/app.js"></script>
 </body>

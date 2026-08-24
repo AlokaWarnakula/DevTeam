@@ -12,6 +12,12 @@ import {
   buildCheckpointCapsule,
   DEFAULT_CHECKPOINT_BUDGET_BYTES,
 } from "./checkpoint.mjs";
+import {
+  assessAssignment,
+  COMPLEXITY_POLICY_VERSION,
+  normalizeRuntimeProfile,
+  resolveRuntimeRequirement,
+} from "./runtime/index.mjs";
 
 const now = () => new Date().toISOString();
 const json = (value) => JSON.stringify(value ?? null);
@@ -235,6 +241,47 @@ export class DevTeamStore extends EventEmitter {
         claimed_at TEXT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS agent_runtime_profiles (
+        agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+        profile TEXT NOT NULL,
+        schema_version INTEGER NOT NULL,
+        source TEXT NOT NULL,
+        confidence REAL NOT NULL,
+        observed_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS complexity_assessments (
+        id TEXT PRIMARY KEY,
+        assignment_id TEXT NOT NULL REFERENCES assignments(id) ON DELETE CASCADE,
+        assignment_version INTEGER NOT NULL,
+        task_version INTEGER NOT NULL,
+        evidence_hash TEXT NOT NULL,
+        policy_version INTEGER NOT NULL,
+        score INTEGER NOT NULL,
+        level TEXT NOT NULL,
+        reasons TEXT NOT NULL,
+        requirements TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        invalidated_at TEXT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS runtime_decisions (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        assignment_id TEXT NOT NULL REFERENCES assignments(id) ON DELETE CASCADE,
+        agent_id TEXT NULL REFERENCES agents(id) ON DELETE SET NULL,
+        assessment_id TEXT NOT NULL REFERENCES complexity_assessments(id) ON DELETE CASCADE,
+        recommendation TEXT NOT NULL,
+        choice TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        reason TEXT NULL,
+        human_approved INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NULL
+      );
+
       CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project_id, status);
       CREATE INDEX IF NOT EXISTS idx_assignments_queue ON assignments(status, target_agent_name, created_at);
       CREATE INDEX IF NOT EXISTS idx_assignments_task_status ON assignments(task_id, status);
@@ -248,6 +295,9 @@ export class DevTeamStore extends EventEmitter {
         ON session_checkpoints(task_id, status, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_checkpoints_assignment_status
         ON session_checkpoints(assignment_id, status, checkpoint_generation DESC);
+      CREATE INDEX IF NOT EXISTS idx_runtime_profiles_expiry ON agent_runtime_profiles(expires_at);
+      CREATE INDEX IF NOT EXISTS idx_complexity_assignment ON complexity_assessments(assignment_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_runtime_decisions_gate ON runtime_decisions(assignment_id, agent_id, created_at DESC);
       PRAGMA optimize;
     `);
     // Additive columns for databases created before consensus snapshots/quorum/timeout existed.
@@ -258,6 +308,8 @@ export class DevTeamStore extends EventEmitter {
       ["agents", "message_floor", "TEXT"],       // on resume, replay messages back to the original session's start
       ["assignments", "claim_generation", "INTEGER NOT NULL DEFAULT 0"], // bumped every (re)claim, for lease fencing
       ["assignments", "claim_token_hash", "TEXT"],                        // hashed fencing token for the live claim
+      ["assignments", "assignment_version", "INTEGER NOT NULL DEFAULT 1"],
+      ["assignments", "complexity_override", "TEXT"],
     ]) {
       try { this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`); } catch { /* already present */ }
     }
@@ -954,6 +1006,7 @@ export class DevTeamStore extends EventEmitter {
     const project = this.db.prepare("SELECT * FROM projects WHERE id = ?").get(projectId);
     if (!project) throw new Error("Project not found.");
     const taskId = randomUUID();
+    const plannerAssignmentId = randomUUID();
     const stamp = now();
     const approvals = Math.max(1, Math.min(8, Number(requiredApprovals) || 2));
     this.#transaction(() => {
@@ -964,9 +1017,10 @@ export class DevTeamStore extends EventEmitter {
       this.db.prepare(`
         INSERT INTO assignments (id, task_id, title, description, role, requires_write, status, created_at)
         VALUES (?, ?, ?, ?, 'planner', 0, 'queued', ?)
-      `).run(randomUUID(), taskId, "Create the implementation plan", "Inspect the project, propose a concrete plan, then assign implementation and review work to the team.", stamp);
+      `).run(plannerAssignmentId, taskId, "Create the implementation plan", "Inspect the project, propose a concrete plan, then assign implementation and review work to the team.", stamp);
       this.#event(taskId, null, "task.created", `Task created: ${title.trim()}`, { projectId, requiredApprovals: approvals });
     });
+    this.assignmentAssessment({ assignmentId: plannerAssignmentId });
     this.#changed("task.created", taskId);
     return this.getTask(taskId);
   }
@@ -1542,7 +1596,217 @@ export class DevTeamStore extends EventEmitter {
     };
   }
 
-  connectAgent({ name, provider, capabilities = [] }) {
+  #runtimeProfileRecord(row) {
+    if (!row) return null;
+    const profile = fromJson(row.profile, null);
+    return profile ? { ...profile, stale: Date.parse(row.expires_at) <= Date.now() } : null;
+  }
+
+  runtimeProfile(agentId) {
+    this.getAgent(agentId);
+    return this.#runtimeProfileRecord(this.db.prepare("SELECT * FROM agent_runtime_profiles WHERE agent_id = ?").get(agentId));
+  }
+
+  updateRuntimeProfile({ agentId, profile, force = false }) {
+    const agent = this.getAgent(agentId);
+    if (agent.status === "disconnected") throw new Error("A disconnected session cannot update its runtime profile.");
+    const normalized = normalizeRuntimeProfile(profile);
+    const existing = this.runtimeProfile(agentId);
+    if (!force && existing && !existing.stale && existing.confidence > normalized.confidence
+      && (existing.currentModel !== normalized.currentModel || existing.currentEffort !== normalized.currentEffort)) {
+      throw new Error(`A fresh ${existing.source} runtime profile outranks this ${normalized.source} update. Refresh it from the authoritative source or use an explicit human correction.`);
+    }
+    const stamp = now();
+    this.db.prepare(`
+      INSERT INTO agent_runtime_profiles (
+        agent_id, profile, schema_version, source, confidence, observed_at, expires_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(agent_id) DO UPDATE SET
+        profile = excluded.profile, schema_version = excluded.schema_version, source = excluded.source,
+        confidence = excluded.confidence, observed_at = excluded.observed_at,
+        expires_at = excluded.expires_at, updated_at = excluded.updated_at
+    `).run(agentId, json(normalized), normalized.schemaVersion, normalized.source, normalized.confidence,
+      normalized.observedAt, normalized.expiresAt, stamp);
+    const taskId = agent.current_task_id || this.#memberTaskIds(agentId)[0] || null;
+    if (taskId) this.#event(taskId, agentId, "runtime.profile_updated", `${agent.name} updated its runtime profile from ${normalized.source}.`, {
+      source: normalized.source, switchMode: normalized.switchMode, expiresAt: normalized.expiresAt,
+      modelClass: normalized.currentModelClass, effortClass: normalized.currentEffortClass,
+    });
+    this.#changed("runtime.profile_updated", taskId);
+    return normalized;
+  }
+
+  #dependencyDepth(assignmentId, seen = new Set()) {
+    if (seen.has(assignmentId)) return 0;
+    seen.add(assignmentId);
+    const dependencies = this.#dependenciesFor(assignmentId);
+    if (!dependencies.length) return 0;
+    return 1 + Math.max(...dependencies.map((item) => this.#dependencyDepth(item.id, new Set(seen))));
+  }
+
+  #assessmentRecord(row) {
+    if (!row) return null;
+    return {
+      id: row.id,
+      assignmentId: row.assignment_id,
+      assignmentVersion: Number(row.assignment_version),
+      taskVersion: Number(row.task_version),
+      evidenceHash: row.evidence_hash,
+      policyVersion: Number(row.policy_version),
+      score: Number(row.score),
+      level: row.level,
+      reasons: fromJson(row.reasons, []),
+      requirements: fromJson(row.requirements, {}),
+      createdAt: row.created_at,
+      invalidatedAt: row.invalidated_at || null,
+    };
+  }
+
+  assignmentAssessment({ agentId = null, assignmentId, refresh = false }) {
+    const assignment = this.db.prepare(`
+      SELECT a.*, t.title AS task_title, t.description AS task_description, t.version AS task_version
+      FROM assignments a JOIN tasks t ON t.id = a.task_id WHERE a.id = ?
+    `).get(assignmentId);
+    if (!assignment) throw new Error("Assignment not found.");
+    if (agentId) { this.getAgent(agentId); this.assertMembership(agentId, assignment.task_id); }
+    const failures = Number(this.db.prepare(`
+      SELECT COUNT(*) AS count FROM events
+      WHERE task_id = ? AND type = 'assignment.blocked'
+        AND (json_extract(metadata, '$.assignmentId') = ? OR message LIKE ?)
+    `).get(assignment.task_id, assignmentId, `%${assignment.title}%`).count);
+    const assessed = assessAssignment({
+      ...assignment,
+      paths: assignment.requires_write ? this.#writeScopeFor(assignment.id) : [],
+      checklist: this.#checklistFor(assignment.id),
+      dependencyDepth: this.#dependencyDepth(assignment.id),
+      priorFailures: failures,
+      override: fromJson(assignment.complexity_override, null),
+    });
+    const current = this.db.prepare(`
+      SELECT * FROM complexity_assessments
+      WHERE assignment_id = ? AND invalidated_at IS NULL ORDER BY created_at DESC LIMIT 1
+    `).get(assignmentId);
+    if (!refresh && current && current.evidence_hash === assessed.evidenceHash
+      && Number(current.policy_version) === COMPLEXITY_POLICY_VERSION
+      && Number(current.assignment_version) === Number(assignment.assignment_version)) return this.#assessmentRecord(current);
+    const stamp = now();
+    if (current) this.db.prepare("UPDATE complexity_assessments SET invalidated_at = ? WHERE id = ?").run(stamp, current.id);
+    const id = randomUUID();
+    this.db.prepare(`
+      INSERT INTO complexity_assessments (
+        id, assignment_id, assignment_version, task_version, evidence_hash, policy_version,
+        score, level, reasons, requirements, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, assignmentId, assignment.assignment_version, assignment.task_version, assessed.evidenceHash,
+      assessed.policyVersion, assessed.score, assessed.level, json(assessed.reasons), json(assessed.requirements), stamp);
+    this.#event(assignment.task_id, agentId, "assignment.complexity_assessed", `Assessed “${assignment.title}” as ${assessed.level} (${assessed.score}).`, {
+      assignmentId, assessmentId: id, score: assessed.score, level: assessed.level,
+      requirements: assessed.requirements, invalidatedAssessmentId: current?.id || null,
+    });
+    this.emit("change", { type: "assignment.complexity_assessed", taskId: assignment.task_id, at: stamp });
+    return this.#assessmentRecord(this.db.prepare("SELECT * FROM complexity_assessments WHERE id = ?").get(id));
+  }
+
+  setAssignmentComplexityOverride({ assignmentId, override = null }) {
+    const assignment = this.db.prepare("SELECT * FROM assignments WHERE id = ?").get(assignmentId);
+    if (!assignment) throw new Error("Assignment not found.");
+    if (override != null && (typeof override !== "object" || Array.isArray(override))) throw new Error("Complexity override must be an object or null.");
+    const level = override?.level;
+    if (level != null && !["base", "difficult", "critical", "recovery", "exceptional"].includes(level)) throw new Error("Invalid complexity override level.");
+    this.db.prepare(`
+      UPDATE assignments SET complexity_override = ?, assignment_version = assignment_version + 1 WHERE id = ?
+    `).run(override == null ? null : json({ level: level || null, score: Number.isFinite(Number(override.score)) ? Math.max(0, Math.floor(Number(override.score))) : null }), assignmentId);
+    const assessment = this.assignmentAssessment({ assignmentId, refresh: true });
+    this.#changed("assignment.complexity_override", assignment.task_id);
+    return assessment;
+  }
+
+  #runtimeDecisionRecord(row) {
+    return row ? {
+      id: row.id, taskId: row.task_id, assignmentId: row.assignment_id, agentId: row.agent_id,
+      assessmentId: row.assessment_id, recommendation: fromJson(row.recommendation, null),
+      choice: row.choice, actor: row.actor, reason: row.reason, humanApproved: Boolean(row.human_approved),
+      createdAt: row.created_at, expiresAt: row.expires_at,
+    } : null;
+  }
+
+  runtimeDecision({ agentId = null, assignmentId, assessmentId = null, choice, actor = null, reason = "", humanApproved = false }) {
+    if (!["switched", "continue", "reassign", "cancel"].includes(choice)) throw new Error("Runtime choice must be switched, continue, reassign, or cancel.");
+    const assignment = this.db.prepare("SELECT * FROM assignments WHERE id = ?").get(assignmentId);
+    if (!assignment) throw new Error("Assignment not found.");
+    if (agentId) { this.getAgent(agentId); this.assertMembership(agentId, assignment.task_id); }
+    const assessment = this.assignmentAssessment({ agentId, assignmentId });
+    if (assessmentId && assessment.id !== assessmentId) throw new Error("The assignment assessment changed. Review the current recommendation before deciding.");
+    const profile = agentId ? this.runtimeProfile(agentId) : null;
+    const resolution = resolveRuntimeRequirement(assessment.requirements, profile);
+    if (choice === "switched" && !resolution.satisfied) throw new Error("The refreshed runtime profile still does not satisfy this assessment. Update the current host settings first or choose Continue anyway.");
+    if (assessment.requirements.humanApprovalRequired && ["switched", "continue"].includes(choice) && !humanApproved) {
+      throw new Error("Exceptional runtime settings require explicit human approval.");
+    }
+    const stamp = now();
+    const expiresAt = ["reassign", "cancel"].includes(choice) ? new Date(Date.now() + 5 * 60 * 1000).toISOString() : null;
+    const id = randomUUID();
+    this.db.prepare(`
+      INSERT INTO runtime_decisions (
+        id, task_id, assignment_id, agent_id, assessment_id, recommendation, choice,
+        actor, reason, human_approved, created_at, expires_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, assignment.task_id, assignmentId, agentId, assessment.id, json(resolution), choice,
+      String(actor || (agentId ? "agent" : "human")).trim().slice(0, 120), String(reason || "").trim().slice(0, 1000) || null,
+      humanApproved ? 1 : 0, stamp, expiresAt);
+    this.#event(assignment.task_id, agentId, "runtime.decision_recorded", `Runtime decision for “${assignment.title}”: ${choice}.`, {
+      assignmentId, assessmentId: assessment.id, choice, actor: actor || (agentId ? "agent" : "human"), humanApproved: Boolean(humanApproved),
+    });
+    if (choice === "switched") this.#event(assignment.task_id, agentId, "runtime.switch_verified", `Runtime switch verified for “${assignment.title}”.`, { assignmentId, assessmentId: assessment.id });
+    this.#changed("runtime.decision_recorded", assignment.task_id);
+    return this.#runtimeDecisionRecord(this.db.prepare("SELECT * FROM runtime_decisions WHERE id = ?").get(id));
+  }
+
+  #runtimeGate(agent, candidate) {
+    // Candidate selection already authorizes either contributor membership or an exact targeted
+    // invitation. Assess without re-running the stricter room-membership check so a targeted agent
+    // can pass the runtime gate before its membership is persisted by the eventual claim.
+    const assessment = this.assignmentAssessment({ assignmentId: candidate.id });
+    const profile = this.runtimeProfile(agent.id);
+    // Runtime profiles were added after DevTeam's original connect handshake. A session that did
+    // not send one remains a legacy client and keeps the old claim behavior; once a session opts
+    // into runtime discovery, stale/estimated/insufficient data is always gated and never guessed.
+    if (!profile) return { allowed: true, assessment, profile: null, resolution: null, legacyUnprofiled: true };
+    const resolution = resolveRuntimeRequirement(assessment.requirements, profile);
+    const decisionRow = this.db.prepare(`
+      SELECT * FROM runtime_decisions
+      WHERE assignment_id = ? AND assessment_id = ? AND (agent_id = ? OR agent_id IS NULL)
+      ORDER BY created_at DESC LIMIT 1
+    `).get(candidate.id, assessment.id, agent.id);
+    const decision = this.#runtimeDecisionRecord(decisionRow);
+    if (decision && ["reassign", "cancel"].includes(decision.choice)
+      && (!decision.expiresAt || Date.parse(decision.expiresAt) > Date.now())) return { skip: true, decision };
+    if (resolution.satisfied || decision?.choice === "continue" || decision?.choice === "switched") return { allowed: true, assessment, profile, resolution, decision };
+    const priorRecommendation = this.db.prepare(`
+      SELECT id FROM events WHERE task_id = ? AND type = 'runtime.switch_recommended'
+        AND json_extract(metadata, '$.assignmentId') = ? AND json_extract(metadata, '$.assessmentId') = ?
+        AND json_extract(metadata, '$.agentId') = ? LIMIT 1
+    `).get(candidate.task_id, candidate.id, assessment.id, agent.id);
+    if (!priorRecommendation) this.#event(candidate.task_id, agent.id, "runtime.switch_recommended", `Runtime action is required before “${candidate.title}” can be claimed.`, {
+      assignmentId: candidate.id, assessmentId: assessment.id, agentId: agent.id,
+      level: assessment.level, requirements: assessment.requirements, recommendation: resolution.recommendation,
+    });
+    return {
+      runtimeActionRequired: true,
+      status: "runtime_action_required",
+      taskId: candidate.task_id,
+      assignment: { id: candidate.id, title: candidate.title, role: candidate.role, requiresWrite: Boolean(candidate.requires_write) },
+      assessment,
+      runtimeProfile: profile,
+      resolution,
+      actions: ["switched", "continue", "reassign", "cancel"],
+      advisory: profile?.switchMode !== "automatic",
+      humanApprovalRequired: Boolean(assessment.requirements.humanApprovalRequired),
+      leaseAcquired: false,
+    };
+  }
+
+  connectAgent({ name, provider, capabilities = [], runtimeProfile = null }) {
     const cleanName = name.trim();
     const cleanProvider = provider.trim();
     if (!cleanName || !cleanProvider) throw new Error("Agent name and provider are required.");
@@ -1586,7 +1850,8 @@ export class DevTeamStore extends EventEmitter {
     });
     this.#changed("agent.connected");
     // The resume token is returned exactly once, to this caller, and only its hash is stored.
-    return { ...this.getAgent(id), resumeToken };
+    if (runtimeProfile) this.updateRuntimeProfile({ agentId: id, profile: runtimeProfile });
+    return { ...this.getAgent(id), runtimeProfile: this.runtimeProfile(id), resumeToken };
   }
 
   getAgent(agentId) {
@@ -1733,6 +1998,7 @@ export class DevTeamStore extends EventEmitter {
       return {
         ...safe,
         capabilities: fromJson(row.capabilities, []),
+        runtimeProfile: this.#runtimeProfileRecord(this.db.prepare("SELECT * FROM agent_runtime_profiles WHERE agent_id = ?").get(row.id)),
         pending_messages: row.status === "disconnected" ? 0 : this.#pendingMessageCount(row),
       };
     });
@@ -1912,6 +2178,7 @@ export class DevTeamStore extends EventEmitter {
         dependsOn: dependencyIds,
       });
     });
+    this.assignmentAssessment({ assignmentId: assignment.id });
     this.#changed("assignment.created", taskId);
     return { ...this.db.prepare("SELECT * FROM assignments WHERE id = ?").get(assignment.id), checklist: resolvedChecklist || [], writePaths, dependsOn: dependencyIds };
   }
@@ -2015,6 +2282,9 @@ export class DevTeamStore extends EventEmitter {
             && lease.scopes.some((held) => scopes.some((want) => this.#scopesOverlap(held, want))));
           if (conflict) continue;
         }
+        const gate = this.#runtimeGate(agent, candidate);
+        if (gate.skip) continue;
+        if (!gate.allowed) return gate;
         const claimToken = randomBytes(18).toString("base64url");
         const result = this.db.prepare(`
           UPDATE assignments
@@ -2045,7 +2315,10 @@ export class DevTeamStore extends EventEmitter {
       this.db.prepare("UPDATE agents SET status = 'waiting', last_seen = ? WHERE id = ?").run(now(), agentId);
       return null;
     });
-    if (assignment) this.#changed("assignment.claimed", assignment.task_id);
+    if (assignment) this.#changed(
+      assignment.runtimeActionRequired ? "runtime.switch_recommended" : "assignment.claimed",
+      assignment.task_id || assignment.taskId,
+    );
     return assignment;
   }
 
@@ -2671,19 +2944,30 @@ export class DevTeamStore extends EventEmitter {
       WHERE a.task_id = ? ORDER BY a.created_at ASC
     `).all(taskId).map((assignment) => {
       const dependencies = this.#dependenciesFor(assignment.id);
+      const assessment = this.#assessmentRecord(this.db.prepare(`
+        SELECT * FROM complexity_assessments WHERE assignment_id = ? AND invalidated_at IS NULL
+        ORDER BY created_at DESC LIMIT 1
+      `).get(assignment.id));
+      const runtimeDecision = this.#runtimeDecisionRecord(this.db.prepare(`
+        SELECT * FROM runtime_decisions WHERE assignment_id = ? ORDER BY created_at DESC LIMIT 1
+      `).get(assignment.id));
       return {
         ...assignment,
         checklist: this.#checklistFor(assignment.id),
         writeScope: assignment.requires_write ? this.#writeScopeFor(assignment.id) : [],
         dependsOn: dependencies.map((item) => item.id),
         blockedBy: dependencies.filter((item) => item.status !== "done"),
+        assessment,
+        runtimeDecision,
       };
     });
     const members = this.db.prepare(`
       SELECT m.role, ag.id AS agent_id, ag.name AS agent_name, ag.provider AS agent_provider, ag.status
       FROM task_members m JOIN agents ag ON ag.id = m.agent_id
       WHERE m.task_id = ? ORDER BY m.joined_at ASC
-    `).all(taskId);
+    `).all(taskId).map((member) => ({ ...member, runtimeProfile: this.#runtimeProfileRecord(
+      this.db.prepare("SELECT * FROM agent_runtime_profiles WHERE agent_id = ?").get(member.agent_id),
+    ) }));
     const approvals = this.db.prepare(`
       SELECT ap.*, ag.name AS agent_name, ag.provider AS agent_provider
       FROM approvals ap JOIN agents ag ON ag.id = ap.agent_id
@@ -2887,6 +3171,11 @@ export class DevTeamStore extends EventEmitter {
         project_root: clip(currentSource.project_root || task.project_root, 2_000, "currentAssignmentProjectRoot"),
         project_name: clip(currentSource.project_name || task.project_name, 400, "currentAssignmentProjectName"),
         claimGeneration: Number(currentSource.claimGeneration ?? currentSource.claim_generation ?? 0),
+        assessment: this.#assessmentRecord(this.db.prepare(`
+          SELECT * FROM complexity_assessments WHERE assignment_id = ? AND invalidated_at IS NULL
+          ORDER BY created_at DESC LIMIT 1
+        `).get(currentSource.id)),
+        runtimeProfile: this.runtimeProfile(agentId),
         ...(currentSource.claimToken ? { claimToken: currentSource.claimToken } : {}),
       };
     }

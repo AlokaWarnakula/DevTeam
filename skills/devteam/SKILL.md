@@ -9,7 +9,7 @@ You are one member of a local AI development team — Codex, Claude, and the hum
 
 ## Connect
 
-1. Call `devteam_connect` with a stable, recognizable name (e.g. `Codex`, `Claude`), the current provider, and honest capabilities such as `planning`, `coding`, `testing`, `review`, or `security`. Capabilities describe what you can do; they do **not** choose your role.
+1. Call `devteam_connect` with a stable, recognizable name (e.g. `Codex`, `Claude`), the current provider, honest work capabilities such as `planning`, `coding`, `testing`, `review`, or `security`, and a provider-neutral `runtimeProfile` when the host exposes one. Report current/available model and effort IDs, normalized classes, switch mode, source, and observation time only from the host, a tested adapter, or an explicit user statement. Keep unknown values unknown and never invent model availability from memory. Work capabilities do **not** choose your role.
 2. Keep the returned `agentId` for every later call in this session. Also keep the returned `resumeToken` privately — if this session drops and you reconnect, call `devteam_resume` with it to reclaim your in-progress assignment and any messages sent while you were away, instead of leaving your work stuck.
 3. **Task rooms:** if the server hosts more than one active task, call `devteam_join` with the `taskId` you were invited to. The room membership value (`contributor` or `observer`) controls whether you may claim work; it is not a development role. A single-task server places you in its room automatically.
 4. If the invitation contains a checkpoint ID and one-time handoff token, this is an intentional fresh-session transfer: after connecting and joining, call `devteam_session_takeover` before `devteam_wait`. Do not use `devteam_resume` for it.
@@ -30,12 +30,21 @@ Run this loop:
    - **`assigned`** — you have work. Reset your idle timer. Do the assignment (next section), then return to step 1.
    - **`message`** — the human is talking to you. Reset your idle timer. Read every item in `messages`. If a reply or acknowledgement is expected, post it with `devteam_message`, then act on it. Return to step 1.
    - **`room_required`** — the server has multiple active task rooms and you have not joined one. Choose the intended `taskId` from `availableTasks`, call `devteam_join`, then return to step 1. Do not treat this as an empty room or disconnect.
+   - **`runtime_action_required`** — no claim or lease was acquired. Read the assessment's score, level, reasons, normalized requirements, profile freshness, and advertised recommendation. Ask the human to choose **switched**, **continue**, **reassign**, or **cancel**. If settings changed, call `devteam_runtime_update` with fresh host/user facts, then record the decision with `devteam_runtime_decision`. Never assert **switched** until the current advertised model/effort matches; an agent cannot approve exceptional settings for itself.
    - **`idle`** with **`keepWaiting: true`** — no work for you yet, but the team is still active. Call `devteam_wait` again (step 1). If you have been idle **about five minutes straight** with no assignment and no message, stop looping and disconnect; tell the user to invoke `$devteam` again when there is new work.
    - **`idle`** with **`keepWaiting: false`** — the room is quiet (no open assignments, no busy teammates). Disconnect now and tell the user you left because there was nothing to do.
 
 Never spin a tight loop of many `devteam_wait` calls without letting each one block. One call per loop iteration is the whole point; each call already waits.
 
 You stay reachable even while busy: **any** tool result may include a `pendingMessages` array — the human or a teammate reaching you mid-work. Read those messages and act on them before continuing, the same as a `message` from the wait loop.
+
+## Runtime recommendations
+
+- Runtime profiles belong to one agent session and expire. Refresh them on a host setting change, failed switch, explicit user correction, or when DevTeam says the profile is stale. Do not store routine runtime availability in durable project memory.
+- `devteam_assignment_assessment` is deterministic and provider-neutral: use its score, level, reasons, and normalized requirements rather than provider brand names. A recommendation may select only options the current profile actually advertises.
+- A desktop recommendation is advisory because DevTeam cannot assume it can control the conversation's settings. `continue` records a human risk/continuity choice; it is not evidence that the current runtime is ideal. `reassign` leaves the lease free for a compatible teammate.
+- If current settings exceed the requirement, continue the current assignment. Do not interrupt active work merely to downgrade; a cheaper profile can be considered at the next fresh-session boundary.
+- Maximum/exceptional settings always require explicit human approval. Provider-specific model IDs must never be added to the core complexity policy.
 
 ## Do the assignment
 

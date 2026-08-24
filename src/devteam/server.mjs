@@ -219,6 +219,34 @@ export async function startDevTeamServer({
     requireFields(req.body, ["title", "description"]);
     res.status(201).json(store.createAssignment({ ...req.body, taskId: req.params.taskId }));
   });
+  app.get("/api/agents/:agentId/runtime", requireControlAuth, (req, res) => {
+    res.json({ agentId: req.params.agentId, runtimeProfile: store.runtimeProfile(req.params.agentId) });
+  });
+  app.put("/api/agents/:agentId/runtime", (req, res) => {
+    res.json({ updated: true, runtimeProfile: store.updateRuntimeProfile({
+      agentId: req.params.agentId,
+      profile: { ...(req.body?.profile || req.body), source: "user" },
+      force: true,
+    }) });
+  });
+  app.get("/api/assignments/:assignmentId/assessment", requireControlAuth, (req, res) => {
+    res.json(store.assignmentAssessment({ assignmentId: req.params.assignmentId }));
+  });
+  app.patch("/api/assignments/:assignmentId/complexity", (req, res) => {
+    res.json(store.setAssignmentComplexityOverride({ assignmentId: req.params.assignmentId, override: req.body?.override ?? req.body ?? null }));
+  });
+  app.post("/api/assignments/:assignmentId/runtime-decisions", (req, res) => {
+    requireFields(req.body, ["choice"]);
+    res.status(201).json(store.runtimeDecision({
+      agentId: typeof req.body?.agentId === "string" ? req.body.agentId : null,
+      assignmentId: req.params.assignmentId,
+      assessmentId: typeof req.body?.assessmentId === "string" ? req.body.assessmentId : null,
+      choice: req.body.choice,
+      actor: "human",
+      reason: req.body?.reason || "Human runtime decision from the dashboard.",
+      humanApproved: req.body?.humanApproved === true,
+    }));
+  });
   app.post("/api/tasks/:taskId/checkpoints", (req, res) => {
     const task = store.getTask(req.params.taskId);
     if (!task) return res.status(404).json({ error: "Task not found." });

@@ -202,7 +202,15 @@ function renderTask(task) {
     const blockedBy = item.blockedBy?.length
       ? `<div class="dependency-wait"><strong>Waiting for</strong>${item.blockedBy.map((dependency) => `<span>${escapeHtml(dependency.title)} · ${escapeHtml(dependency.status)}</span>`).join("")}</div>`
       : "";
-    return `<div class="assignment"><div class="assignment-top"><strong>${escapeHtml(item.title)}</strong><span class="role">${escapeHtml(item.role)}</span></div><p>${escapeHtml(item.agent_name ? `${item.agent_name} · ${item.status}` : item.status)}${item.requires_write ? " · write lease" : ""}</p>${blockedBy}${scope}${checklist}<div class="assignment-actions">${checkpoint}${release}</div></div>`;
+    const assessment = item.assessment;
+    const assessmentView = assessment
+      ? `<div class="complexity"><strong>${escapeHtml(assessment.level)} · score ${Number(assessment.score)}</strong><span>${escapeHtml(assessment.requirements.modelClass)} / ${escapeHtml(assessment.requirements.effortClass)}</span><small>${assessment.reasons.slice(0, 2).map((reason) => escapeHtml(reason.detail)).join(" · ") || "Scoped baseline work."}</small></div>`
+      : `<div class="complexity pending"><small>Complexity assessment pending</small></div>`;
+    const runtimeDecision = item.runtimeDecision ? `<small class="runtime-decision">Runtime: ${escapeHtml(item.runtimeDecision.choice)} by ${escapeHtml(item.runtimeDecision.actor)}</small>` : "";
+    const runtime = item.status === "queued" && assessment
+      ? `<button class="mini runtime" data-runtime-assignment="${item.id}" title="Review the provider-neutral runtime recommendation">Runtime settings</button>`
+      : "";
+    return `<div class="assignment"><div class="assignment-top"><strong>${escapeHtml(item.title)}</strong><span class="role">${escapeHtml(item.role)}</span></div><p>${escapeHtml(item.agent_name ? `${item.agent_name} · ${item.status}` : item.status)}${item.requires_write ? " · write lease" : ""}</p>${assessmentView}${runtimeDecision}${blockedBy}${scope}${checklist}<div class="assignment-actions">${runtime}${checkpoint}${release}</div></div>`;
   }).join("") || `<p class="hint">Waiting for the plan</p>`;
   renderSessionCheckpoints(task);
   renderBlackboard(task);
@@ -439,7 +447,11 @@ function renderAgentList() {
     const forget = agent.status === "unresponsive"
       ? `<button class="row-delete" data-forget-agent="${agent.id}" data-forget-name="${escapeHtml(agent.name)}" title="Remove this unresponsive agent from DevTeam" aria-label="Remove ${escapeHtml(agent.name)}">×</button>`
       : "";
-    return `<div class="agent"><div class="avatar">${initials(agent.name)}</div><div class="agent-info"><strong>${escapeHtml(agent.name)}${unread}</strong><small>${escapeHtml(agent.provider)} · ${escapeHtml(agent.status)}</small><small class="activity">${escapeHtml(activityLine(agent))}</small></div><span class="agent-actions"><span class="agent-status ${agent.status} ${freshness(agent.last_seen)}" title="${escapeHtml(agent.status)} · seen ${relativeTime(agent.last_seen)}"></span>${forget}</span></div>`;
+    const profile = agent.runtimeProfile;
+    const runtime = profile
+      ? `<small class="runtime-profile">${escapeHtml(profile.currentModel || "unknown model")} · ${escapeHtml(profile.currentEffort || "unknown effort")} · ${escapeHtml(profile.source)}${profile.stale ? " · expired" : ""}</small>`
+      : `<small class="runtime-profile unknown">Runtime not advertised</small>`;
+    return `<div class="agent"><div class="avatar">${initials(agent.name)}</div><div class="agent-info"><strong>${escapeHtml(agent.name)}${unread}</strong><small>${escapeHtml(agent.provider)} · ${escapeHtml(agent.status)}</small>${runtime}<small class="activity">${escapeHtml(activityLine(agent))}</small></div><span class="agent-actions"><span class="agent-status ${agent.status} ${freshness(agent.last_seen)}" title="${escapeHtml(agent.status)} · seen ${relativeTime(agent.last_seen)}"></span>${forget}</span></div>`;
   }).join("") || `<p class="hint">No agents connected. Copy the MCP setup, then invoke <code>$devteam</code> in an AI desktop.</p>`;
   renderReconnectList();
 }
@@ -627,6 +639,24 @@ document.addEventListener("click", async (event) => {
     form.elements.nextAction.focus();
     return;
   }
+  const runtimeButton = event.target.closest("[data-runtime-assignment]");
+  if (runtimeButton) {
+    const assignment = state?.selectedTask?.assignments.find((item) => item.id === runtimeButton.dataset.runtimeAssignment);
+    if (!assignment?.assessment) return;
+    const form = $("#runtime-form");
+    form.reset();
+    form.elements.assignmentId.value = assignment.id;
+    form.elements.assessmentId.value = assignment.assessment.id;
+    form.dataset.exceptional = String(Boolean(assignment.assessment.requirements.humanApprovalRequired));
+    $("#runtime-assignment-summary").textContent = `${assignment.title}: ${assignment.assessment.level} (${assignment.assessment.score}) requires ${assignment.assessment.requirements.modelClass} / ${assignment.assessment.requirements.effortClass}.`;
+    $("#runtime-reasons").innerHTML = assignment.assessment.reasons.map((reason) => `<p><strong>+${Number(reason.points)}</strong> ${escapeHtml(reason.detail)}</p>`).join("") || "<p>Baseline scoped work.</p>";
+    $("#runtime-exceptional-confirm").classList.toggle("hidden", !assignment.assessment.requirements.humanApprovalRequired);
+    const agents = state.agents.filter((agent) => agent.status !== "disconnected" && agent.runtimeProfile);
+    $("#runtime-agent").innerHTML = agents.map((agent) => `<option value="${agent.id}">${escapeHtml(agent.name)} · ${escapeHtml(agent.runtimeProfile.currentModel || "unknown")}</option>`).join("");
+    populateRuntimeOptions();
+    $("#runtime-dialog").showModal();
+    return;
+  }
   const cancelCheckpointButton = event.target.closest("[data-cancel-checkpoint]");
   if (cancelCheckpointButton) {
     if (!selectedTaskId || !confirm("Cancel this unused session handoff?\n\nThe old session keeps its assignment claim, and the one-time handoff token will stop working immediately.")) return;
@@ -677,6 +707,61 @@ $("#project-form").addEventListener("submit", async (event) => {
 });
 
 const checkpointLines = (value) => String(value || "").split("\n").map((line) => line.trim()).filter(Boolean);
+
+function selectedRuntimeAgent() {
+  return state?.agents.find((agent) => agent.id === $("#runtime-agent").value) || null;
+}
+
+function populateRuntimeOptions(requestedModel = null) {
+  const profile = selectedRuntimeAgent()?.runtimeProfile;
+  const models = profile?.availableModels || [];
+  const selectedModel = models.some((model) => model.id === requestedModel) ? requestedModel : profile?.currentModel;
+  $("#runtime-model").innerHTML = models.map((model) => `<option value="${escapeHtml(model.id)}" ${model.id === selectedModel ? "selected" : ""}>${escapeHtml(model.label)} · ${escapeHtml(model.class)}</option>`).join("") || '<option value="">No advertised models</option>';
+  const model = models.find((item) => item.id === selectedModel) || models[0];
+  $("#runtime-effort").innerHTML = (model?.efforts || []).map((effort) => `<option value="${escapeHtml(effort.id)}" ${effort.id === profile?.currentEffort ? "selected" : ""}>${escapeHtml(effort.label)} · ${escapeHtml(effort.class)}</option>`).join("") || '<option value="">No advertised efforts</option>';
+}
+
+$("#runtime-agent").addEventListener("change", populateRuntimeOptions);
+$("#runtime-model").addEventListener("change", (event) => populateRuntimeOptions(event.target.value));
+$("#runtime-form").addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-runtime-choice]");
+  if (!button) return;
+  const form = event.currentTarget;
+  const choice = button.dataset.runtimeChoice;
+  const values = Object.fromEntries(new FormData(form));
+  if (!values.agentId) { toast("Choose an agent with an advertised runtime profile"); return; }
+  const exceptional = form.dataset.exceptional === "true";
+  if (exceptional && ["switched", "continue"].includes(choice) && values.humanApproved !== "on") { toast("Exceptional settings require explicit approval"); return; }
+  button.disabled = true;
+  try {
+    if (choice === "switched") {
+      const agent = selectedRuntimeAgent();
+      const advertised = agent.runtimeProfile.availableModels.find((model) => model.id === values.modelId);
+      const effort = advertised?.efforts.find((item) => item.id === values.effortId);
+      if (!advertised || !effort) throw new Error("Choose a host-advertised model and effort before confirming the switch.");
+      await api(`/api/agents/${values.agentId}/runtime`, { method: "PUT", body: JSON.stringify({ profile: {
+        ...agent.runtimeProfile,
+        currentModel: advertised.id,
+        currentEffort: effort.id,
+        currentModelClass: advertised.class,
+        currentEffortClass: effort.class,
+        observedAt: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+      } }) });
+    }
+    await api(`/api/assignments/${values.assignmentId}/runtime-decisions`, { method: "POST", body: JSON.stringify({
+      agentId: values.agentId,
+      assessmentId: values.assessmentId,
+      choice,
+      reason: values.reason,
+      humanApproved: values.humanApproved === "on",
+    }) });
+    $("#runtime-dialog").close();
+    await refresh();
+    toast(`Runtime decision recorded: ${choice}`);
+  } catch (error) { toast(error.message); }
+  finally { button.disabled = false; }
+});
 
 $("#checkpoint-form").addEventListener("submit", async (event) => {
   event.preventDefault();

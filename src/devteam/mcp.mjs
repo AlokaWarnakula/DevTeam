@@ -65,10 +65,11 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
       name: z.string().min(1).max(80).describe("Agent display name, for example Codex or Claude"),
       provider: z.string().min(1).max(80).describe("Provider or host, for example OpenAI Codex Desktop or Anthropic Claude Desktop"),
       capabilities: z.array(z.string().max(80)).max(20).default([]).describe("Useful specialties such as implementation, review, security, or testing"),
+      runtimeProfile: z.any().optional().describe("Provider-neutral host/runtime profile. Report only host-, adapter-, or user-supplied model and effort options; never invent availability."),
       taskId: z.string().uuid().optional().describe("Task room to join on connect. Required to disambiguate a server hosting more than one task."),
     },
-  }, safe(async ({ name, provider, capabilities, taskId }) => {
-    const agent = store.connectAgent({ name, provider, capabilities });
+  }, safe(async ({ name, provider, capabilities, runtimeProfile, taskId }) => {
+    const agent = store.connectAgent({ name, provider, capabilities, runtimeProfile });
     session.agentId = agent.id;
     let room = null;
     if (taskId) {
@@ -157,6 +158,13 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
       }
       const assignment = store.claimNextAssignment(agentId);
       if (assignment) {
+        if (assignment.runtimeActionRequired) {
+          return {
+            ...assignment,
+            keepWaiting: true,
+            next: "No lease was acquired. Ask the user to switch, continue, reassign, or cancel, then record the choice with devteam_runtime_decision. If settings changed, call devteam_runtime_update first.",
+          };
+        }
         return store.taskBrief(agentId, assignment.task_id, {
           currentAssignment: assignment,
           assignmentKey: "assignment",
@@ -207,6 +215,46 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
     store.heartbeat(agentId);
     const { pendingMessages, pendingProposals } = takeInbox(agentId);
     return store.taskBrief(agentId, taskId, { pendingMessages, pendingProposals });
+  }));
+
+  server.registerTool("devteam_runtime_update", {
+    title: "Update this session's runtime profile",
+    description: "Refresh provider-neutral current/available model and effort capabilities for this exact agent session. Use only host-, adapter-, or explicitly user-supplied facts; unknown values must remain unknown.",
+    inputSchema: {
+      agentId: z.string().uuid(),
+      profile: z.any(),
+    },
+  }, safe(async ({ agentId, profile }) => {
+    requireIdentity(agentId);
+    return withInbox(agentId, { updated: true, runtimeProfile: store.updateRuntimeProfile({ agentId, profile }) });
+  }));
+
+  server.registerTool("devteam_assignment_assessment", {
+    title: "Read an assignment complexity assessment",
+    description: "Return the deterministic provider-neutral score, level, reasons, and normalized runtime requirements for an assignment in this task room.",
+    inputSchema: {
+      agentId: z.string().uuid(),
+      assignmentId: z.string().uuid(),
+    },
+  }, safe(async ({ agentId, assignmentId }) => {
+    requireIdentity(agentId);
+    store.heartbeat(agentId);
+    return withInbox(agentId, store.assignmentAssessment({ agentId, assignmentId }));
+  }));
+
+  server.registerTool("devteam_runtime_decision", {
+    title: "Record a runtime gate decision",
+    description: "After runtime_action_required, record switched, continue, reassign, or cancel. Exceptional settings cannot be approved by an agent; the human must approve them in the authenticated dashboard.",
+    inputSchema: {
+      agentId: z.string().uuid(),
+      assignmentId: z.string().uuid(),
+      assessmentId: z.string().uuid(),
+      choice: z.enum(["switched", "continue", "reassign", "cancel"]),
+      reason: z.string().max(1000).optional(),
+    },
+  }, safe(async ({ agentId, assignmentId, assessmentId, choice, reason }) => {
+    requireIdentity(agentId);
+    return withInbox(agentId, store.runtimeDecision({ agentId, assignmentId, assessmentId, choice, reason, actor: "agent", humanApproved: false }));
   }));
 
   server.registerTool("devteam_session_checkpoint", {

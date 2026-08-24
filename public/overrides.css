@@ -1258,3 +1258,19 @@
 .member-row:hover .row-delete,
 .member-row .row-delete:focus-visible { opacity: 1; }
 .member-row.gone:hover { opacity: 0.85; }
+
+/* Provider-neutral runtime recommendation and decision UI. */
+.complexity { margin: 8px 0; padding: 8px; border: 1px solid #273446; border-radius: 8px; display: grid; gap: 3px; background: #101720; }
+.complexity > strong { text-transform: capitalize; color: #b9d9ff; }
+.complexity > span, .complexity > small { color: var(--muted); }
+.complexity.pending { background: transparent; border-style: dashed; }
+.runtime-decision { display: block; color: #8fd3ad; margin-bottom: 6px; }
+.runtime-profile { color: #9fbce0 !important; }
+.runtime-profile.unknown { color: var(--muted) !important; }
+.runtime-dialog { width: min(700px, calc(100vw - 28px)); }
+.runtime-summary { border: 1px solid #33445d; border-radius: 9px; padding: 10px; background: #111923; }
+.runtime-reasons { max-height: 180px; overflow: auto; margin-bottom: 10px; }
+.runtime-reasons p { margin: 5px 0; color: var(--muted); }
+.runtime-reasons strong { color: #f1bf71; }
+.runtime-exceptional { border: 1px solid #8d6034; background: #261b12; border-radius: 8px; padding: 10px; }
+.runtime-actions { flex-wrap: wrap; }
