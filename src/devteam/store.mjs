@@ -18,6 +18,15 @@ import {
   normalizeRuntimeProfile,
   resolveRuntimeRequirement,
 } from "./runtime/index.mjs";
+import {
+  CHECK_ALLOWLIST_LIMIT,
+  DEFAULT_CHECK_TIMEOUT_MS,
+  matchCheckCommand,
+  normalizeCheckCommand,
+  packageScriptCommands,
+  runVerifiedCheck,
+  VERIFIED_CHECKS_PER_REPORT,
+} from "./checks.mjs";
 
 // A task in one of these states hands out no work; named once so the candidate scan and the
 // scheduler's explanation can never disagree about what "closed" means.
@@ -38,7 +47,7 @@ const fromJson = (value, fallback = null) => {
 };
 
 export class DevTeamStore extends EventEmitter {
-  constructor(dataDir, { liveness = {}, knowledge = {}, codegraph = {}, checkpoint = {} } = {}) {
+  constructor(dataDir, { liveness = {}, knowledge = {}, codegraph = {}, checkpoint = {}, checks = {} } = {}) {
     super();
     this.dataDir = path.resolve(dataDir);
     mkdirSync(this.dataDir, { recursive: true });
@@ -46,6 +55,9 @@ export class DevTeamStore extends EventEmitter {
     this.db = new DatabaseSync(this.databasePath);
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
     this.#migrate();
+    // How long DevTeam will block while verifying one reported check. The ceiling lives in
+    // checks.mjs; this is the per-install default a host may lower.
+    this.checkTimeoutMs = Number(checks.timeoutMs) || DEFAULT_CHECK_TIMEOUT_MS;
     this.knowledge = new KnowledgeVault(this.db, knowledge);
     this.knowledgeErrors = new Map();
     this.codegraph = new CodeGraph(this.db, codegraph);
@@ -290,6 +302,34 @@ export class DevTeamStore extends EventEmitter {
         expires_at TEXT NULL
       );
 
+      -- The per-project allowlist of commands DevTeam may run to verify a reported check. Empty
+      -- means verification is off for the project and every check stays agent-asserted. Rows are a
+      -- pinned snapshot, never a live read of package.json: see the note in checks.mjs.
+      CREATE TABLE IF NOT EXISTS project_check_commands (
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        argv TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (project_id, name)
+      );
+
+      -- What a report actually claimed, and what DevTeam found when it looked.
+      CREATE TABLE IF NOT EXISTS assignment_checks (
+        id TEXT PRIMARY KEY,
+        assignment_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        label TEXT NOT NULL,
+        requested_command TEXT NULL,
+        command TEXT NULL,
+        verified INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL,
+        exit_code INTEGER NULL,
+        duration_ms INTEGER NULL,
+        output TEXT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_assignment_checks ON assignment_checks(assignment_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project_id, status);
       CREATE INDEX IF NOT EXISTS idx_assignments_queue ON assignments(status, target_agent_name, created_at);
       CREATE INDEX IF NOT EXISTS idx_assignments_task_status ON assignments(task_id, status);
@@ -2821,6 +2861,127 @@ export class DevTeamStore extends EventEmitter {
     if (!invited) throw new Error("You are not a member of this task room. Call devteam_join first.");
   }
 
+  // The commands DevTeam is allowed to run for this project. This is the whole authority: an empty
+  // list means nothing is ever executed and every reported check stays visibly agent-asserted.
+  projectCheckCommands(projectId) {
+    return this.db.prepare("SELECT name, argv FROM project_check_commands WHERE project_id = ? ORDER BY name ASC")
+      .all(projectId)
+      .map((row) => ({ name: row.name, argv: fromJson(row.argv, []) }))
+      .filter((entry) => Array.isArray(entry.argv) && entry.argv.length);
+  }
+
+  // What the project's package.json offers, so a human can see what enabling verification would
+  // allow *before* enabling it. Reading this executes nothing and authorizes nothing.
+  availableCheckCommands(projectId) {
+    const project = this.db.prepare("SELECT root FROM projects WHERE id = ?").get(projectId);
+    if (!project) throw new Error("Project not found.");
+    return packageScriptCommands(project.root);
+  }
+
+  // Turn verification on (or off) for a project. Passing no commands snapshots the project's own
+  // package.json scripts; passing an explicit list stores exactly that; passing an empty list turns
+  // verification back off. Snapshotting is what keeps this safe — an agent that later edits a script
+  // body changes nothing, because the argv DevTeam runs was pinned here by a human.
+  setProjectCheckCommands({ projectId, commands = null }) {
+    const project = this.db.prepare("SELECT id, root FROM projects WHERE id = ?").get(projectId);
+    if (!project) throw new Error("Project not found.");
+    const requested = commands === null ? packageScriptCommands(project.root) : commands;
+    if (!Array.isArray(requested)) throw new Error("Check commands must be a list.");
+    const entries = [];
+    const seen = new Set();
+    for (const candidate of requested.slice(0, CHECK_ALLOWLIST_LIMIT)) {
+      const entry = normalizeCheckCommand(candidate);
+      if (!entry) throw new Error(`Unusable check command: ${JSON.stringify(candidate)?.slice(0, 120)}. A command is a name plus an argv list whose program is a bare executable name.`);
+      if (seen.has(entry.name)) continue;
+      seen.add(entry.name);
+      entries.push(entry);
+    }
+    const stamp = now();
+    this.#transaction(() => {
+      this.db.prepare("DELETE FROM project_check_commands WHERE project_id = ?").run(projectId);
+      for (const entry of entries) {
+        this.db.prepare("INSERT INTO project_check_commands (project_id, name, argv, created_at) VALUES (?, ?, ?, ?)")
+          .run(projectId, entry.name, json(entry.argv), stamp);
+      }
+    });
+    this.#changed("project.check_commands");
+    return { projectId, commands: entries, verificationEnabled: entries.length > 0 };
+  }
+
+  // What a report claimed and what DevTeam found. Every record says whether it was verified, so an
+  // unverified assertion can never be displayed as if DevTeam had confirmed it.
+  #checksFor(assignmentId) {
+    return this.db.prepare(`
+      SELECT label, requested_command, command, verified, status, exit_code, duration_ms, output, created_at
+      FROM assignment_checks WHERE assignment_id = ? ORDER BY created_at ASC, rowid ASC
+    `).all(assignmentId).map((row) => ({
+      label: row.label,
+      requestedCommand: row.requested_command,
+      command: fromJson(row.command, null),
+      verified: Boolean(row.verified),
+      status: row.status,
+      exitCode: row.exit_code,
+      durationMs: row.duration_ms,
+      output: row.output,
+      // The dashboard and the task detail payload both read this, so an unverified claim is labeled
+      // wherever it is shown rather than only where someone remembered to label it.
+      agentAsserted: !row.verified,
+      createdAt: row.created_at,
+    }));
+  }
+
+  // Normalize what an agent reported, then verify whatever it asked DevTeam to verify. A check is a
+  // plain string (an assertion, as before) or { label, command } where command *selects* an entry
+  // from the project's allowlist. The selected entry's argv is what runs; the agent's text never is.
+  #gradeReportedChecks(assignment, task, checks) {
+    const allowlist = task?.project_id ? this.projectCheckCommands(task.project_id) : [];
+    const records = [];
+    let executed = 0;
+    for (const item of Array.isArray(checks) ? checks.slice(0, 100) : []) {
+      const isObject = item && typeof item === "object" && !Array.isArray(item);
+      const requested = isObject ? String(item.command ?? "").trim() : "";
+      const label = String((isObject ? (item.label ?? item.command ?? "") : item) ?? "").trim();
+      if (!label) continue;
+      const record = { label: label.slice(0, 500), requestedCommand: requested ? requested.slice(0, 200) : null, command: null, verified: false, status: "asserted", exitCode: null, durationMs: null, output: null };
+      const entry = requested ? matchCheckCommand(allowlist, requested) : null;
+      if (requested && !entry) {
+        // The agent asked for something the human never allowlisted. Recorded plainly as
+        // unavailable: DevTeam refuses to run it *and* refuses to call it verified.
+        record.status = "unavailable";
+        record.output = allowlist.length
+          ? "No allowlisted command matches this name for the project."
+          : "Command verification is not enabled for this project.";
+      } else if (entry && executed >= VERIFIED_CHECKS_PER_REPORT) {
+        record.status = "unavailable";
+        record.output = `Only ${VERIFIED_CHECKS_PER_REPORT} commands are executed per report.`;
+      } else if (entry) {
+        executed += 1;
+        record.command = entry.argv;
+        Object.assign(record, runVerifiedCheck({
+          argv: entry.argv,
+          cwd: task.project_root,  // pinned to the project root; nothing selects a working directory
+          timeoutMs: this.checkTimeoutMs,
+        }));
+      }
+      records.push(record);
+    }
+    return records;
+  }
+
+  #storeReportedChecks(assignmentId, taskId, records, stamp) {
+    for (const record of records) {
+      this.db.prepare(`
+        INSERT INTO assignment_checks (
+          id, assignment_id, task_id, label, requested_command, command,
+          verified, status, exit_code, duration_ms, output, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        randomUUID(), assignmentId, taskId, record.label, record.requestedCommand, record.command ? json(record.command) : null,
+        record.verified ? 1 : 0, record.status, record.exitCode ?? null, record.durationMs ?? null, record.output ?? null, stamp,
+      );
+    }
+  }
+
   // Currently-held write leases (claimed write assignments owned by a live agent on a live task),
   // with their normalized path scopes, for per-path conflict resolution.
   #heldWriteLeases() {
@@ -2996,8 +3157,42 @@ export class DevTeamStore extends EventEmitter {
     const tokenMatches = claimToken == null || (assignment.claim_token_hash && this.#hashToken(claimToken) === assignment.claim_token_hash);
     if (!ownedByCaller || !tokenMatches) return this.#claimConflict(assignment, agentId);
     const cleanChanged = [...new Set(changedFiles.map((item) => String(item).trim()).filter(Boolean))].slice(0, 200);
-    const cleanChecks = checks.map((item) => String(item).trim()).filter(Boolean).slice(0, 100);
     const task = this.getTask(assignment.task_id);
+    // Anything the agent asked DevTeam to verify is run *now*, before a single row is written, so a
+    // failure cannot become a permanently green record that approvals are then built on top of.
+    const checkRecords = this.#gradeReportedChecks(assignment, task, checks);
+    const cleanChecks = checkRecords.map((record) => record.label).slice(0, 100);
+    const failedChecks = checkRecords.filter((record) => record.status === "failed");
+    // A verified failure cannot be reported as done. The claim is deliberately left intact: the
+    // agent fixes the work and reports again rather than losing its lease over a caught overclaim.
+    // status=blocked is still allowed through — reporting a genuine failure is the honest path.
+    if (status !== "blocked" && failedChecks.length) {
+      const stamp = now();
+      this.#transaction(() => {
+        this.#storeReportedChecks(assignmentId, assignment.task_id, checkRecords, stamp);
+        this.#event(assignment.task_id, agentId, "assignment.check_failed",
+          `${agent.name} reported “${assignment.title}” as done, but ${failedChecks.length === 1 ? "a check" : `${failedChecks.length} checks`} DevTeam ran failed.`, {
+            assignmentId,
+            role: assignment.role,
+            checks: cleanChecks,
+            checkRecords,
+          });
+      });
+      this.#changed("assignment.check_failed", assignment.task_id);
+      return {
+        completed: false,
+        checksFailed: {
+          assignmentId,
+          taskId: assignment.task_id,
+          failed: failedChecks.map((record) => ({
+            label: record.label, command: record.command, exitCode: record.exitCode,
+            durationMs: record.durationMs, timedOut: Boolean(record.timedOut), output: record.output,
+          })),
+          reason: "DevTeam ran the commands you reported and they did not pass, so this cannot be recorded as done. Fix the work and report again, or report status=blocked with what you found.",
+        },
+        checks: checkRecords,
+      };
+    }
     const unverifiedFiles = this.#unverifiedChangedFiles(task?.project_root, cleanChanged);
     this.markMessagesSeen(agentId);
     let version;
@@ -3014,11 +3209,15 @@ export class DevTeamStore extends EventEmitter {
         this.db.prepare("UPDATE tasks SET updated_at = ? WHERE id = ?").run(stamp, assignment.task_id);
       }
       version = this.db.prepare("SELECT version FROM tasks WHERE id = ?").get(assignment.task_id).version;
+      this.#storeReportedChecks(assignmentId, assignment.task_id, checkRecords, stamp);
       this.#event(assignment.task_id, agentId, status === "blocked" ? "assignment.blocked" : "assignment.completed", message.trim(), {
         assignmentId,
         role: assignment.role,
         changedFiles: cleanChanged,
         checks: cleanChecks,
+        // The structured form says which of those lines DevTeam actually ran. Consumers that only
+        // understand the strings keep working; consumers that can tell the difference now can.
+        checkRecords,
         version,
         ...(unverifiedFiles.length ? { unverifiedFiles } : {}),
       });
@@ -3061,7 +3260,8 @@ export class DevTeamStore extends EventEmitter {
       status,
       version,
       changedFiles: cleanChanged,
-      checks: cleanChecks,
+      checks: checkRecords,
+      verifiedChecks: checkRecords.filter((record) => record.verified).length,
       agent: agent.name,
       ...(status === "blocked" ? { taskBlocked: false, followUpAssignmentId } : {}),
     };
@@ -3500,6 +3700,7 @@ export class DevTeamStore extends EventEmitter {
         writeScope: assignment.requires_write ? this.#writeScopeFor(assignment.id) : [],
         dependsOn: dependencies.map((item) => item.id),
         blockedBy: dependencies.filter((item) => item.status !== "done"),
+        checks: this.#checksFor(assignment.id),
         schedulingHold: this.#schedulingHold(assignment),
         assessment,
         runtimeDecision,

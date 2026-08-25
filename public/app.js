@@ -241,6 +241,21 @@ function eventAuthorName(event) {
   return event.agent_name || event.author_name || "Agent";
 }
 
+// A check DevTeam ran and a check an agent merely claimed must never look alike. Reports written
+// before verification existed carry only strings, and stay labeled as the assertions they were.
+function checkLabel(record) {
+  if (record.status === "passed") return `check ✓ ${record.label} · verified (exit 0${record.durationMs != null ? `, ${Math.round(record.durationMs / 100) / 10}s` : ""})`;
+  if (record.status === "failed") return `check ✕ ${record.label} · verified failure${record.exitCode != null ? ` (exit ${record.exitCode})` : ""}`;
+  if (record.status === "unavailable") return `check ? ${record.label} · not run`;
+  return `check: ${record.label} · agent-asserted`;
+}
+
+function checkChips(metadata) {
+  const records = metadata.checkRecords;
+  if (Array.isArray(records) && records.length) return records.map(checkLabel);
+  return (metadata.checks || []).map((check) => `check: ${check} · agent-asserted`);
+}
+
 function renderEvent(event) {
   if (event.type === "proposal.vote") return "";
   if (SYSTEM_EVENTS.includes(event.type)) {
@@ -252,7 +267,7 @@ function renderEvent(event) {
   const kind = KIND_LABELS[event.type];
   const meta = [
     ...(event.metadata.changedFiles || []).map((file) => `changed: ${file}`),
-    ...(event.metadata.checks || []).map((check) => `check: ${check}`),
+    ...checkChips(event.metadata),
     event.metadata.role ? `role: ${event.metadata.role}` : null,
   ].filter(Boolean);
   const badge = kind ? `<span class="kind-badge ${kind}">${escapeHtml(kind)}</span>` : "";
@@ -383,6 +398,9 @@ function renderTask(task) {
       : "";
     // A queued item nobody is picking up used to look identical to one about to be claimed. The
     // scheduler now says why, so a stall is visible on the card instead of only in a log.
+    const checks = item.checks?.length
+      ? `<div class="reported-checks">${item.checks.map((record) => `<span class="check-chip ${record.status}" title="${escapeHtml(record.output || "")}">${escapeHtml(checkLabel(record))}</span>`).join("")}</div>`
+      : "";
     const hold = item.schedulingHold
       ? `<div class="scheduling-hold"><strong>Held back</strong><span>${escapeHtml(item.schedulingHold.detail)}</span></div>`
       : "";
@@ -394,7 +412,7 @@ function renderTask(task) {
     const runtime = item.status === "queued" && assessment
       ? `<button class="mini runtime" data-runtime-assignment="${item.id}" title="Review the provider-neutral runtime recommendation">Runtime settings</button>`
       : "";
-    return `<div class="assignment"><div class="assignment-top"><strong>${escapeHtml(item.title)}</strong><span class="role">${escapeHtml(item.role)}</span></div><p>${escapeHtml(item.agent_name ? `${item.agent_name} · ${item.status}` : item.status)}${item.requires_write ? " · write lease" : ""}</p>${assessmentView}${runtimeDecision}${hold}${blockedBy}${scope}${checklist}<div class="assignment-actions">${runtime}${checkpoint}${release}</div></div>`;
+    return `<div class="assignment"><div class="assignment-top"><strong>${escapeHtml(item.title)}</strong><span class="role">${escapeHtml(item.role)}</span></div><p>${escapeHtml(item.agent_name ? `${item.agent_name} · ${item.status}` : item.status)}${item.requires_write ? " · write lease" : ""}</p>${assessmentView}${runtimeDecision}${hold}${blockedBy}${checks}${scope}${checklist}<div class="assignment-actions">${runtime}${checkpoint}${release}</div></div>`;
   }).join("") || `<p class="hint">Waiting for the plan</p>`;
   renderSessionCheckpoints(task);
   renderBlackboard(task);

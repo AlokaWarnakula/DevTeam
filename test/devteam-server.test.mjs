@@ -671,3 +671,37 @@ test("the scheduler explains a held assignment over REST and over MCP", async (t
   assert.equal(single.claimable, false);
   assert.match(single.reasons.find((reason) => reason.code === "awaiting_writer").detail, /Ship the feature/);
 });
+
+test("the check-command allowlist is a credentialed human decision, not an agent-reachable one", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-checks-server-"));
+  const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd(), knowledge: { enabled: false } });
+  t.after(async () => { await instance.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const authed = { "content-type": "application/json", authorization: `Bearer ${instance.store.token}` };
+  const project = instance.store.ensureProject("Checks REST", process.cwd());
+
+  // Reading the allowlist discloses what this host is willing to run, so it needs the credential.
+  assert.equal((await fetch(`${instance.url}/api/projects/${project.id}/check-commands`)).status, 401);
+  const anonymousWrite = await fetch(`${instance.url}/api/projects/${project.id}/check-commands`, {
+    method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ commands: [{ name: "x", argv: ["node", "-v"] }] }),
+  });
+  assert.equal(anonymousWrite.status, 401, "nothing becomes executable without the dashboard session or bearer token");
+
+  const before = await fetch(`${instance.url}/api/projects/${project.id}/check-commands`, { headers: authed }).then((response) => response.json());
+  assert.equal(before.verificationEnabled, false, "a project verifies nothing until a human enables it");
+  assert.ok(before.available.some((entry) => entry.name === "test"), "the human is shown what enabling would allow");
+
+  // Omitting commands snapshots this project's own package.json scripts.
+  const enabled = await fetch(`${instance.url}/api/projects/${project.id}/check-commands`, {
+    method: "PUT", headers: authed, body: JSON.stringify({}),
+  }).then((response) => response.json());
+  assert.equal(enabled.verificationEnabled, true);
+  assert.deepEqual(enabled.commands.find((entry) => entry.name === "test").argv, ["node", "--test"]);
+
+  // An entry that would need a shell, or that points at a path, is refused where the human can see it.
+  const refused = await fetch(`${instance.url}/api/projects/${project.id}/check-commands`, {
+    method: "PUT", headers: authed, body: JSON.stringify({ commands: [{ name: "evil", argv: ["../../bin/sh", "-c", "echo"] }] }),
+  });
+  assert.equal(refused.status >= 400, true, "a path-qualified program is not accepted into the allowlist");
+  const still = await fetch(`${instance.url}/api/projects/${project.id}/check-commands`, { headers: authed }).then((response) => response.json());
+  assert.equal(still.commands.some((entry) => entry.name === "evil"), false, "and the refusal leaves the stored list untouched");
+});

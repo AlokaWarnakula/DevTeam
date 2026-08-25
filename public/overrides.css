@@ -1022,6 +1022,28 @@
   text-transform: uppercase;
 }
 
+/* Reported checks. A verified pass and an agent's word for it must not read alike. */
+.reported-checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 7px;
+}
+
+.check-chip {
+  padding: 2px 6px;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--fg, #cbd5e1) 8%, transparent);
+  color: #9ca6b3;
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.check-chip.passed { background: color-mix(in srgb, var(--green, #34d399) 14%, transparent); color: var(--green, #34d399); }
+.check-chip.failed { background: color-mix(in srgb, var(--red, #f87171) 14%, transparent); color: var(--red, #f87171); }
+.check-chip.unavailable { font-style: italic; }
+.check-chip.asserted { border: 1px dashed color-mix(in srgb, var(--amber) 40%, transparent); }
+
 /* Why a queued item is not moving: the scheduler's own reason, on the card. */
 .scheduling-hold {
   display: grid;
