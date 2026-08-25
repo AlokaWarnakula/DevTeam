@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 
 export const RUNTIME_SCHEMA_VERSION = 1;
-export const COMPLEXITY_POLICY_VERSION = 1;
+export const COMPLEXITY_POLICY_VERSION = 2;
 
 export const MODEL_CLASSES = ["economy", "balanced", "strong", "frontier", "specialized", "unknown"];
 export const EFFORT_CLASSES = ["light", "medium", "high", "extra_high", "maximum", "unknown"];
@@ -101,10 +101,27 @@ export function runtimeProfileState(profile, at = Date.now()) {
 }
 
 const contains = (text, expression) => expression.test(text);
-const addReason = (state, points, code, detail) => {
+const addReason = (state, points, code, detail, source = "assignment") => {
   state.score += points;
-  state.reasons.push({ code, points, detail });
+  state.reasons.push({ code, points, detail, source });
 };
+
+const TEXT_SIGNALS = [
+  [5, "security_scope", "Authentication, authorization, secrets, or cryptography are in scope.", /\b(auth(?:entication|orization)?|permission|secret|cryptograph|credential|csrf|origin|token)\b/],
+  [5, "migration_risk", "Database/schema migration or destructive-data risk is in scope.", /\b(database|schema|migration|rollback|destructive|data loss)\b/],
+  [4, "concurrency_recovery", "Concurrency, distributed state, leases, or recovery behavior is in scope.", /\b(concurren|distributed|atomic|lease|fencing|race condition|takeover|recovery)\b/],
+  [3, "architecture_breadth", "Cross-project or architecture-wide behavior is in scope.", /\b(architecture-wide|cross-project|cross project|system-wide|system wide)\b/],
+];
+
+function scoreTextSignals(state, text, source, cap = Number.POSITIVE_INFINITY) {
+  let awarded = 0;
+  for (const [points, code, detail, expression] of TEXT_SIGNALS) {
+    if (!contains(text, expression) || awarded >= cap) continue;
+    const applied = Math.min(points, cap - awarded);
+    addReason(state, applied, code, source === "task" ? `Task context: ${detail}` : detail, source);
+    awarded += applied;
+  }
+}
 
 export function assignmentEvidence(input) {
   const evidence = {
@@ -127,16 +144,17 @@ export function assignmentEvidence(input) {
 export function assessAssignment(input) {
   const { evidence, hash } = assignmentEvidence(input);
   const state = { score: 0, reasons: [] };
-  const text = `${evidence.title}\n${evidence.description}\n${evidence.taskTitle}\n${evidence.taskDescription}`.toLowerCase();
+  const assignmentText = [evidence.title, evidence.description, evidence.role, ...evidence.checklist, ...evidence.paths].join("\n").toLowerCase();
+  const taskText = `${evidence.taskTitle}\n${evidence.taskDescription}`.toLowerCase();
   const distinctRoots = new Set(evidence.paths.map((item) => item.replace(/\\/g, "/").split("/")[0])).size;
   if (evidence.paths.length >= 2) addReason(state, 1, "multi_path", `${evidence.paths.length} declared paths.`);
   if (evidence.paths.length >= 6 || distinctRoots >= 3) addReason(state, 2, "broad_scope", `Work spans ${evidence.paths.length} paths across ${distinctRoots} roots.`);
   if (["reviewer", "tester"].includes(evidence.role)) addReason(state, 1, "verification_role", `${evidence.role} work requires independent evidence.`);
   if (evidence.role === "security-reviewer") addReason(state, 5, "security_role", "Security review requires critical-risk capability.");
-  if (contains(text, /\b(auth(?:entication|orization)?|permission|secret|cryptograph|credential|csrf|origin|token)\b/)) addReason(state, 5, "security_scope", "Authentication, authorization, secrets, or cryptography are in scope.");
-  if (contains(text, /\b(database|schema|migration|rollback|destructive|data loss)\b/)) addReason(state, 5, "migration_risk", "Database/schema migration or destructive-data risk is in scope.");
-  if (contains(text, /\b(concurren|distributed|atomic|lease|fencing|race condition|takeover|recovery)\b/)) addReason(state, 4, "concurrency_recovery", "Concurrency, distributed state, leases, or recovery behavior is in scope.");
-  if (contains(text, /\b(architecture-wide|cross-project|cross project|system-wide|system wide)\b/)) addReason(state, 3, "architecture_breadth", "Cross-project or architecture-wide behavior is in scope.");
+  scoreTextSignals(state, assignmentText, "assignment");
+  // Task context still matters, but it must not promote every small assignment merely because the
+  // parent task mentions several risky subsystems. Its total contribution is deliberately capped.
+  scoreTextSignals(state, taskText, "task", 2);
   if (evidence.checklist.length >= 6) addReason(state, evidence.checklist.length >= 12 ? 2 : 1, "deep_checklist", `${evidence.checklist.length} verification points are required.`);
   if (evidence.dependencyDepth >= 2) addReason(state, Math.min(3, evidence.dependencyDepth - 1), "dependency_depth", `Dependency depth is ${evidence.dependencyDepth}.`);
   if (evidence.priorFailures > 0) addReason(state, Math.min(8, evidence.priorFailures * 3), "prior_failures", `${evidence.priorFailures} prior blocked or failed attempts were recorded.`);
@@ -149,7 +167,7 @@ export function assessAssignment(input) {
   let level = score >= 16 ? "exceptional" : score >= 12 ? "recovery" : score >= 8 ? "critical" : score >= 4 ? "difficult" : "base";
   if (["base", "difficult", "critical", "recovery", "exceptional"].includes(overrideLevel)) {
     level = overrideLevel;
-    state.reasons.push({ code: "human_override", points: 0, detail: `A human set the level to ${level}.` });
+    state.reasons.push({ code: "human_override", points: 0, detail: `A human set the level to ${level}.`, source: "assignment" });
   }
   const requirements = {
     base: { modelClass: "balanced", effortClass: "medium", humanApprovalRequired: false },
@@ -167,9 +185,16 @@ const effortSatisfies = (actual, required) => (EFFORT_RANK.get(actual) ?? -1) >=
 export function resolveRuntimeRequirement(requirement, profile) {
   const profileState = runtimeProfileState(profile);
   if (!profileState.usable) return { satisfied: false, confirmationRequired: true, reason: profileState.reason, current: null, recommendation: null };
+  // Carry the advertised display names alongside the ids so a caller can say "Sonnet 5 (balanced)"
+  // instead of a bare capability class. A label is echoed only when the profile actually advertises
+  // that exact model/effort; anything unadvertised stays null rather than being guessed at.
+  const advertisedModel = profile.availableModels.find((model) => model.id === profile.currentModel);
+  const advertisedEffort = advertisedModel?.efforts.find((effort) => effort.id === profile.currentEffort);
   const current = {
     modelId: profile.currentModel,
+    modelLabel: advertisedModel?.label || null,
     effortId: profile.currentEffort,
+    effortLabel: advertisedEffort?.label || null,
     modelClass: profile.currentModelClass,
     effortClass: profile.currentEffortClass,
   };

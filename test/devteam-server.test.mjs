@@ -139,6 +139,57 @@ test("an unscoped MCP agent on a multi-task server receives room choices instead
   assert.equal(assigned.structuredContent.assignment.task_id, first.id);
 });
 
+test("an already-delivered runtime recommendation does not hot-loop subsequent MCP waits", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-runtime-wait-"));
+  const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd(), knowledge: { enabled: false } });
+  t.after(async () => { await instance.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const state = await fetch(`${instance.url}/api/state`).then((response) => response.json());
+  const task = await fetch(`${instance.url}/api/tasks`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${instance.store.token}`, "content-type": "application/json" },
+    body: JSON.stringify({ projectId: state.projects[0].id, title: "Runtime wait", description: "Avoid repeated wakeups." }),
+  }).then((response) => response.json());
+  const transport = new StreamableHTTPClientTransport(new URL(instance.mcpUrl), {
+    requestInit: { headers: { Authorization: `Bearer ${instance.store.token}` } },
+  });
+  const client = new Client({ name: "devteam-runtime-wait-test", version: "1.0.0" });
+  await client.connect(transport);
+  t.after(() => client.close());
+  const runtimeProfile = {
+    providerId: "fixture-provider",
+    currentModel: "fixture-balanced",
+    currentEffort: "fixture-medium",
+    availableModels: [
+      { id: "fixture-balanced", class: "balanced", efforts: [{ id: "fixture-medium", class: "medium" }] },
+      { id: "fixture-frontier", class: "frontier", efforts: [{ id: "fixture-high", class: "high" }] },
+    ],
+    switchMode: "user_required",
+    source: "host",
+    observedAt: new Date().toISOString(),
+  };
+  const connected = await client.callTool({ name: "devteam_connect", arguments: { name: "Runtime worker", provider: "test" } });
+  const agentId = connected.structuredContent.agent.id;
+  const planner = instance.store.claimNextAssignment(agentId);
+  assert.ok(planner?.id, "the fixture planner assignment is claimable");
+  instance.store.completeAssignment({ agentId, assignmentId: planner.id, claimToken: planner.claimToken, message: "Planned." });
+  instance.store.updateRuntimeProfile({ agentId, profile: runtimeProfile });
+  instance.store.continueCurrentSession({ agentId, taskId: task.id });
+  instance.store.createAssignment({
+    taskId: task.id,
+    title: "Secure migration",
+    description: "Implement authentication tokens and a database schema migration.",
+    role: "implementer",
+  });
+
+  const firstGate = await client.callTool({ name: "devteam_wait", arguments: { agentId, timeoutSeconds: 1 } });
+  assert.equal(firstGate.structuredContent.status, "runtime_action_required", "the recommendation is surfaced once");
+  const started = Date.now();
+  const repeatedWait = await client.callTool({ name: "devteam_wait", arguments: { agentId, timeoutSeconds: 1 } });
+  const elapsed = Date.now() - started;
+  assert.equal(repeatedWait.structuredContent.status, "idle", "an undecided recommendation is not returned again");
+  assert.ok(elapsed >= 850, `the second wait should block near its timeout instead of hot-looping (${elapsed} ms)`);
+});
+
 test("MCP assignment dependencies sequence work and devteam_brief stays compact", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-dependency-mcp-"));
   const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd(), knowledge: { enabled: false } });
@@ -500,4 +551,78 @@ test("dashboard can resume blocked work and records human acceptance without for
   assert.equal(detail.status, "accepted");
   assert.equal(event.metadata.humanOverride, true);
   assert.match(event.message, /Human accepted/);
+});
+
+test("the runtime profile control plane persists human-entered models and stays authenticated", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-runtime-rest-"));
+  const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd(), knowledge: { enabled: false } });
+  t.after(async () => { await instance.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const authed = { "content-type": "application/json", authorization: `Bearer ${instance.store.token}` };
+
+  const project = instance.store.ensureProject("Runtime REST", process.cwd());
+  const task = instance.store.createTask({ projectId: project.id, title: "Runtime REST", description: "Exercise the profile surface." });
+  const profile = {
+    providerId: "fixture-provider",
+    currentModel: "fixture-balanced",
+    currentEffort: "fixture-medium",
+    availableModels: [{
+      id: "fixture-balanced",
+      label: "Fixture Balanced 5",
+      class: "balanced",
+      efforts: [{ id: "fixture-medium", label: "Medium", class: "medium" }],
+    }],
+  };
+
+  // A state-changing profile call without a credential must be refused.
+  const anonymous = await fetch(`${instance.url}/api/tasks/${task.id}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ baseRuntimeProfile: profile }),
+  });
+  assert.equal(anonymous.status, 401, "the base profile cannot be set without the dashboard session or bearer token");
+
+  const patched = await fetch(`${instance.url}/api/tasks/${task.id}`, {
+    method: "PATCH", headers: authed, body: JSON.stringify({ baseRuntimeProfile: profile }),
+  });
+  assert.equal(patched.status, 200);
+  const state = await fetch(`${instance.url}/api/state?taskId=${task.id}`).then((response) => response.json());
+  const base = state.selectedTask.baseRuntimeProfile;
+  assert.equal(base.source, "user", "a human-entered profile is stored as a user claim, never as a host observation");
+  assert.equal(base.currentModelClass, "balanced");
+  assert.equal(base.availableModels[0].label, "Fixture Balanced 5", "the display name the human typed survives the round trip");
+
+  const agent = instance.store.connectAgent({ name: "RestAgent", provider: "fixture" });
+  const put = await fetch(`${instance.url}/api/agents/${agent.id}/runtime`, {
+    method: "PUT", headers: authed, body: JSON.stringify({ profile }),
+  });
+  assert.equal(put.status, 200);
+  const stored = await put.json();
+  assert.equal(stored.runtimeProfile.source, "user");
+  assert.equal(stored.runtimeProfile.currentModel, "fixture-balanced");
+  // The profile read-back is itself credentialed, so a page without the dashboard session cannot
+  // enumerate which models a session advertises.
+  const anonymousRead = await fetch(`${instance.url}/api/agents/${agent.id}/runtime`);
+  assert.equal(anonymousRead.status, 401, "reading an agent's advertised models requires a credential");
+  const readBack = await fetch(`${instance.url}/api/agents/${agent.id}/runtime`, { headers: authed }).then((response) => response.json());
+  assert.equal(readBack.runtimeProfile.availableModels[0].label, "Fixture Balanced 5");
+
+  // A value that claims to be a full profile but cannot normalize is refused rather than stored.
+  const rejected = await fetch(`${instance.url}/api/tasks/${task.id}`, {
+    method: "PATCH", headers: authed, body: JSON.stringify({ baseRuntimeProfile: { providerId: "", availableModels: [] } }),
+  });
+  assert.equal(rejected.status >= 400, true, "an unusable profile is refused where the human can still fix it");
+});
+
+test("the dashboard renders advertised model names and states plainly when gating is inactive", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-runtime-ui-"));
+  const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd(), knowledge: { enabled: false } });
+  t.after(async () => { await instance.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const script = await fetch(`${instance.url}/app.js`).then((response) => response.text());
+  const markup = await fetch(`${instance.url}`).then((response) => response.text());
+  // The human asked to stop reading bare capability classes: a name must be paired with its class.
+  assert.match(script, /modelLabel\}\s*\(\$\{[^}]*modelClass\}\)/, "the model name is rendered with its class, not the class alone");
+  assert.match(script, /effortLabel/, "the effort is rendered by its advertised label");
+  assert.match(script, /Model gating inactive/, "an unprofiled agent is told gating is off rather than shown a guess");
+  assert.match(script, /runtimeProfileSource/, "the dashboard distinguishes an agent profile from the task's standing one");
+  assert.match(markup, /runtime-dialog/, "the runtime decision dialog still ships");
 });

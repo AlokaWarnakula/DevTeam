@@ -995,6 +995,66 @@ test("the author of a version cannot approve it when a teammate could review ins
   assert.equal(outcome.selfReviewed, false, "and it is not labeled self-reviewed");
 });
 
+test("a disconnected historical teammate cannot dead-end the remaining solo author", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-now-solo-"));
+  const store = new DevTeamStore(dataDir);
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Now-solo project", process.cwd());
+  const task = store.createTask({ projectId: project.id, title: "Finish after teammate leaves", description: "Current availability controls approvals.", requiredApprovals: 2 });
+  const former = store.connectAgent({ name: "Former teammate", provider: "test" });
+  const solo = store.connectAgent({ name: "Remaining author", provider: "test" });
+  const plan = store.claimNextAssignment(former.id);
+  store.createAssignment({ agentId: former.id, taskId: task.id, title: "Build", description: "Implement it.", role: "implementer", requiresWrite: true, targetAgentName: solo.name });
+  store.createAssignment({ agentId: former.id, taskId: task.id, title: "Review", description: "Review the current version.", role: "reviewer", targetAgentName: solo.name });
+  store.completeAssignment({ agentId: former.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+  store.disconnectAgent(former.id, "Left the task.");
+
+  const build = store.claimNextAssignment(solo.id);
+  store.completeAssignment({ agentId: solo.id, assignmentId: build.id, claimToken: build.claimToken, message: "Built.", changedFiles: ["package.json"] });
+  const review = store.claimNextAssignment(solo.id);
+  store.completeAssignment({ agentId: solo.id, assignmentId: review.id, claimToken: review.claimToken, message: "Self-reviewed." });
+  const outcome = store.approveTask({ agentId: solo.id, taskId: task.id, summary: "No independent teammate remains connected." });
+  assert.equal(outcome.accepted, true);
+  assert.equal(outcome.requiredApprovals, 1);
+  assert.equal(outcome.selfReviewed, true);
+});
+
+test("checkpoint successors share one approval lineage and cannot manufacture consensus", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-lineage-"));
+  const store = new DevTeamStore(dataDir);
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Lineage project", process.cwd());
+  const task = store.createTask({ projectId: project.id, title: "Rotate one session", description: "A fresh session is not a fresh reviewer.", requiredApprovals: 2 });
+  const oldSession = store.connectAgent({ name: "Rotating agent", provider: "test" });
+  const plan = store.claimNextAssignment(oldSession.id);
+  store.createAssignment({ agentId: oldSession.id, taskId: task.id, title: "Build", description: "Implement it.", role: "implementer", requiresWrite: true, targetAgentName: oldSession.name });
+  store.createAssignment({ agentId: oldSession.id, taskId: task.id, title: "First review", description: "Review before rotation.", role: "reviewer", targetAgentName: oldSession.name });
+  store.createAssignment({ agentId: oldSession.id, taskId: task.id, title: "Fresh-session review", description: "Review after rotation.", role: "reviewer", targetAgentName: "Fresh rotating agent" });
+  store.completeAssignment({ agentId: oldSession.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+  const build = store.claimNextAssignment(oldSession.id);
+  store.completeAssignment({ agentId: oldSession.id, assignmentId: build.id, claimToken: build.claimToken, message: "Built.", changedFiles: ["package.json"] });
+  const firstReview = store.claimNextAssignment(oldSession.id);
+  store.completeAssignment({ agentId: oldSession.id, assignmentId: firstReview.id, claimToken: firstReview.claimToken, message: "Reviewed before rotation." });
+  const beforeRotation = store.approveTask({ agentId: oldSession.id, taskId: task.id, summary: "Self-review before rotating." });
+  assert.equal(beforeRotation.accepted, false, "the queued successor review keeps the task open");
+
+  const checkpoint = store.createSessionCheckpoint({ agentId: oldSession.id, taskId: task.id, nextAction: "Complete the queued review." });
+  const freshSession = store.connectAgent({ name: "Fresh rotating agent", provider: "test" });
+  store.takeoverSessionCheckpoint({
+    agentId: freshSession.id,
+    taskId: task.id,
+    checkpointId: checkpoint.checkpoint.id,
+    handoffToken: checkpoint.handoffToken,
+  });
+  const freshReview = store.claimNextAssignment(freshSession.id);
+  store.completeAssignment({ agentId: freshSession.id, assignmentId: freshReview.id, claimToken: freshReview.claimToken, message: "Reviewed after rotation." });
+  const outcome = store.approveTask({ agentId: freshSession.id, taskId: task.id, summary: "Same participant, fresh session." });
+  assert.equal(outcome.accepted, true);
+  assert.equal(outcome.approvalCount, 1, "predecessor and successor approvals collapse to one lineage");
+  assert.equal(outcome.requiredApprovals, 1);
+  assert.equal(outcome.selfReviewed, true, "the acceptance is not mislabeled as independent consensus");
+});
+
 test("a solo acceptance is labeled selfReviewed; changed files that aren't on disk are flagged", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-selfreview-"));
   const store = new DevTeamStore(dataDir);
@@ -1373,6 +1433,7 @@ test("continueTask during review advances the version and clears the in-progress
   const task = store.createTask({ projectId: project.id, title: "Review then continue", description: "Follow-up mid-review.", requiredApprovals: 2 });
   const planner = store.connectAgent({ name: "Planner", provider: "Codex" });
   const reviewer = store.connectAgent({ name: "Reviewer", provider: "Claude" });
+  store.connectAgent({ name: "Second reviewer", provider: "test" });
   const plan = store.claimNextAssignment(planner.id);
   store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Write", description: "Change a file.", role: "implementer", requiresWrite: true, targetAgentName: "Planner" });
   store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Review", description: "Review.", role: "reviewer", targetAgentName: "Reviewer" });
@@ -1511,4 +1572,127 @@ test("workspaceSearch spans tasks, timeline messages, assignments, and knowledge
   assert.equal(store.workspaceSearch("nebula", { projectId: otherProject.id }).length, 0, "project-scoped search cannot cross into another project");
   assert.deepEqual(store.workspaceSearch("x"), [], "one-character scans are rejected");
   assert.doesNotThrow(() => store.workspaceSearch("%' OR 1=1 --"), "search text stays parameterized and escaped");
+});
+
+// Shared scaffolding for the scheduler regressions below: a store, a project, a task whose planner
+// assignment is already closed, and one connected agent.
+async function schedulerFixture(t, { knowledge = false } = {}) {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-sched-data-"));
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "devteam-sched-project-"));
+  const store = new DevTeamStore(dataDir, { knowledge: { enabled: knowledge }, codegraph: { enabled: false } });
+  t.after(async () => {
+    try { store.close(); } catch { /* some tests close early */ }
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  });
+  const project = store.ensureProject("Scheduler project", projectRoot);
+  const task = store.createTask({ projectId: project.id, title: "Scheduler", description: "Exercise claim scheduling." });
+  const agent = store.connectAgent({ name: "Worker", provider: "fixture" });
+  const plan = store.claimNextAssignment(agent.id);
+  store.completeAssignment({ agentId: agent.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+  return { store, project, task, agent };
+}
+
+test("a verifier that declares write access is not treated as the writer it waits for", async (t) => {
+  const { store, task, agent } = await schedulerFixture(t);
+  const writingTester = store.createAssignment({
+    taskId: task.id,
+    title: "Write regression tests",
+    description: "Add coverage.",
+    role: "tester",
+    requiresWrite: true,
+    paths: ["test/**"],
+  });
+  const claim = store.claimNextAssignment(agent.id);
+  assert.equal(claim?.id, writingTester.id, "a write-requiring tester must not block itself out of every scan");
+  store.completeAssignment({ agentId: agent.id, assignmentId: claim.id, claimToken: claim.claimToken, message: "Tests written." });
+  // The real rule still holds: a verifier waits for a genuinely separate pending writer.
+  store.createAssignment({
+    taskId: task.id, title: "Ship the feature", description: "Edit source.",
+    role: "implementer", requiresWrite: true, paths: ["src/**"],
+  });
+  const secondTester = store.createAssignment({
+    taskId: task.id, title: "Verify the feature", description: "Check it.",
+    role: "tester", requiresWrite: true, paths: ["test/**"],
+  });
+  const next = store.claimNextAssignment(agent.id);
+  assert.notEqual(next?.id, secondTester.id, "a verifier still waits for an unrelated queued writer");
+});
+
+test("an agent that goes quiet while holding a claim still counts as working", async (t) => {
+  const { store, task, agent } = await schedulerFixture(t);
+  store.createAssignment({
+    taskId: task.id, title: "Long implementation", description: "Edit source for a while.",
+    role: "implementer", requiresWrite: true, paths: ["src/**"],
+  });
+  const claim = store.claimNextAssignment(agent.id);
+  assert.equal(store.teamActivity([task.id]).busyAgents, 1);
+  assert.equal(store.teamActivity([task.id]).workingAgents, 1);
+  // Editing files produces no MCP calls, so the liveness sweep marks the session unresponsive
+  // while it still owns the claim and the write lease.
+  store.db.prepare("UPDATE agents SET status = 'unresponsive' WHERE id = ?").run(agent.id);
+  const activity = store.teamActivity([task.id]);
+  assert.equal(activity.busyAgents, 0, "responsiveness is reported honestly");
+  assert.equal(activity.workingAgents, 1, "but a claim holder is still reported as working");
+  assert.equal(activity.active, true);
+  store.completeAssignment({ agentId: agent.id, assignmentId: claim.id, claimToken: claim.claimToken, message: "Done." });
+  assert.equal(store.teamActivity([task.id]).workingAgents, 0, "the count clears once the claim is released");
+});
+
+test("purging an agent removes it from the roster without rewriting who spoke", async (t) => {
+  const { store, task, agent } = await schedulerFixture(t);
+  store.postMessage({ agentId: agent.id, taskId: task.id, message: "Agent said this." });
+  store.humanMessage(task.id, "Human said this.");
+  const authored = () => store.taskDetail(task.id).events.filter((event) => event.message === "Agent said this.")[0];
+  assert.equal(authored().author_kind, "agent", "authorship is recorded when the event is written");
+  assert.equal(authored().author_name, "Worker");
+
+  // The liveness sweep purges a long-gone agent; its foreign key is cleared, but the transcript
+  // must still attribute the message to the agent that wrote it.
+  store.disconnectAgent(agent.id, "done");
+  store.forgetAgent(agent.id, { force: true });
+  const afterPurge = authored();
+  assert.equal(afterPurge.agent_id, null, "the roster row is gone");
+  assert.equal(afterPurge.author_kind, "agent", "a purged agent's message is still an agent's message");
+  assert.equal(afterPurge.author_name, "Worker", "the original author name survives the purge");
+  const humanEvent = store.taskDetail(task.id).events.find((event) => event.message === "Human said this.");
+  assert.equal(humanEvent.author_kind, "human", "human messages stay human");
+});
+
+test("targeting routes work to a teammate without outliving them", async (t) => {
+  const { store, task, agent } = await schedulerFixture(t);
+  const other = store.connectAgent({ name: "Other", provider: "fixture" });
+  store.joinTask(other.id, task.id, "contributor");
+  const targeted = store.createAssignment({
+    taskId: task.id, title: "Work for Worker", description: "Targeted work.",
+    role: "implementer", targetAgentName: "Worker",
+  });
+  // While the target is connected, targeting is exclusive — nobody else may take it.
+  assert.equal(store.claimNextAssignment(other.id), null, "a live target keeps its exclusive hold");
+  // Once the target is gone, the item must return to the general queue rather than stranding.
+  store.disconnectAgent(agent.id, "left");
+  const claim = store.claimNextAssignment(other.id);
+  assert.equal(claim?.id, targeted.id, "work addressed to an absent agent is claimable by the room");
+});
+
+test("a queued assignment explains why the scheduler is holding it back", async (t) => {
+  const { store, task } = await schedulerFixture(t);
+  store.createAssignment({
+    taskId: task.id, title: "Ship the feature", description: "Edit source.",
+    role: "implementer", requiresWrite: true, paths: ["src/**"],
+  });
+  const reviewer = store.createAssignment({
+    taskId: task.id, title: "Review it", description: "Read the diff.", role: "reviewer",
+  });
+  const ghosted = store.createAssignment({
+    taskId: task.id, title: "Work for a ghost", description: "Targeted work.",
+    role: "implementer", targetAgentName: "NobodyHere",
+  });
+  const detail = store.taskDetail(task.id);
+  const held = detail.assignments.find((item) => item.id === reviewer.id);
+  assert.equal(held.blockedBy.length, 0, "it has no dependency blockers");
+  assert.equal(held.schedulingHold?.reason, "awaiting_writer", "yet the stall is explained rather than invisible");
+  assert.match(held.schedulingHold.detail, /Ship the feature/);
+  const absent = detail.assignments.find((item) => item.id === ghosted.id);
+  assert.equal(absent.schedulingHold?.reason, "target_absent");
 });

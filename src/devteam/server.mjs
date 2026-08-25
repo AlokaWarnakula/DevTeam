@@ -10,7 +10,7 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { DevTeamStore } from "./store.mjs";
 import { createDevTeamMcpServer } from "./mcp.mjs";
 import { ManagedRuntimeSupervisor } from "./runtime/managed.mjs";
-import { resolveRuntimeRequirement } from "./runtime/index.mjs";
+import { normalizeRuntimeProfile, resolveRuntimeRequirement } from "./runtime/index.mjs";
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.resolve(moduleDir, "../../public");
@@ -35,6 +35,27 @@ function requireDirectory(root) {
   const resolved = path.resolve(root);
   if (!statSync(resolved, { throwIfNoEntry: false })?.isDirectory()) throw new Error("Project root must be an existing directory.");
   return resolved;
+}
+
+function userRuntimeProfile(value) {
+  if (value == null) return null;
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Runtime profile must be an object or null.");
+  return normalizeRuntimeProfile({
+    ...value,
+    source: "user",
+    switchMode: value.switchMode || "user_required",
+    observedAt: value.observedAt || new Date().toISOString(),
+  });
+}
+
+function taskRuntimeProfile(task) {
+  if (!task?.base_runtime_profile) return null;
+  try {
+    const stored = typeof task.base_runtime_profile === "string" ? JSON.parse(task.base_runtime_profile) : task.base_runtime_profile;
+    return userRuntimeProfile(stored);
+  } catch {
+    return null;
+  }
 }
 
 export async function startDevTeamServer({
@@ -181,7 +202,24 @@ export async function startDevTeamServer({
   }));
   app.get("/api/state", (req, res) => {
     const taskId = Object.hasOwn(req.query, "taskId") ? req.query.taskId || null : undefined;
-    res.json(store.snapshot(taskId));
+    const snapshot = store.snapshot(taskId);
+    const task = snapshot.selectedTask;
+    if (task) {
+      const baseProfile = taskRuntimeProfile(task);
+      task.baseRuntimeProfile = baseProfile;
+      for (const assignment of task.assignments || []) {
+        if (!assignment.assessment?.requirements) continue;
+        const assigned = snapshot.agents.find((agent) => agent.id === assignment.agent_id);
+        const targeted = !assigned && assignment.target_agent_name
+          ? snapshot.agents.find((agent) => agent.status !== "disconnected" && agent.name.toLowerCase() === assignment.target_agent_name.toLowerCase())
+          : null;
+        const agentProfile = assigned?.runtimeProfile || targeted?.runtimeProfile || null;
+        const profile = agentProfile || baseProfile;
+        assignment.runtimeProfileSource = agentProfile ? "agent" : (baseProfile ? "task" : null);
+        assignment.runtimeResolution = resolveRuntimeRequirement(assignment.assessment.requirements, profile);
+      }
+    }
+    res.json(snapshot);
   });
   app.get("/api/search", (req, res) => {
     res.json({
@@ -222,13 +260,16 @@ export async function startDevTeamServer({
     if (typeof req.body?.description === "string") patch.description = req.body.description;
     if (req.body?.requiredApprovals !== undefined) patch.requiredApprovals = Number(req.body.requiredApprovals);
     if (typeof req.body?.sessionPolicy === "string") patch.sessionPolicy = req.body.sessionPolicy;
-    if (Object.hasOwn(req.body || {}, "baseRuntimeProfile")) patch.baseRuntimeProfile = req.body.baseRuntimeProfile;
+    if (Object.hasOwn(req.body || {}, "baseRuntimeProfile")) patch.baseRuntimeProfile = userRuntimeProfile(req.body.baseRuntimeProfile);
     if (!Object.keys(patch).length) throw new Error("Provide task details or a session policy to update.");
     res.json(store.updateTask(req.params.taskId, patch));
   });
   app.patch("/api/tasks/:taskId/session-policy", (req, res) => {
     requireFields(req.body, ["sessionPolicy"]);
-    res.json(store.updateTask(req.params.taskId, { sessionPolicy: req.body.sessionPolicy, baseRuntimeProfile: req.body?.baseRuntimeProfile }));
+    res.json(store.updateTask(req.params.taskId, {
+      sessionPolicy: req.body.sessionPolicy,
+      baseRuntimeProfile: Object.hasOwn(req.body || {}, "baseRuntimeProfile") ? userRuntimeProfile(req.body.baseRuntimeProfile) : undefined,
+    }));
   });
   app.delete("/api/tasks/:taskId", (req, res) => {
     requireFields(req.body, ["confirmTaskId"]);
@@ -244,7 +285,7 @@ export async function startDevTeamServer({
   app.put("/api/agents/:agentId/runtime", (req, res) => {
     res.json({ updated: true, runtimeProfile: store.updateRuntimeProfile({
       agentId: req.params.agentId,
-      profile: { ...(req.body?.profile || req.body), source: "user" },
+      profile: userRuntimeProfile(req.body?.profile || req.body),
       force: true,
     }) });
   });

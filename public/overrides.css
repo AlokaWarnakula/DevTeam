@@ -1338,6 +1338,22 @@
 .runtime-reasons p { margin: 5px 0; color: var(--muted); }
 .runtime-reasons strong { color: #f1bf71; }
 .runtime-exceptional { border: 1px solid #8d6034; background: #261b12; border-radius: 8px; padding: 10px; }
+.runtime-profile-state { color: var(--muted); margin: 4px 0 8px; }
+.row-runtime { border: 0; background: transparent; color: #9fbce0; cursor: pointer; padding: 2px 4px; border-radius: 5px; }
+.row-runtime:hover, .row-runtime:focus-visible { background: #1a2635; color: #d5e7ff; }
+.profile-model-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 10px 0 7px; }
+.profile-model-list { display: grid; gap: 10px; max-height: min(46vh, 470px); overflow: auto; padding-right: 3px; }
+.profile-model-card { border: 1px solid #33445d; border-radius: 9px; padding: 10px; background: #111923; }
+.profile-grid { display: grid; grid-template-columns: 1fr 1.25fr 0.9fr; gap: 8px; }
+.profile-effort-list { display: grid; gap: 6px; margin: 9px 0; }
+.profile-effort-row { display: grid; grid-template-columns: 1fr 1.2fr 0.9fr 28px; gap: 6px; align-items: center; }
+.profile-effort-row input, .profile-effort-row select { min-width: 0; }
+.profile-add-effort { padding: 5px 8px; }
+.row-delete.visible { opacity: 1; }
+@media (max-width: 650px) {
+  .profile-grid { grid-template-columns: 1fr; }
+  .profile-effort-row { grid-template-columns: 1fr 1fr; }
+}
 
 /* ── Workspace polish: search, filters, drafts, formatting, unread state, and resizing ── */
 .search-trigger {
