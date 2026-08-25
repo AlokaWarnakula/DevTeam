@@ -118,7 +118,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
 
   server.registerTool("devteam_wait", {
     title: "Wait for DevTeam work or messages",
-    description: "Block locally (no model tokens are spent while blocked) until DevTeam has an assignment or a human message for this agent. Returns 'room_required' immediately when a multi-task server needs an explicit devteam_join; otherwise returns early with status 'assigned' or 'message', or 'idle' after the timeout.",
+    description: "Block locally (no model tokens are spent while blocked) until DevTeam has an assignment or a human message for this agent. A new runtime recommendation is surfaced once; later waits keep blocking while the same recommendation remains undecided. Returns 'room_required' immediately when a multi-task server needs an explicit devteam_join; otherwise returns early with status 'assigned' or 'message', or 'idle' after the timeout.",
     inputSchema: {
       agentId: z.string().uuid(),
       timeoutSeconds: z.number().int().min(1).max(50).default(45),
@@ -162,21 +162,27 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
       const assignment = store.claimNextAssignment(agentId);
       if (assignment) {
         if (assignment.runtimeActionRequired) {
-          return {
-            ...assignment,
-            keepWaiting: true,
-            next: "No lease was acquired. Ask the user to switch, continue, reassign, or cancel, then record the choice with devteam_runtime_decision. If settings changed, call devteam_runtime_update first.",
-          };
+          // The first recommendation needs a model turn so the agent can ask the human. Once it has
+          // already been delivered, keep this local wait blocked instead of returning the same gate
+          // every 750 ms and burning a model turn per retry.
+          if (!assignment.alreadyRecommended) {
+            return {
+              ...assignment,
+              keepWaiting: true,
+              next: "No lease was acquired. Ask the user to switch, continue, reassign, or cancel, then record the choice with devteam_runtime_decision. If settings changed, call devteam_runtime_update first.",
+            };
+          }
+        } else {
+          return store.taskBrief(agentId, assignment.task_id, {
+            currentAssignment: assignment,
+            assignmentKey: "assignment",
+            responseCore: {
+              status: "assigned",
+              keepWaiting: true,
+              instructions: "Inspect the current project state before acting. Complete this bounded assignment, then call devteam_report — pass back assignment.claimToken so a stale report is fenced if your lease moved. Use devteam_assign to delegate follow-up implementation, testing, or independent review.",
+            },
+          });
         }
-        return store.taskBrief(agentId, assignment.task_id, {
-          currentAssignment: assignment,
-          assignmentKey: "assignment",
-          responseCore: {
-            status: "assigned",
-            keepWaiting: true,
-            instructions: "Inspect the current project state before acting. Complete this bounded assignment, then call devteam_report — pass back assignment.claimToken so a stale report is fenced if your lease moved. Use devteam_assign to delegate follow-up implementation, testing, or independent review.",
-          },
-        });
       }
       store.heartbeat(agentId, "waiting");
       await sleep(Math.min(750, Math.max(0, deadline - Date.now())));

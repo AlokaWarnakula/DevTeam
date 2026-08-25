@@ -317,6 +317,8 @@ export class DevTeamStore extends EventEmitter {
       ["agents", "fresh_task_id", "TEXT"],
       ["agents", "replaced_by_agent_id", "TEXT"],
       ["agents", "session_policy_ack_task_id", "TEXT"],
+      ["events", "author_name", "TEXT"],                                   // who wrote it, kept even after the agent row is purged
+      ["events", "author_kind", "TEXT"],                                   // 'human' or 'agent', so authorship never depends on a nullable FK
     ]) {
       try { this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`); } catch { /* already present */ }
     }
@@ -353,12 +355,19 @@ export class DevTeamStore extends EventEmitter {
     }
   }
 
+  // Authorship is denormalized onto the row at write time. agent_id is a nullable foreign key that
+  // gets cleared when an agent is purged from the roster, so it cannot be the record of who spoke:
+  // relying on it silently reattributed every purged agent's message to the human.
   #event(taskId, agentId, type, message, metadata = {}) {
     const stamp = now();
+    const author = agentId
+      ? this.db.prepare("SELECT name FROM agents WHERE id = ?").get(agentId)
+      : null;
     const info = this.db.prepare(`
-      INSERT INTO events (task_id, agent_id, type, message, metadata, created_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(taskId, agentId || null, type, message, json(metadata), stamp);
+      INSERT INTO events (task_id, agent_id, type, message, metadata, created_at, author_name, author_kind)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(taskId, agentId || null, type, message, json(metadata), stamp,
+      agentId ? (author?.name || null) : null, agentId ? "agent" : "human");
     return Number(info.lastInsertRowid);
   }
 
@@ -567,7 +576,7 @@ export class DevTeamStore extends EventEmitter {
   // leaves once the room is genuinely quiet.
   teamActivity(roomIds = null) {
     const scoped = Array.isArray(roomIds);
-    if (scoped && !roomIds.length) return { active: false, openWork: 0, busyAgents: 0, waitingAgents: 0 };
+    if (scoped && !roomIds.length) return { active: false, openWork: 0, busyAgents: 0, workingAgents: 0, waitingAgents: 0 };
     const roomFilter = scoped ? `AND a.task_id IN (${roomIds.map(() => "?").join(", ")})` : "";
     const busyFilter = scoped ? `AND current_task_id IN (${roomIds.map(() => "?").join(", ")})` : "";
     const openWork = Number(this.db.prepare(`
@@ -576,6 +585,17 @@ export class DevTeamStore extends EventEmitter {
       WHERE a.status IN ('queued', 'claimed') AND t.status NOT IN ('accepted', 'blocked', 'cancelled') ${roomFilter}
     `).get(...(scoped ? roomIds : [])).count);
     const busyAgents = Number(this.db.prepare(`SELECT COUNT(*) AS count FROM agents WHERE status = 'busy' ${busyFilter}`).get(...(scoped ? roomIds : [])).count);
+    // Presence and work are different things. The liveness sweep marks a session 'unresponsive'
+    // after it goes quiet, which is exactly what a teammate deep in an edit looks like — it still
+    // holds its claim. Counting only 'busy' therefore reports an actively working teammate as
+    // nobody at all, so ownership of a claim is counted separately from responsiveness.
+    const workingAgents = Number(this.db.prepare(`
+      SELECT COUNT(DISTINCT a.agent_id) AS count FROM assignments a
+      JOIN agents agent ON agent.id = a.agent_id
+      JOIN tasks t ON t.id = a.task_id
+      WHERE a.status = 'claimed' AND agent.status != 'disconnected'
+        AND t.status NOT IN ('accepted', 'blocked', 'cancelled') ${roomFilter}
+    `).get(...(scoped ? roomIds : [])).count);
     const waitingAgents = Number(this.db.prepare("SELECT COUNT(*) AS count FROM agents WHERE status = 'waiting'").get().count);
     // A task accepted moments ago keeps the room "active" for a short window, so its members stay
     // assembled long enough to catch a same-conversation follow-up instead of being told to leave the
@@ -585,7 +605,7 @@ export class DevTeamStore extends EventEmitter {
     const continuing = Number(this.db.prepare(`
       SELECT COUNT(*) AS count FROM tasks WHERE status = 'accepted' AND updated_at >= ? ${acceptedFilter}
     `).get(continuationSince, ...(scoped ? roomIds : [])).count);
-    return { active: openWork > 0 || busyAgents > 0 || continuing > 0, openWork, busyAgents, waitingAgents, continuing };
+    return { active: openWork > 0 || busyAgents > 0 || workingAgents > 0 || continuing > 0, openWork, busyAgents, workingAgents, waitingAgents, continuing };
   }
 
   // Activity as seen from one agent's rooms, so a member of a quiet task isn't kept assembled by
@@ -1009,6 +1029,19 @@ export class DevTeamStore extends EventEmitter {
     return this.db.prepare("SELECT * FROM projects WHERE id = ?").get(projectId);
   }
 
+  // A base runtime profile is human-entered. Reject a value that claims to be a full runtime
+  // profile but cannot normalize, so an unusable note is refused at the point the human can still
+  // fix it rather than silently ignored later by the gate. A bare {modelClass, effortClass} hint
+  // stays accepted: the session-handoff capsule has always read that shorter shape.
+  #validatedBaseRuntimeProfile(value) {
+    if (value == null) return null;
+    if (typeof value !== "object" || Array.isArray(value)) throw new Error("Base runtime profile must be an object or null.");
+    if (value.providerId || value.availableModels || value.currentModel) {
+      normalizeRuntimeProfile({ ...value, source: "user" });
+    }
+    return value;
+  }
+
   createTask({ projectId, title, description, requiredApprovals = 2, sessionPolicy = "per_task", baseRuntimeProfile = null }) {
     const project = this.db.prepare("SELECT * FROM projects WHERE id = ?").get(projectId);
     if (!project) throw new Error("Project not found.");
@@ -1023,7 +1056,7 @@ export class DevTeamStore extends EventEmitter {
         VALUES (?, ?, ?, ?, 'planning', 1, ?, ?, 1, ?, ?, ?)
       `).run(taskId, projectId, title.trim(), description.trim(), approvals,
         ["manual", "per_task", "adaptive", "per_assignment"].includes(sessionPolicy) ? sessionPolicy : "per_task",
-        baseRuntimeProfile ? json(baseRuntimeProfile) : null, stamp, stamp);
+        baseRuntimeProfile ? json(this.#validatedBaseRuntimeProfile(baseRuntimeProfile)) : null, stamp, stamp);
       this.db.prepare(`
         INSERT INTO assignments (id, task_id, title, description, role, requires_write, status, created_at)
         VALUES (?, ?, ?, ?, 'planner', 0, 'queued', ?)
@@ -1125,7 +1158,7 @@ export class DevTeamStore extends EventEmitter {
       : Math.max(1, Math.min(8, Number(requiredApprovals) || task.required_approvals));
     const nextPolicy = sessionPolicy === undefined ? task.session_policy : String(sessionPolicy);
     if (!["manual", "per_task", "adaptive", "per_assignment"].includes(nextPolicy)) throw new Error("Invalid session policy.");
-    const nextBaseProfile = baseRuntimeProfile === undefined ? task.base_runtime_profile : (baseRuntimeProfile == null ? null : json(baseRuntimeProfile));
+    const nextBaseProfile = baseRuntimeProfile === undefined ? task.base_runtime_profile : (baseRuntimeProfile == null ? null : json(this.#validatedBaseRuntimeProfile(baseRuntimeProfile)));
     if (nextTitle === task.title && nextDescription === task.description && nextApprovals === task.required_approvals
       && nextPolicy === task.session_policy && nextBaseProfile === task.base_runtime_profile) {
       return this.getTask(taskId);
@@ -1804,8 +1837,9 @@ export class DevTeamStore extends EventEmitter {
     const failures = Number(this.db.prepare(`
       SELECT COUNT(*) AS count FROM events
       WHERE task_id = ? AND type = 'assignment.blocked'
-        AND (json_extract(metadata, '$.assignmentId') = ? OR message LIKE ?)
-    `).get(assignment.task_id, assignmentId, `%${assignment.title}%`).count);
+        AND json_extract(metadata, '$.assignmentId') = ?
+        AND CAST(json_extract(metadata, '$.version') AS INTEGER) = ?
+    `).get(assignment.task_id, assignmentId, assignment.task_version).count);
     const assessed = assessAssignment({
       ...assignment,
       paths: assignment.requires_write ? this.#writeScopeFor(assignment.id) : [],
@@ -1894,16 +1928,43 @@ export class DevTeamStore extends EventEmitter {
     return this.#runtimeDecisionRecord(this.db.prepare("SELECT * FROM runtime_decisions WHERE id = ?").get(id));
   }
 
+  // A task's base runtime profile is the human's standing statement about the session they run
+  // this task in ("I start these chats on Sonnet 5, medium effort"). It is always read back as a
+  // `user` claim regardless of what was stored, so a saved note can never impersonate a host or
+  // adapter observation and outrank a live session profile.
+  #taskBaseRuntimeProfile(taskId) {
+    const stored = fromJson(this.db.prepare("SELECT base_runtime_profile FROM tasks WHERE id = ?").get(taskId)?.base_runtime_profile, null);
+    if (!stored || typeof stored !== "object" || Array.isArray(stored)) return null;
+    try {
+      const normalized = normalizeRuntimeProfile({ ...stored, source: "user" });
+      return { ...normalized, stale: Date.parse(normalized.expiresAt) <= Date.now() };
+    } catch {
+      // A loose or malformed note is not evidence of anything; it must never gate work.
+      return null;
+    }
+  }
+
   #runtimeGate(agent, candidate) {
     // Candidate selection already authorizes either contributor membership or an exact targeted
     // invitation. Assess without re-running the stricter room-membership check so a targeted agent
     // can pass the runtime gate before its membership is persisted by the eventual claim.
     const assessment = this.assignmentAssessment({ assignmentId: candidate.id });
-    const profile = this.runtimeProfile(agent.id);
+    const agentProfile = this.runtimeProfile(agent.id);
+    // Fall back to the task's standing profile only when the session itself advertises nothing.
+    const baseProfile = agentProfile ? null : this.#taskBaseRuntimeProfile(candidate.task_id);
+    const profile = agentProfile || baseProfile;
+    const profileSource = agentProfile ? "agent" : baseProfile ? "task_base" : null;
     // Runtime profiles were added after DevTeam's original connect handshake. A session that did
-    // not send one remains a legacy client and keeps the old claim behavior; once a session opts
-    // into runtime discovery, stale/estimated/insufficient data is always gated and never guessed.
-    if (!profile) return { allowed: true, assessment, profile: null, resolution: null, legacyUnprofiled: true };
+    // not send one, on a task with no usable base profile, remains a legacy client and keeps the
+    // old claim behavior; once a session opts into runtime discovery, stale/estimated/insufficient
+    // data is always gated and never guessed.
+    if (!profile) return { allowed: true, assessment, profile: null, resolution: null, legacyUnprofiled: true, profileSource: null };
+    // A standing declaration that has aged out is not evidence about the current session — but it
+    // must not stall the queue either. Aging out returns the agent to legacy behavior and asks the
+    // dashboard for a refresh, rather than blocking every claim on a stale human note.
+    if (baseProfile?.stale) {
+      return { allowed: true, assessment, profile: null, resolution: null, legacyUnprofiled: true, profileSource: null, baseProfileStale: true };
+    }
     const resolution = resolveRuntimeRequirement(assessment.requirements, profile);
     const decisionRow = this.db.prepare(`
       SELECT * FROM runtime_decisions
@@ -1913,16 +1974,12 @@ export class DevTeamStore extends EventEmitter {
     const decision = this.#runtimeDecisionRecord(decisionRow);
     if (decision && ["reassign", "cancel"].includes(decision.choice)
       && (!decision.expiresAt || Date.parse(decision.expiresAt) > Date.now())) return { skip: true, decision };
-    if (resolution.satisfied || decision?.choice === "continue") return { allowed: true, assessment, profile, resolution, decision };
+    if (resolution.satisfied || decision?.choice === "continue") return { allowed: true, assessment, profile, resolution, decision, profileSource };
     const priorRecommendation = this.db.prepare(`
       SELECT id FROM events WHERE task_id = ? AND type = 'runtime.switch_recommended'
         AND json_extract(metadata, '$.assignmentId') = ? AND json_extract(metadata, '$.assessmentId') = ?
         AND json_extract(metadata, '$.agentId') = ? LIMIT 1
     `).get(candidate.task_id, candidate.id, assessment.id, agent.id);
-    if (!priorRecommendation) this.#event(candidate.task_id, agent.id, "runtime.switch_recommended", `Runtime action is required before “${candidate.title}” can be claimed.`, {
-      assignmentId: candidate.id, assessmentId: assessment.id, agentId: agent.id,
-      level: assessment.level, requirements: assessment.requirements, recommendation: resolution.recommendation,
-    });
     return {
       runtimeActionRequired: true,
       status: "runtime_action_required",
@@ -1930,7 +1987,9 @@ export class DevTeamStore extends EventEmitter {
       assignment: { id: candidate.id, title: candidate.title, role: candidate.role, requiresWrite: Boolean(candidate.requires_write) },
       assessment,
       runtimeProfile: profile,
+      profileSource,
       resolution,
+      alreadyRecommended: Boolean(priorRecommendation),
       actions: ["switched", "continue", "reassign", "cancel"],
       advisory: profile?.switchMode !== "automatic",
       humanApprovalRequired: Boolean(assessment.requirements.humanApprovalRequired),
@@ -2276,6 +2335,14 @@ export class DevTeamStore extends EventEmitter {
       }
     }
     this.db.prepare("UPDATE assignments SET agent_id = NULL WHERE agent_id = ?").run(agentId);
+    // Detach the purged roster row without rewriting history: author_name/author_kind were recorded
+    // when each event was written, and any legacy row missing them is backfilled here so the
+    // transcript still says who spoke after the agent is gone.
+    this.db.prepare(`
+      UPDATE events SET author_name = COALESCE(author_name, (SELECT name FROM agents WHERE id = ?)),
+        author_kind = COALESCE(author_kind, 'agent')
+      WHERE agent_id = ?
+    `).run(agentId, agentId);
     this.db.prepare("UPDATE events SET agent_id = NULL WHERE agent_id = ?").run(agentId);
     this.db.prepare("UPDATE proposals SET proposer_id = NULL WHERE proposer_id = ?").run(agentId);
     this.db.prepare("DELETE FROM agents WHERE id = ?").run(agentId);
@@ -2415,7 +2482,18 @@ export class DevTeamStore extends EventEmitter {
         WHERE a.status = 'queued'
           AND a.task_id IN (${claimPlaceholders})
           AND t.status NOT IN ('accepted', 'blocked', 'cancelled')
-          AND (a.target_agent_name IS NULL OR lower(a.target_agent_name) = lower(?))
+          -- Targeting routes work to a teammate by name; it must not outlive that teammate. A
+          -- target that is still connected keeps its exclusive hold (and its ORDER BY priority),
+          -- but once nobody by that name is present the item returns to the general queue instead
+          -- of sitting claimable-by-nobody and blocking every verifier behind it.
+          AND (
+            a.target_agent_name IS NULL
+            OR lower(a.target_agent_name) = lower(?)
+            OR NOT EXISTS (
+              SELECT 1 FROM agents present
+              WHERE lower(present.name) = lower(a.target_agent_name) AND present.status != 'disconnected'
+            )
+          )
           AND ${memberScopeClause}
           AND NOT EXISTS (
             SELECT 1 FROM assignment_dependencies dependency_link
@@ -2426,6 +2504,10 @@ export class DevTeamStore extends EventEmitter {
             lower(a.role) NOT IN ('reviewer', 'security-reviewer', 'tester') OR NOT EXISTS (
               SELECT 1 FROM assignments pending_write
               WHERE pending_write.task_id = a.task_id
+                -- An assignment can never be the writer it is waiting for. Without this, a
+                -- reviewer/tester that itself declares write access matches its own row here and
+                -- is excluded from every scan forever, with nothing reported as blocking it.
+                AND pending_write.id != a.id
                 AND pending_write.requires_write = 1
                 AND pending_write.status IN ('queued', 'claimed')
                 AND NOT EXISTS (
@@ -2444,6 +2526,7 @@ export class DevTeamStore extends EventEmitter {
       }
       const heldLeases = this.#heldWriteLeases();
       const stamp = now();
+      let firstRuntimeGate = null;
       for (const candidate of candidates) {
         // A write assignment is claimable only if its declared paths don't overlap a write
         // lease already held by another agent in the same project. Undeclared paths mean the
@@ -2456,7 +2539,12 @@ export class DevTeamStore extends EventEmitter {
         }
         const gate = this.#runtimeGate(agent, candidate);
         if (gate.skip) continue;
-        if (!gate.allowed) return gate;
+        // Preserve the queue's targeted-first ordering for recommendations, but do not let one
+        // incompatible item hide later work this agent can legally claim right now.
+        if (!gate.allowed) {
+          firstRuntimeGate ||= gate;
+          continue;
+        }
         const claimToken = randomBytes(18).toString("base64url");
         const result = this.db.prepare(`
           UPDATE assignments
@@ -2490,9 +2578,22 @@ export class DevTeamStore extends EventEmitter {
         const dependencies = this.#dependenciesFor(candidate.id);
         return { ...candidate, agent_id: agentId, status: "claimed", claimed_at: stamp, checklist: this.#checklistFor(candidate.id), writeScope, dependsOn: dependencies.map((item) => item.id), blockedBy: [], claimToken, claimGeneration };
       }
+      if (firstRuntimeGate) return firstRuntimeGate;
       this.db.prepare("UPDATE agents SET status = 'waiting', last_seen = ? WHERE id = ?").run(now(), agentId);
       return null;
     });
+    // A gate encountered while scanning must not count as delivered if later compatible work was
+    // claimed. Record the recommendation only when the gate is the result returned to the caller.
+    if (assignment?.runtimeActionRequired && !assignment.alreadyRecommended) {
+      this.#event(assignment.taskId, agentId, "runtime.switch_recommended", `Runtime action is required before “${assignment.assignment.title}” can be claimed.`, {
+        assignmentId: assignment.assignment.id,
+        assessmentId: assignment.assessment.id,
+        agentId,
+        level: assignment.assessment.level,
+        requirements: assignment.assessment.requirements,
+        recommendation: assignment.resolution.recommendation,
+      });
+    }
     if (assignment) this.#changed(
       assignment.runtimeActionRequired ? "runtime.switch_recommended" : "assignment.claimed",
       assignment.task_id || assignment.taskId,
@@ -2743,35 +2844,59 @@ export class DevTeamStore extends EventEmitter {
     };
   }
 
-  // No dead-ends: a task can never require more independent approvals than the number
-  // of distinct agents that actually took part (completed work or approved). A solo run
-  // can finish; a two-agent run still needs two independent reviews.
-  #participantCount(taskId) {
-    return Number(this.db.prepare(`
-      SELECT COUNT(*) AS count FROM (
-        SELECT agent_id FROM approvals WHERE task_id = ? AND agent_id IS NOT NULL
-        UNION
-        SELECT agent_id FROM events WHERE task_id = ? AND type = 'assignment.completed' AND agent_id IS NOT NULL
-      )
-    `).get(taskId, taskId).count);
+  // A checkpoint takeover creates a fresh session id, but it does not create a new independent
+  // participant. Follow claimed checkpoint links back to the original session in that lineage.
+  #participantLineage(agentId) {
+    let current = agentId;
+    const seen = new Set();
+    while (current && !seen.has(current)) {
+      seen.add(current);
+      const predecessor = this.db.prepare(`
+        SELECT from_agent_id FROM session_checkpoints
+        WHERE claimed_by_agent_id = ? AND status = 'claimed'
+        ORDER BY claimed_at DESC, checkpoint_generation DESC LIMIT 1
+      `).get(current);
+      if (!predecessor?.from_agent_id) break;
+      current = predecessor.from_agent_id;
+    }
+    return current || agentId;
   }
 
-  #effectiveRequiredApprovals(taskId, configured) {
-    const participants = this.#participantCount(taskId);
-    return Math.max(1, Math.min(configured, participants || 1));
+  #connectedParticipantLineages(taskId) {
+    const members = this.db.prepare(`
+      SELECT tm.agent_id FROM task_members tm
+      JOIN agents agent ON agent.id = tm.agent_id
+      WHERE tm.task_id = ? AND tm.role = 'contributor' AND agent.status != 'disconnected'
+    `).all(taskId);
+    return new Set(members.map((member) => this.#participantLineage(member.agent_id)));
   }
 
-  // Did this agent author the change under review (a completed assignment that reported changed
-  // files on the current version)? Used to keep review independent: the author of a version may
-  // not sign off on their own version when other teammates exist to do it.
-  #authoredCurrentVersion(taskId, agentId, version) {
-    return this.db.prepare(`
-      SELECT metadata FROM events
-      WHERE task_id = ? AND agent_id = ? AND type = 'assignment.completed'
-    `).all(taskId, agentId).some((event) => {
+  #currentVersionAuthorLineages(taskId, version) {
+    const authors = this.db.prepare(`
+      SELECT agent_id, metadata FROM events
+      WHERE task_id = ? AND type = 'assignment.completed' AND agent_id IS NOT NULL
+    `).all(taskId).filter((event) => {
       const metadata = fromJson(event.metadata, {});
       return metadata.version === version && Array.isArray(metadata.changedFiles) && metadata.changedFiles.length > 0;
     });
+    return new Set(authors.map((author) => this.#participantLineage(author.agent_id)));
+  }
+
+  #approvalLineages(taskId, version) {
+    const approvals = this.db.prepare("SELECT agent_id FROM approvals WHERE task_id = ? AND version = ?").all(taskId, version);
+    return new Set(approvals.map((approval) => this.#participantLineage(approval.agent_id)));
+  }
+
+  #eligibleIndependentApproverLineages(taskId, version) {
+    const authors = this.#currentVersionAuthorLineages(taskId, version);
+    return new Set([...this.#connectedParticipantLineages(taskId)].filter((lineage) => !authors.has(lineage)));
+  }
+
+  // No dead-ends: configured consensus cannot exceed the independent teammates who could
+  // actually approve now. With none available, one honest self-review remains sufficient.
+  #effectiveRequiredApprovals(taskId, configured, version) {
+    const eligible = this.#eligibleIndependentApproverLineages(taskId, version).size;
+    return Math.max(1, Math.min(configured, eligible || 1));
   }
 
   approveTask({ agentId, taskId, summary }) {
@@ -2798,9 +2923,10 @@ export class DevTeamStore extends EventEmitter {
     // cannot approve it — an independent teammate must. A genuine solo run is still allowed to
     // finish (no dead-ends), but its acceptance is labeled selfReviewed so it is never mistaken
     // for independent consensus.
-    const authoredThisVersion = this.#authoredCurrentVersion(taskId, agentId, task.version);
-    const participants = this.#participantCount(taskId);
-    if (authoredThisVersion && participants > 1) {
+    const authorLineages = this.#currentVersionAuthorLineages(taskId, task.version);
+    const approverLineage = this.#participantLineage(agentId);
+    const eligibleIndependent = this.#eligibleIndependentApproverLineages(taskId, task.version);
+    if (authorLineages.has(approverLineage) && eligibleIndependent.size > 0) {
       throw new Error("The author of the current version cannot approve it; an independent reviewer or tester must.");
     }
     let outcome;
@@ -2812,13 +2938,14 @@ export class DevTeamStore extends EventEmitter {
         ON CONFLICT(task_id, agent_id, version) DO UPDATE SET summary = excluded.summary, created_at = excluded.created_at
       `).run(taskId, agentId, task.version, summary.trim(), stamp);
       this.#event(taskId, agentId, "task.approved", `${agent.name} approved version ${task.version}.`, { summary: summary.trim(), version: task.version });
-      const approvalCount = Number(this.db.prepare("SELECT COUNT(*) AS count FROM approvals WHERE task_id = ? AND version = ?").get(taskId, task.version).count);
+      const approvalLineages = this.#approvalLineages(taskId, task.version);
+      const approvalCount = approvalLineages.size;
       const openAssignments = Number(this.db.prepare("SELECT COUNT(*) AS count FROM assignments WHERE task_id = ? AND status IN ('queued', 'claimed')").get(taskId).count);
-      const effectiveRequired = this.#effectiveRequiredApprovals(taskId, task.required_approvals);
+      const effectiveRequired = this.#effectiveRequiredApprovals(taskId, task.required_approvals, task.version);
       const accepted = approvalCount >= effectiveRequired && openAssignments === 0;
-      // Honest labeling: a single-participant task was never independently reviewed, however many
-      // approvals it nominally required.
-      const selfReviewed = participants <= 1;
+      // Honest labeling: rotating one session through a checkpoint cannot manufacture consensus.
+      const independentApprovalCount = [...approvalLineages].filter((lineage) => !authorLineages.has(lineage)).length;
+      const selfReviewed = authorLineages.size > 0 ? independentApprovalCount === 0 : approvalLineages.size <= 1;
       if (accepted) {
         this.db.prepare("UPDATE tasks SET status = 'accepted', updated_at = ? WHERE id = ?").run(stamp, taskId);
         this.#event(taskId, null, "task.accepted", `${selfReviewed ? "Self-reviewed acceptance" : "Consensus reached"} for version ${task.version}.`, { approvalCount, requiredApprovals: effectiveRequired, selfReviewed });
@@ -3113,6 +3240,41 @@ export class DevTeamStore extends EventEmitter {
     }
   }
 
+  // Why is this queued item not being handed out? The scheduler already knows, but it used to throw
+  // the reason away, so an assignment held back by review-gating or by an absent target looked
+  // perfectly claimable while nobody could ever claim it. Surfaced so a stall is legible.
+  #schedulingHold(assignment) {
+    if (assignment.status !== "queued") return null;
+    const role = String(assignment.role || "").toLowerCase();
+    if (["reviewer", "security-reviewer", "tester"].includes(role)) {
+      const writer = this.db.prepare(`
+        WITH RECURSIVE dependency_closure(assignment_id, prerequisite_id) AS (
+          SELECT assignment_id, depends_on_assignment_id FROM assignment_dependencies
+          UNION
+          SELECT dependency_closure.assignment_id, dependency_link.depends_on_assignment_id
+          FROM dependency_closure
+          JOIN assignment_dependencies dependency_link ON dependency_link.assignment_id = dependency_closure.prerequisite_id
+        )
+        SELECT pending_write.title FROM assignments pending_write
+        WHERE pending_write.task_id = ? AND pending_write.id != ?
+          AND pending_write.requires_write = 1 AND pending_write.status IN ('queued', 'claimed')
+          AND NOT EXISTS (
+            SELECT 1 FROM dependency_closure
+            WHERE dependency_closure.assignment_id = pending_write.id AND dependency_closure.prerequisite_id = ?
+          )
+        LIMIT 1
+      `).get(assignment.task_id, assignment.id, assignment.id);
+      if (writer) return { reason: "awaiting_writer", detail: `Verification waits for the writer “${writer.title}” to finish.` };
+    }
+    if (assignment.target_agent_name) {
+      const present = this.db.prepare(`
+        SELECT 1 FROM agents WHERE lower(name) = lower(?) AND status != 'disconnected' LIMIT 1
+      `).get(assignment.target_agent_name);
+      if (!present) return { reason: "target_absent", detail: `Targeted at “${assignment.target_agent_name}”, who is not connected; any member of the room may claim it.` };
+    }
+    return null;
+  }
+
   taskDetail(taskId) {
     const task = this.getTask(taskId);
     if (!task) return null;
@@ -3135,6 +3297,7 @@ export class DevTeamStore extends EventEmitter {
         writeScope: assignment.requires_write ? this.#writeScopeFor(assignment.id) : [],
         dependsOn: dependencies.map((item) => item.id),
         blockedBy: dependencies.filter((item) => item.status !== "done"),
+        schedulingHold: this.#schedulingHold(assignment),
         assessment,
         runtimeDecision,
       };

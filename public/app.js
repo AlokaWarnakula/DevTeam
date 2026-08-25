@@ -22,6 +22,8 @@ const freshness = (stamp) => {
 };
 const initials = (name = "AI") => name.split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toUpperCase();
 const ROLE_VERB = { planner: "planning", implementer: "implementing", reviewer: "reviewing", "security-reviewer": "security review", tester: "testing", researcher: "researching" };
+const MODEL_CLASSES = ["economy", "balanced", "strong", "frontier", "specialized"];
+const EFFORT_CLASSES = ["light", "medium", "high", "extra_high", "maximum"];
 // A live "doing X" line for an agent: what it is working on right now, or how long it has waited.
 function activityLine(agent) {
   if (agent.status === "busy" && agent.current_assignment_title) {
@@ -32,6 +34,35 @@ function activityLine(agent) {
   if (agent.status === "unresponsive") return `unresponsive · silent ${relativeTime(agent.last_seen)} (keeps its claim)`;
   if (agent.status === "waiting") return `waiting · ${relativeTime(agent.last_seen)}`;
   return relativeTime(agent.last_seen);
+}
+
+function runtimeSelectionLabel(selection) {
+  if (!selection?.modelLabel || !selection?.effortLabel) return null;
+  const effort = selection.effortLabel === selection.effortClass
+    ? selection.effortLabel
+    : `${selection.effortLabel} (${selection.effortClass})`;
+  return `${selection.modelLabel} (${selection.modelClass}) · ${effort}`;
+}
+
+function runtimeProfileLabel(profile) {
+  if (!profile) return null;
+  const model = profile.availableModels?.find((item) => item.id === profile.currentModel);
+  const effort = model?.efforts?.find((item) => item.id === profile.currentEffort);
+  if (!model || !effort) return null;
+  return runtimeSelectionLabel({
+    modelLabel: model.label,
+    modelClass: model.class,
+    effortLabel: effort.label,
+    effortClass: effort.class,
+  });
+}
+
+function assignmentRuntimeLabel(assignment) {
+  const resolution = assignment.runtimeResolution;
+  const advertised = runtimeSelectionLabel(resolution?.recommendation);
+  if (advertised) return `${resolution.satisfied ? "Current" : "Needs at least"} ${advertised}`;
+  if (!assignment.runtimeProfileSource) return "Model gating inactive — no runtime profile registered";
+  return resolution?.reason || "No advertised model/effort combination matches this assignment.";
 }
 let state = null;
 let selectedTaskId = new URLSearchParams(location.search).get("task");
@@ -49,6 +80,9 @@ let timelineFilter = "all";
 let pendingSends = [];
 let pendingJumpEventId = null;
 let searchGeneration = 0;
+let profileDraftModels = [];
+let profileDraftCurrentModel = "";
+let profileDraftCurrentEffort = "";
 const ATTACHMENT_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf"]);
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 const DRAFT_LIMIT = 50_000;
@@ -172,6 +206,7 @@ function render() {
   $("#empty-state").classList.toggle("hidden", Boolean(task));
   $("#conversation").classList.toggle("hidden", !task);
   $("#copy-task-invite").classList.toggle("hidden", !task);
+  $("#edit-task-runtime").classList.toggle("hidden", !task || task.status === "cancelled");
   $("#edit-task").classList.toggle("hidden", !task || task.status === "cancelled");
   $("#block-task").classList.toggle("hidden", !task || ["accepted", "blocked", "cancelled"].includes(task.status));
   $("#unblock-task").classList.toggle("hidden", !task || task.status !== "blocked");
@@ -194,14 +229,26 @@ function deliveryLine(event) {
 
 const SYSTEM_EVENTS = ["task.created", "assignment.created", "task.accepted", "assignment.reassigned", "proposal.created", "proposal.adopted", "proposal.declined"];
 
+// Authorship comes from the event's own recorded author, not from its nullable agent_id: purging an
+// agent from the roster clears that foreign key, which used to reattribute every message it ever
+// wrote to the human. Rows written before author_kind existed fall back to the old inference.
+function eventIsHuman(event) {
+  if (event.author_kind) return event.author_kind === "human";
+  return !event.agent_id;
+}
+
+function eventAuthorName(event) {
+  return event.agent_name || event.author_name || "Agent";
+}
+
 function renderEvent(event) {
   if (event.type === "proposal.vote") return "";
   if (SYSTEM_EVENTS.includes(event.type)) {
     const icon = event.type === "proposal.adopted" ? "✓ " : event.type === "proposal.declined" ? "✕ " : event.type.startsWith("proposal") ? "⇄ " : "";
     return `<div id="event-${event.id}" class="system-event ${event.type.replace(".", "-")}">${icon}${escapeHtml(event.message)} <span class="provider">· ${time(event.created_at)}</span></div>`;
   }
-  const human = !event.agent_id;
-  const name = human ? "You" : event.agent_name || "Agent";
+  const human = eventIsHuman(event);
+  const name = human ? "You" : eventAuthorName(event);
   const kind = KIND_LABELS[event.type];
   const meta = [
     ...(event.metadata.changedFiles || []).map((file) => `changed: ${file}`),
@@ -211,7 +258,7 @@ function renderEvent(event) {
   const badge = kind ? `<span class="kind-badge ${kind}">${escapeHtml(kind)}</span>` : "";
   const parent = event.metadata.replyTo ? eventLookup.get(event.metadata.replyTo) : null;
   const quote = parent
-    ? `<div class="reply-quote">↳ ${escapeHtml(parent.agent_id ? (parent.agent_name || "Agent") : "You")}: ${escapeHtml((parent.message || "").slice(0, 100))}</div>`
+    ? `<div class="reply-quote">↳ ${escapeHtml(eventIsHuman(parent) ? "You" : eventAuthorName(parent))}: ${escapeHtml((parent.message || "").slice(0, 100))}</div>`
     : "";
   const parsed = parseAttachmentMarkers(event.message);
   const body = parsed.message ? `<div class="event-body markdown">${renderSafeMarkdown(parsed.message)}</div>` : "";
@@ -303,6 +350,8 @@ function renderTask(task) {
   $("#task-title").textContent = task.title;
   renderTaskDescription(task.description);
   $("#task-version").textContent = `v${task.version}`;
+  const taskRuntime = runtimeProfileLabel(task.baseRuntimeProfile);
+  $("#edit-task-runtime").textContent = taskRuntime ? `Task runtime: ${taskRuntime}` : "Set task runtime";
   $("#copy-task-invite").textContent = task.session_policy === "manual" ? "Invite agent" : "Fresh-session invite";
   const eventList = $("#event-list");
   const nearBottom = eventList.scrollHeight - eventList.scrollTop - eventList.clientHeight < 220;
@@ -334,7 +383,7 @@ function renderTask(task) {
       : "";
     const assessment = item.assessment;
     const assessmentView = assessment
-      ? `<div class="complexity"><strong>${escapeHtml(assessment.level)} · score ${Number(assessment.score)}</strong><span>${escapeHtml(assessment.requirements.modelClass)} / ${escapeHtml(assessment.requirements.effortClass)}</span><small>${assessment.reasons.slice(0, 2).map((reason) => escapeHtml(reason.detail)).join(" · ") || "Scoped baseline work."}</small></div>`
+      ? `<div class="complexity"><strong>${escapeHtml(assessment.level)} · score ${Number(assessment.score)}</strong><span>${escapeHtml(assignmentRuntimeLabel(item))}</span><small>${assessment.reasons.slice(0, 2).map((reason) => escapeHtml(reason.detail)).join(" · ") || "Scoped baseline work."}</small></div>`
       : `<div class="complexity pending"><small>Complexity assessment pending</small></div>`;
     const runtimeDecision = item.runtimeDecision ? `<small class="runtime-decision">Runtime: ${escapeHtml(item.runtimeDecision.choice)} by ${escapeHtml(item.runtimeDecision.actor)}</small>` : "";
     const runtime = item.status === "queued" && assessment
@@ -588,10 +637,12 @@ function renderAgentList() {
       ? `<button class="row-delete" data-forget-agent="${agent.id}" data-forget-name="${escapeHtml(agent.name)}" title="Remove this unresponsive agent from DevTeam" aria-label="Remove ${escapeHtml(agent.name)}">×</button>`
       : "";
     const profile = agent.runtimeProfile;
+    const profileLabel = runtimeProfileLabel(profile);
     const runtime = profile
-      ? `<small class="runtime-profile">${escapeHtml(profile.currentModel || "unknown model")} · ${escapeHtml(profile.currentEffort || "unknown effort")} · ${escapeHtml(profile.source)}${profile.stale ? " · expired" : ""}</small>`
-      : `<small class="runtime-profile unknown">Runtime not advertised</small>`;
-    return `<div class="agent"><div class="avatar">${initials(agent.name)}</div><div class="agent-info"><strong>${escapeHtml(agent.name)}${unread}</strong><small>${escapeHtml(agent.provider)} · ${escapeHtml(agent.status)} · session ${Number(agent.session_generation || 1)}</small>${runtime}<small class="activity">${escapeHtml(activityLine(agent))}</small></div><span class="agent-actions"><span class="agent-status ${agent.status} ${freshness(agent.last_seen)}" title="${escapeHtml(agent.status)} · seen ${relativeTime(agent.last_seen)}"></span>${forget}</span></div>`;
+      ? `<small class="runtime-profile">${escapeHtml(profileLabel || "Registered profile has no valid current selection")} · ${escapeHtml(profile.source)}${profile.stale ? " · expired" : ""}</small>`
+      : `<small class="runtime-profile unknown">Model gating inactive — no runtime profile registered for this agent</small>`;
+    const editRuntime = `<button class="row-runtime" data-edit-agent-runtime="${escapeHtml(agent.id)}" title="Set or correct ${escapeHtml(agent.name)}'s real model and effort options" aria-label="Edit runtime profile for ${escapeHtml(agent.name)}">⚙</button>`;
+    return `<div class="agent"><div class="avatar">${initials(agent.name)}</div><div class="agent-info"><strong>${escapeHtml(agent.name)}${unread}</strong><small>${escapeHtml(agent.provider)} · ${escapeHtml(agent.status)} · session ${Number(agent.session_generation || 1)}</small>${runtime}<small class="activity">${escapeHtml(activityLine(agent))}</small></div><span class="agent-actions">${editRuntime}<span class="agent-status ${agent.status} ${freshness(agent.last_seen)}" title="${escapeHtml(agent.status)} · seen ${relativeTime(agent.last_seen)}"></span>${forget}</span></div>`;
   }).join("") || `<p class="hint">No agents connected. Copy the MCP setup, then invoke <code>$devteam</code> in an AI desktop.</p>`;
   renderReconnectList();
 }
@@ -770,7 +821,7 @@ document.addEventListener("click", async (event) => {
   if (replyButton) {
     const parent = eventLookup.get(Number(replyButton.dataset.reply));
     if (parent) {
-      replyTo = { id: parent.id, name: parent.agent_id ? (parent.agent_name || "Agent") : "You", snippet: (parent.message || "").slice(0, 80) };
+      replyTo = { id: parent.id, name: eventIsHuman(parent) ? "You" : eventAuthorName(parent), snippet: (parent.message || "").slice(0, 80) };
       renderReplyContext();
       $("#message-form").elements.message.focus();
     }
@@ -801,6 +852,18 @@ document.addEventListener("click", async (event) => {
     form.elements.nextAction.focus();
     return;
   }
+  const editAgentRuntimeButton = event.target.closest("[data-edit-agent-runtime]");
+  if (editAgentRuntimeButton) {
+    const agent = state.agents.find((item) => item.id === editAgentRuntimeButton.dataset.editAgentRuntime);
+    if (!agent || agent.status === "disconnected") return;
+    openRuntimeProfileEditor({
+      scopeType: "agent",
+      scopeId: agent.id,
+      scopeLabel: `${agent.name} · ${agent.provider}`,
+      profile: agent.runtimeProfile,
+    });
+    return;
+  }
   const runtimeButton = event.target.closest("[data-runtime-assignment]");
   if (runtimeButton) {
     const assignment = state?.selectedTask?.assignments.find((item) => item.id === runtimeButton.dataset.runtimeAssignment);
@@ -810,11 +873,14 @@ document.addEventListener("click", async (event) => {
     form.elements.assignmentId.value = assignment.id;
     form.elements.assessmentId.value = assignment.assessment.id;
     form.dataset.exceptional = String(Boolean(assignment.assessment.requirements.humanApprovalRequired));
-    $("#runtime-assignment-summary").textContent = `${assignment.title}: ${assignment.assessment.level} (${assignment.assessment.score}) requires ${assignment.assessment.requirements.modelClass} / ${assignment.assessment.requirements.effortClass}.`;
-    $("#runtime-reasons").innerHTML = assignment.assessment.reasons.map((reason) => `<p><strong>+${Number(reason.points)}</strong> ${escapeHtml(reason.detail)}</p>`).join("") || "<p>Baseline scoped work.</p>";
+    $("#runtime-assignment-summary").textContent = `${assignment.title}: ${assignment.assessment.level} (${assignment.assessment.score}). ${assignmentRuntimeLabel(assignment)}.`;
+    $("#runtime-reasons").innerHTML = assignment.assessment.reasons.map((reason) => {
+      const source = reason.source === "task" ? "from the task description" : "from the assignment";
+      return `<p><strong>+${Number(reason.points)}</strong> ${escapeHtml(reason.detail)} <small>· ${escapeHtml(source)}</small></p>`;
+    }).join("") || "<p>Baseline scoped work.</p>";
     $("#runtime-exceptional-confirm").classList.toggle("hidden", !assignment.assessment.requirements.humanApprovalRequired);
-    const agents = state.agents.filter((agent) => agent.status !== "disconnected" && agent.runtimeProfile);
-    $("#runtime-agent").innerHTML = agents.map((agent) => `<option value="${agent.id}">${escapeHtml(agent.name)} · ${escapeHtml(agent.runtimeProfile.currentModel || "unknown")}</option>`).join("");
+    const agents = state.agents.filter((agent) => agent.status !== "disconnected");
+    $("#runtime-agent").innerHTML = agents.map((agent) => `<option value="${escapeHtml(agent.id)}">${escapeHtml(agent.name)} · ${escapeHtml(runtimeProfileLabel(agent.runtimeProfile || state.selectedTask.baseRuntimeProfile) || "no runtime profile")}</option>`).join("") || '<option value="">No connected agents</option>';
     populateRuntimeOptions();
     $("#runtime-dialog").showModal();
     return;
@@ -868,23 +934,197 @@ $("#project-form").addEventListener("submit", async (event) => {
   } catch (error) { toast(error.message); }
 });
 
+function runtimeClassOptions(values, selected) {
+  return values.map((value) => `<option value="${value}" ${value === selected ? "selected" : ""}>${escapeHtml(value.replace("_", " "))}</option>`).join("");
+}
+
+function renderProfileModelRows() {
+  $("#profile-model-list").innerHTML = profileDraftModels.map((model, modelIndex) => `
+    <section class="profile-model-card">
+      <div class="profile-model-head"><strong>Model ${modelIndex + 1}</strong><button type="button" class="row-delete visible" data-profile-remove-model="${modelIndex}" aria-label="Remove model ${modelIndex + 1}">×</button></div>
+      <div class="profile-grid">
+        <label>Model ID<input data-profile-model-field="id" data-model-index="${modelIndex}" value="${escapeHtml(model.id || "")}" placeholder="desktop-model-id" required></label>
+        <label>Display name<input data-profile-model-field="label" data-model-index="${modelIndex}" value="${escapeHtml(model.label || "")}" placeholder="Clear model name" required></label>
+        <label>Capability class<select data-profile-model-field="class" data-model-index="${modelIndex}">${runtimeClassOptions(MODEL_CLASSES, model.class)}</select></label>
+      </div>
+      <div class="profile-effort-list">${(model.efforts || []).map((effort, effortIndex) => `
+        <div class="profile-effort-row">
+          <input data-profile-effort-field="id" data-model-index="${modelIndex}" data-effort-index="${effortIndex}" value="${escapeHtml(effort.id || "")}" placeholder="effort-id" aria-label="Effort ID" required>
+          <input data-profile-effort-field="label" data-model-index="${modelIndex}" data-effort-index="${effortIndex}" value="${escapeHtml(effort.label || "")}" placeholder="Display label" aria-label="Effort display label" required>
+          <select data-profile-effort-field="class" data-model-index="${modelIndex}" data-effort-index="${effortIndex}" aria-label="Effort class">${runtimeClassOptions(EFFORT_CLASSES, effort.class)}</select>
+          <button type="button" class="row-delete visible" data-profile-remove-effort="${modelIndex}:${effortIndex}" aria-label="Remove effort">×</button>
+        </div>`).join("")}</div>
+      <button type="button" class="secondary profile-add-effort" data-profile-add-effort="${modelIndex}">Add effort</button>
+    </section>`).join("");
+  populateProfileCurrentOptions(profileDraftCurrentModel, profileDraftCurrentEffort);
+}
+
+function populateProfileCurrentOptions(requestedModel = "", requestedEffort = "") {
+  const models = profileDraftModels.filter((model) => String(model.id || "").trim());
+  const modelId = models.some((model) => model.id === requestedModel) ? requestedModel : (models[0]?.id || "");
+  profileDraftCurrentModel = modelId;
+  $("#profile-current-model").innerHTML = models.map((model) => `<option value="${escapeHtml(model.id)}" ${model.id === modelId ? "selected" : ""}>${escapeHtml(model.label || model.id)} · ${escapeHtml(model.class)}</option>`).join("") || '<option value="">Add a model first</option>';
+  const model = models.find((item) => item.id === modelId);
+  const efforts = (model?.efforts || []).filter((effort) => String(effort.id || "").trim());
+  const effortId = efforts.some((effort) => effort.id === requestedEffort) ? requestedEffort : (efforts[0]?.id || "");
+  profileDraftCurrentEffort = effortId;
+  $("#profile-current-effort").innerHTML = efforts.map((effort) => `<option value="${escapeHtml(effort.id)}" ${effort.id === effortId ? "selected" : ""}>${escapeHtml(effort.label || effort.id)} · ${escapeHtml(effort.class)}</option>`).join("") || '<option value="">Add an effort first</option>';
+}
+
+function openRuntimeProfileEditor({ scopeType, scopeId, scopeLabel, profile = null }) {
+  const form = $("#runtime-profile-form");
+  form.reset();
+  form.dataset.scopeType = scopeType;
+  form.dataset.scopeId = scopeId;
+  form.elements.providerId.value = profile?.providerId || "";
+  form.elements.switchMode.value = profile?.switchMode || "user_required";
+  profileDraftModels = (profile?.availableModels || []).map((model) => ({
+    id: model.id,
+    label: model.label,
+    class: model.class,
+    efforts: (model.efforts || []).map((effort) => ({ id: effort.id, label: effort.label, class: effort.class })),
+  }));
+  if (!profileDraftModels.length) profileDraftModels = [{ id: "", label: "", class: "balanced", efforts: [{ id: "", label: "", class: "medium" }] }];
+  for (const model of profileDraftModels) {
+    if (!model.efforts.length) model.efforts.push({ id: "", label: "", class: "medium" });
+  }
+  profileDraftCurrentModel = profile?.currentModel || "";
+  profileDraftCurrentEffort = profile?.currentEffort || "";
+  $("#runtime-profile-title").textContent = scopeType === "task" ? "Set task base runtime" : "Set agent runtime";
+  $("#runtime-profile-scope").textContent = scopeLabel;
+  $("#profile-clear-task").classList.toggle("hidden", scopeType !== "task" || !profile);
+  renderProfileModelRows();
+  $("#runtime-profile-dialog").showModal();
+}
+
+$("#profile-add-model").addEventListener("click", () => {
+  profileDraftModels.push({ id: "", label: "", class: "balanced", efforts: [{ id: "", label: "", class: "medium" }] });
+  renderProfileModelRows();
+});
+
+$("#profile-model-list").addEventListener("input", (event) => {
+  const modelField = event.target.dataset.profileModelField;
+  const effortField = event.target.dataset.profileEffortField;
+  const modelIndex = Number(event.target.dataset.modelIndex);
+  if (modelField && profileDraftModels[modelIndex]) profileDraftModels[modelIndex][modelField] = event.target.value;
+  if (effortField) {
+    const effortIndex = Number(event.target.dataset.effortIndex);
+    if (profileDraftModels[modelIndex]?.efforts[effortIndex]) profileDraftModels[modelIndex].efforts[effortIndex][effortField] = event.target.value;
+  }
+  populateProfileCurrentOptions(profileDraftCurrentModel, profileDraftCurrentEffort);
+});
+
+$("#profile-model-list").addEventListener("change", (event) => {
+  event.target.dispatchEvent(new Event("input", { bubbles: true }));
+});
+
+$("#profile-model-list").addEventListener("click", (event) => {
+  const addEffort = event.target.closest("[data-profile-add-effort]");
+  if (addEffort) {
+    profileDraftModels[Number(addEffort.dataset.profileAddEffort)].efforts.push({ id: "", label: "", class: "medium" });
+    renderProfileModelRows();
+    return;
+  }
+  const removeEffort = event.target.closest("[data-profile-remove-effort]");
+  if (removeEffort) {
+    const [modelIndex, effortIndex] = removeEffort.dataset.profileRemoveEffort.split(":").map(Number);
+    profileDraftModels[modelIndex].efforts.splice(effortIndex, 1);
+    renderProfileModelRows();
+    return;
+  }
+  const removeModel = event.target.closest("[data-profile-remove-model]");
+  if (removeModel) {
+    profileDraftModels.splice(Number(removeModel.dataset.profileRemoveModel), 1);
+    renderProfileModelRows();
+  }
+});
+
+$("#profile-current-model").addEventListener("change", (event) => populateProfileCurrentOptions(event.target.value, ""));
+$("#profile-current-effort").addEventListener("change", (event) => { profileDraftCurrentEffort = event.target.value; });
+
+$("#runtime-profile-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.target;
+  const models = profileDraftModels.map((model) => ({
+    id: String(model.id || "").trim(),
+    label: String(model.label || "").trim(),
+    class: model.class,
+    efforts: (model.efforts || []).map((effort) => ({ id: String(effort.id || "").trim(), label: String(effort.label || "").trim(), class: effort.class })),
+  }));
+  if (!models.length || models.some((model) => !model.id || !model.label || !model.efforts.length || model.efforts.some((effort) => !effort.id || !effort.label))) {
+    toast("Every model and effort needs an ID and a clear display name");
+    return;
+  }
+  if (new Set(models.map((model) => model.id)).size !== models.length || models.some((model) => new Set(model.efforts.map((effort) => effort.id)).size !== model.efforts.length)) {
+    toast("Model and effort IDs must be unique within the profile");
+    return;
+  }
+  const values = Object.fromEntries(new FormData(form));
+  const currentModel = models.find((model) => model.id === values.currentModel);
+  if (!currentModel?.efforts.some((effort) => effort.id === values.currentEffort)) { toast("Choose a valid current model and effort"); return; }
+  const profile = {
+    providerId: values.providerId,
+    currentModel: values.currentModel,
+    currentEffort: values.currentEffort,
+    availableModels: models,
+    switchMode: values.switchMode,
+    source: "user",
+    observedAt: new Date().toISOString(),
+  };
+  try {
+    if (form.dataset.scopeType === "task") {
+      await api(`/api/tasks/${form.dataset.scopeId}`, { method: "PATCH", body: JSON.stringify({ baseRuntimeProfile: profile }) });
+    } else {
+      await api(`/api/agents/${form.dataset.scopeId}/runtime`, { method: "PUT", body: JSON.stringify({ profile }) });
+    }
+    form.closest("dialog").close();
+    await refresh();
+    if ($("#runtime-dialog").open) populateRuntimeOptions();
+    toast("Runtime profile saved with real model names");
+  } catch (error) { toast(error.message); }
+});
+
+$("#profile-clear-task").addEventListener("click", async () => {
+  const form = $("#runtime-profile-form");
+  if (form.dataset.scopeType !== "task" || !confirm("Clear this task's base runtime profile? Model gating stays inactive for agents that do not advertise their own profile.")) return;
+  try {
+    await api(`/api/tasks/${form.dataset.scopeId}`, { method: "PATCH", body: JSON.stringify({ baseRuntimeProfile: null }) });
+    $("#runtime-profile-dialog").close();
+    await refresh();
+    toast("Task runtime profile cleared");
+  } catch (error) { toast(error.message); }
+});
+
 const checkpointLines = (value) => String(value || "").split("\n").map((line) => line.trim()).filter(Boolean);
 
 function selectedRuntimeAgent() {
   return state?.agents.find((agent) => agent.id === $("#runtime-agent").value) || null;
 }
 
+function selectedRuntimeProfile() {
+  return selectedRuntimeAgent()?.runtimeProfile || state?.selectedTask?.baseRuntimeProfile || null;
+}
+
 function populateRuntimeOptions(requestedModel = null) {
-  const profile = selectedRuntimeAgent()?.runtimeProfile;
+  const agent = selectedRuntimeAgent();
+  const profile = selectedRuntimeProfile();
   const models = profile?.availableModels || [];
   const selectedModel = models.some((model) => model.id === requestedModel) ? requestedModel : profile?.currentModel;
   $("#runtime-model").innerHTML = models.map((model) => `<option value="${escapeHtml(model.id)}" ${model.id === selectedModel ? "selected" : ""}>${escapeHtml(model.label)} · ${escapeHtml(model.class)}</option>`).join("") || '<option value="">No advertised models</option>';
   const model = models.find((item) => item.id === selectedModel) || models[0];
   $("#runtime-effort").innerHTML = (model?.efforts || []).map((effort) => `<option value="${escapeHtml(effort.id)}" ${effort.id === profile?.currentEffort ? "selected" : ""}>${escapeHtml(effort.label)} · ${escapeHtml(effort.class)}</option>`).join("") || '<option value="">No advertised efforts</option>';
+  $("#runtime-profile-state").textContent = profile
+    ? `${agent?.runtimeProfile ? "Agent profile" : "Task base profile"}: ${runtimeProfileLabel(profile) || "no valid current selection"}`
+    : "Model gating inactive — no runtime profile registered for this agent";
 }
 
 $("#runtime-agent").addEventListener("change", populateRuntimeOptions);
 $("#runtime-model").addEventListener("change", (event) => populateRuntimeOptions(event.target.value));
+$("#runtime-edit-profile").addEventListener("click", () => {
+  const agent = selectedRuntimeAgent();
+  if (!agent) { toast("Choose a connected agent first"); return; }
+  openRuntimeProfileEditor({ scopeType: "agent", scopeId: agent.id, scopeLabel: `${agent.name} · ${agent.provider}`, profile: agent.runtimeProfile });
+});
 $("#runtime-form").addEventListener("click", async (event) => {
   const button = event.target.closest("[data-runtime-choice]");
   if (!button) return;
@@ -897,12 +1137,12 @@ $("#runtime-form").addEventListener("click", async (event) => {
   button.disabled = true;
   try {
     if (choice === "switched") {
-      const agent = selectedRuntimeAgent();
-      const advertised = agent.runtimeProfile.availableModels.find((model) => model.id === values.modelId);
+      const profile = selectedRuntimeProfile();
+      const advertised = profile?.availableModels.find((model) => model.id === values.modelId);
       const effort = advertised?.efforts.find((item) => item.id === values.effortId);
       if (!advertised || !effort) throw new Error("Choose a host-advertised model and effort before confirming the switch.");
       await api(`/api/agents/${values.agentId}/runtime`, { method: "PUT", body: JSON.stringify({ profile: {
-        ...agent.runtimeProfile,
+        ...profile,
         currentModel: advertised.id,
         currentEffort: effort.id,
         currentModelClass: advertised.class,
@@ -982,6 +1222,11 @@ function openTaskEditor() {
 }
 
 $("#edit-task").addEventListener("click", openTaskEditor);
+$("#edit-task-runtime").addEventListener("click", () => {
+  const task = state?.selectedTask;
+  if (!task) return;
+  openRuntimeProfileEditor({ scopeType: "task", scopeId: task.id, scopeLabel: `Default runtime for “${task.title}”`, profile: task.baseRuntimeProfile });
+});
 $("#edit-task-from-brief").addEventListener("click", () => {
   $("#task-brief-dialog").close();
   openTaskEditor();
