@@ -381,6 +381,11 @@ function renderTask(task) {
     const blockedBy = item.blockedBy?.length
       ? `<div class="dependency-wait"><strong>Waiting for</strong>${item.blockedBy.map((dependency) => `<span>${escapeHtml(dependency.title)} · ${escapeHtml(dependency.status)}</span>`).join("")}</div>`
       : "";
+    // A queued item nobody is picking up used to look identical to one about to be claimed. The
+    // scheduler now says why, so a stall is visible on the card instead of only in a log.
+    const hold = item.schedulingHold
+      ? `<div class="scheduling-hold"><strong>Held back</strong><span>${escapeHtml(item.schedulingHold.detail)}</span></div>`
+      : "";
     const assessment = item.assessment;
     const assessmentView = assessment
       ? `<div class="complexity"><strong>${escapeHtml(assessment.level)} · score ${Number(assessment.score)}</strong><span>${escapeHtml(assignmentRuntimeLabel(item))}</span><small>${assessment.reasons.slice(0, 2).map((reason) => escapeHtml(reason.detail)).join(" · ") || "Scoped baseline work."}</small></div>`
@@ -389,7 +394,7 @@ function renderTask(task) {
     const runtime = item.status === "queued" && assessment
       ? `<button class="mini runtime" data-runtime-assignment="${item.id}" title="Review the provider-neutral runtime recommendation">Runtime settings</button>`
       : "";
-    return `<div class="assignment"><div class="assignment-top"><strong>${escapeHtml(item.title)}</strong><span class="role">${escapeHtml(item.role)}</span></div><p>${escapeHtml(item.agent_name ? `${item.agent_name} · ${item.status}` : item.status)}${item.requires_write ? " · write lease" : ""}</p>${assessmentView}${runtimeDecision}${blockedBy}${scope}${checklist}<div class="assignment-actions">${runtime}${checkpoint}${release}</div></div>`;
+    return `<div class="assignment"><div class="assignment-top"><strong>${escapeHtml(item.title)}</strong><span class="role">${escapeHtml(item.role)}</span></div><p>${escapeHtml(item.agent_name ? `${item.agent_name} · ${item.status}` : item.status)}${item.requires_write ? " · write lease" : ""}</p>${assessmentView}${runtimeDecision}${hold}${blockedBy}${scope}${checklist}<div class="assignment-actions">${runtime}${checkpoint}${release}</div></div>`;
   }).join("") || `<p class="hint">Waiting for the plan</p>`;
   renderSessionCheckpoints(task);
   renderBlackboard(task);

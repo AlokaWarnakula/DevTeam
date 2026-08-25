@@ -1022,6 +1022,26 @@
   text-transform: uppercase;
 }
 
+/* Why a queued item is not moving: the scheduler's own reason, on the card. */
+.scheduling-hold {
+  display: grid;
+  gap: 3px;
+  margin-top: 7px;
+  padding: 7px 8px;
+  border-left: 2px solid var(--amber);
+  border-radius: 0 6px 6px 0;
+  background: color-mix(in srgb, var(--amber) 10%, transparent);
+  color: #b6c0cc;
+  font-size: 10.5px;
+}
+
+.scheduling-hold strong {
+  color: var(--amber);
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
 .role-agent-hint {
   margin-top: -5px;
 }

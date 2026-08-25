@@ -500,6 +500,23 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
     return disconnectAfter ? result : withInbox(args.agentId, result);
   }));
 
+  server.registerTool("devteam_why_blocked", {
+    title: "Ask why work is not claimable",
+    description: "Idle with work on the board? Ask the scheduler for the full ordered reason chain instead of guessing. Omit assignmentId to get every queued item in your rooms; pass one to ask about a specific assignment. Reason codes name the actual blocker (the writer you wait for, the agent holding an overlapping write lease, each unmet dependency, the runtime gap).",
+    inputSchema: {
+      agentId: z.string().uuid(),
+      assignmentId: z.string().uuid().optional().describe("A specific queued assignment; omit to explain everything queued in your rooms."),
+      taskId: z.string().uuid().optional().describe("Narrow the bulk answer to one task room."),
+    },
+  }, safe(async ({ agentId, assignmentId, taskId }) => {
+    requireIdentity(agentId);
+    store.heartbeat(agentId);
+    if (!assignmentId) return withInbox(agentId, store.whyNoClaimableWork(agentId, taskId || null));
+    const explanation = store.whyNotClaimable(assignmentId, agentId);
+    store.assertExplainable(agentId, explanation.taskId);
+    return withInbox(agentId, explanation);
+  }));
+
   server.registerTool("devteam_approve", {
     title: "Approve current task version",
     description: "Approve only after completing an independent read-only reviewer or tester assignment on the current version. Consensus accepts the task and keeps its agents assembled briefly for a same-conversation follow-up instead of disconnecting them.",

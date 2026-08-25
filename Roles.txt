@@ -1,0 +1,2 @@
+Claude → Implementer + Tester + Researcher
+Codex → Planner + Reviewer + Security Reviewer
