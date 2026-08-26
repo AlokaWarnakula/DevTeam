@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DevTeamStore } from "../src/devteam/store.mjs";
@@ -249,4 +250,34 @@ test("restart-safe migration recreates the additive checkpoint table without alt
   }
   assert.equal(migrated.getTask(task.id).title, task.title);
   migrated.close();
+});
+
+test("a project with no git still detects that its files moved under a checkpoint", async (t) => {
+  // T1.4: git is optional. Without a repository the fingerprint used to be the task version alone,
+  // so a manuscript, research folder or data directory got no drift signal at all.
+  const { store, task, oldAgent, assignment, projectRoot } = await fixture(t);
+  assert.equal(existsSync(path.join(projectRoot, ".git")), false, "the fixture project is not a repository");
+  await mkdir(path.join(projectRoot, "chapters"), { recursive: true });
+  await writeFile(path.join(projectRoot, "chapters", "one.md"), "First draft.\n", "utf8");
+  store.db.prepare("INSERT OR REPLACE INTO assignment_write_scopes (assignment_id, paths) VALUES (?, ?)")
+    .run(assignment.id, JSON.stringify(["chapters"]));
+  store.db.prepare("UPDATE assignments SET requires_write = 1 WHERE id = ?").run(assignment.id);
+
+  const checkpoint = await store.createSessionCheckpoint({ agentId: oldAgent.id, taskId: task.id, assignmentId: assignment.id });
+  const fingerprint = checkpoint.checkpoint.repositoryFingerprint;
+  assert.equal(fingerprint.isRepository, false);
+  assert.equal(fingerprint.gitHead, null, "no repository, no HEAD — that is a supported state, not an error");
+  assert.ok(fingerprint.workspaceDigest, "but the scope still has a fingerprint");
+
+  // Someone edits the chapter outside DevTeam while the session is away.
+  await new Promise((resolve) => setTimeout(resolve, 12));
+  await writeFile(path.join(projectRoot, "chapters", "one.md"), "First draft, heavily revised.\n", "utf8");
+
+  const fresh = store.connectAgent({ name: "Fresh writer", provider: "test", freshTaskId: task.id });
+  const taken = await store.takeoverSessionCheckpoint({
+    agentId: fresh.id, taskId: task.id, checkpointId: checkpoint.checkpoint.id, handoffToken: checkpoint.handoffToken,
+  });
+  assert.ok(taken.warnings.some((warning) => /scope changed since the checkpoint/i.test(warning)),
+    "the new session is told the files moved, without git being involved");
+  assert.notEqual(taken.repositoryFingerprintNow.workspaceDigest, fingerprint.workspaceDigest);
 });

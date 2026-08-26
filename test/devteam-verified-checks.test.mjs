@@ -10,6 +10,7 @@ import {
   matchCheckCommand,
   normalizeCheckCommand,
   packageScriptCommands,
+  resolveLocalBinary,
   parseScriptCommand,
   runVerifiedCheck,
   sandboxFlagsFor,
@@ -219,7 +220,10 @@ test("the allowlist is a pinned snapshot, so rewriting package.json changes noth
   assert.match(result.checks[0].output, /142\/142 passing/);
 
   // The human can see the drift and re-snapshot deliberately.
-  assert.deepEqual(store.availableCheckCommands(project.id), [{ name: "test", argv: ["node", "scripts/fail.mjs"] }]);
+  // Reading what is *available* does reflect the rewrite — that is the point of showing a human
+  // what enabling would allow — and now says where each entry came from.
+  assert.deepEqual(store.availableCheckCommands(project.id),
+    [{ name: "test", argv: ["node", "scripts/fail.mjs"], source: "package.json" }]);
   store.setProjectCheckCommands({ projectId: project.id });
   assert.deepEqual(store.projectCheckCommands(project.id), [{ name: "test", argv: ["node", "scripts/fail.mjs"] }]);
 });
@@ -662,4 +666,97 @@ async function doWork(store, agent, task, title, { changedFiles = [], checks = [
     message: `${title} done.`, changedFiles, checks,
   }) };
 }
+
+test("a project with no package.json can still declare and run real checks", async (t) => {
+  // A research project: Python tooling, no Node package anywhere. Before this it could report checks
+  // but never have any of them verified, so every claim stayed agent-asserted forever.
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-declared-data-"));
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "devteam-declared-project-"));
+  const store = new DevTeamStore(dataDir, { knowledge: { enabled: false }, codegraph: { enabled: false }, checks: { timeoutMs: 20_000 } });
+  t.after(async () => {
+    try { store.close(); } catch { /* closed */ }
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  });
+  await mkdir(path.join(projectRoot, "tools"), { recursive: true });
+  await mkdir(path.join(projectRoot, ".devteam"), { recursive: true });
+  await writeFile(path.join(projectRoot, "tools", "citations.mjs"), "process.stdout.write('all citations resolve');\n", "utf8");
+  await writeFile(path.join(projectRoot, ".devteam", "checks.json"), JSON.stringify({
+    checks: [
+      { name: "citations", argv: ["node", "tools/citations.mjs"] },
+      { name: "shell-attempt", argv: ["bash", "-c", "echo nope"] },
+    ],
+  }, null, 2), "utf8");
+
+  const project = store.ensureProject("Research project", projectRoot);
+  const available = store.availableCheckCommands(project.id);
+  assert.deepEqual(available.map((entry) => entry.name), ["citations"],
+    "a declared entry that is a way to run something else is refused, exactly as a derived one is");
+  assert.equal(available[0].source, "project");
+
+  store.setProjectCheckCommands({ projectId: project.id });
+  const task = store.createTask({ projectId: project.id, title: "Write it up", description: "Not a Node project." });
+  const agent = store.connectAgent({ name: "Researcher", provider: "test", freshTaskId: task.id });
+  const plan = store.claimNextAssignment(agent.id);
+  await store.completeAssignment({ agentId: agent.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+
+  const claim = claimWork(store, agent, task, "Check the citations");
+  const result = await store.completeAssignment({
+    agentId: agent.id, assignmentId: claim.id, claimToken: claim.claimToken,
+    message: "Checked.", checks: [{ label: "citations resolve", command: "citations" }],
+  });
+  assert.equal(result.completed, true);
+  assert.equal(result.checks[0].verified, true, "a project that declares its own checks gets real verification");
+  assert.equal(result.checks[0].status, "passed");
+});
+
+test("a declared check overrides a package script of the same name", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-override-data-"));
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "devteam-override-project-"));
+  const store = new DevTeamStore(dataDir, { knowledge: { enabled: false }, codegraph: { enabled: false } });
+  t.after(async () => {
+    try { store.close(); } catch { /* closed */ }
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  });
+  await mkdir(path.join(projectRoot, ".devteam"), { recursive: true });
+  await writeFile(path.join(projectRoot, "package.json"), JSON.stringify({ scripts: { test: "node from-package.mjs" } }), "utf8");
+  await writeFile(path.join(projectRoot, ".devteam", "checks.json"), JSON.stringify({
+    checks: [{ name: "test", argv: ["node", "from-config.mjs"] }],
+  }), "utf8");
+  const project = store.ensureProject("Override project", projectRoot);
+  const available = store.availableCheckCommands(project.id);
+  assert.equal(available.length, 1);
+  assert.deepEqual(available[0].argv, ["node", "from-config.mjs"],
+    "a human writing the file outranks a script body DevTeam parsed");
+});
+
+test("a locally installed tool is resolved to its real entry point instead of an unrunnable shim", async (t) => {
+  // The Windows failure this fixes: `eslint` is a .cmd shim, spawn with shell:false cannot run it,
+  // and the check graded 'unavailable' forever — indistinguishable from having no verification.
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "devteam-shim-"));
+  t.after(async () => { await rm(projectRoot, { recursive: true, force: true }); });
+  const binDirectory = path.join(projectRoot, "node_modules", ".bin");
+  await mkdir(binDirectory, { recursive: true });
+  await mkdir(path.join(projectRoot, "node_modules", "toolkit", "bin"), { recursive: true });
+  await writeFile(path.join(projectRoot, "node_modules", "toolkit", "bin", "cli.js"), "process.exit(0);\n", "utf8");
+  await writeFile(path.join(binDirectory, "toolkit.cmd"),
+    String.raw`@ECHO off\r\n"%_prog%" "%dp0%\\..\\toolkit\\bin\\cli.js" %*`, "utf8");
+
+  assert.deepEqual(resolveLocalBinary(projectRoot, ["toolkit", "--strict"]),
+    ["node", "node_modules/toolkit/bin/cli.js", "--strict"],
+    "the shim is read at snapshot time and rewritten to run its entry point under node");
+
+  // Nothing else is touched: node stays node, an absolute-looking program is left alone, and a
+  // program with no shim is left exactly as written.
+  assert.deepEqual(resolveLocalBinary(projectRoot, ["node", "--test"]), ["node", "--test"]);
+  assert.deepEqual(resolveLocalBinary(projectRoot, ["nothing-here", "x"]), ["nothing-here", "x"]);
+  assert.deepEqual(resolveLocalBinary(null, ["toolkit"]), ["toolkit"]);
+
+  // A shim pointing outside the project is refused rather than run on its say-so.
+  await writeFile(path.join(binDirectory, "escapee.cmd"), String.raw`"%_prog%" "%dp0%\\..\\..\\..\\outside\\evil.js" %*`, "utf8");
+  assert.deepEqual(resolveLocalBinary(projectRoot, ["escapee"]), ["escapee"]);
+});
+
+// --- T2.4 / T2.5: independence and reliability ----------------------------------------------------
 

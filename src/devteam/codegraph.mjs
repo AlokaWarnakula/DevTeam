@@ -10,18 +10,16 @@ import {
 } from "node:fs";
 import path from "node:path";
 import { atomicWrite, redact, secretLike, slugify } from "./knowledge.mjs";
+import { buildParserRegistry, MAX_EXPORTS, MAX_IMPORTS, MAX_SPECIFIER_LENGTH, MAX_SYMBOL_LENGTH } from "./parsers.mjs";
 
-const SOURCE_EXTENSIONS = new Set([".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".json"]);
-const LEAF_EXTENSIONS = ["", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json"];
-const INDEX_EXTENSIONS = ["/index.ts", "/index.tsx", "/index.js", "/index.jsx", "/index.mjs", "/index.cjs"];
+// Which file types are artifacts, and how each is read, now comes from the parser registry rather
+// than a JS/TS list here. See parsers.mjs for the interface and why every parser is a bounded regex.
+const REGISTRY = buildParserRegistry((value, max) => safeString(value, max));
+const SOURCE_EXTENSIONS = REGISTRY.extensions;
 const IGNORED_DIRECTORIES = new Set([
   "node_modules", ".git", "dist", "build", "out", "coverage", ".next", ".cache", ".turbo", "knowledge",
 ]);
 const MAX_FILE_BYTES = 256 * 1024;
-const MAX_IMPORTS = 100;
-const MAX_EXPORTS = 100;
-const MAX_SPECIFIER_LENGTH = 500;
-const MAX_SYMBOL_LENGTH = 120;
 const GENERATED_MARKER = "generated_by: DevTeam CodeGraph";
 
 const now = () => new Date().toISOString();
@@ -34,56 +32,24 @@ const posix = (value) => String(value || "").replace(/\\/g, "/");
 const safeString = (value, max) => redact(String(value || "").trim()).slice(0, max);
 
 function languageFor(file) {
-  const extension = path.extname(file).toLowerCase();
-  return ({ ".js": "javascript", ".mjs": "javascript", ".cjs": "javascript", ".ts": "typescript", ".jsx": "jsx", ".tsx": "tsx", ".json": "json" })[extension] || null;
+  return REGISTRY.for(file)?.language(file) || null;
 }
 
-function parseSource(source) {
-  const imports = [];
-  const exports = [];
-  const addImport = (specifier) => {
-    const clean = safeString(specifier, MAX_SPECIFIER_LENGTH);
-    if (clean && imports.length < MAX_IMPORTS) imports.push(clean);
-  };
-  const addExport = (symbol) => {
-    const clean = safeString(symbol, MAX_SYMBOL_LENGTH);
-    if (clean && exports.length < MAX_EXPORTS) exports.push(clean);
-  };
-
-  // v1 deliberately uses bounded regex heuristics. Import-like text in comments or strings may be mis-detected.
-  for (const pattern of [
-    /\b(?:import|export)\s+(?:[\s\S]*?\s+from\s+)?["']([^"'\r\n]+)["']/g,
-    /\bimport\s*\(\s*["']([^"'\r\n]+)["']\s*\)/g,
-    /\brequire\s*\(\s*["']([^"'\r\n]+)["']\s*\)/g,
-  ]) {
-    for (const match of source.matchAll(pattern)) addImport(match[1]);
-  }
-
-  for (const match of source.matchAll(/\bexport\s+(?:declare\s+)?(?:async\s+)?(?:function|class|const|let|var|interface|type|enum)\s+([A-Za-z_$][\w$]*)/g)) addExport(match[1]);
-  if (/\bexport\s+default\b/.test(source)) addExport("default");
-  for (const match of source.matchAll(/\bexport\s*\{([^}]{0,4000})\}/g)) {
-    for (const item of match[1].split(",").slice(0, MAX_EXPORTS)) {
-      const clean = item.trim().replace(/^type\s+/, "");
-      if (!clean) continue;
-      const parts = clean.split(/\s+as\s+/i).map((part) => part.trim());
-      addExport(parts[1] || parts[0]);
-    }
-  }
-  for (const match of source.matchAll(/\b(?:module\.exports|exports)\.([A-Za-z_$][\w$]*)\s*=/g)) addExport(match[1]);
-  for (const match of source.matchAll(/\bmodule\.exports\s*=\s*\{([^}]{0,4000})\}/g)) {
-    for (const item of match[1].split(",").slice(0, MAX_EXPORTS)) {
-      const symbol = item.trim().split(/\s*:\s*/)[0]?.trim();
-      if (/^[A-Za-z_$][\w$]*$/.test(symbol || "")) addExport(symbol);
-    }
-  }
-
-  const normalizedImports = uniqueSorted(imports, MAX_IMPORTS);
+// Kept only so the existing JS/TS unit expectations keep a name to call. New work should go through
+// the registry, which is what the scanner uses.
+function parseSource(source, filePath = "file.mjs") {
+  const parser = REGISTRY.for(filePath);
+  if (!parser) return { exports: [], imports: [], dependencies: [] };
+  const parsed = parser.parse(source, filePath);
   return {
-    exports: uniqueSorted(exports, MAX_EXPORTS),
-    imports: normalizedImports,
-    dependencies: normalizedImports.filter((specifier) => !specifier.startsWith("./") && !specifier.startsWith("../")),
+    exports: parsed.exports,
+    imports: parsed.imports,
+    // What counts as "outside the project" is the parser's call: `./x` in JavaScript, a leading dot
+    // in Python, and nothing at all in prose, where every specifier is a path.
+    dependencies: parsed.imports.filter((specifier) => parser.external(specifier)),
   };
 }
+
 
 export class CodeGraph {
   constructor(db, {
@@ -247,7 +213,7 @@ export class CodeGraph {
     if (source.includes("\uFFFD")) return { invalid: true, path: item.path };
     const hash = sha(body);
     if (existing?.hash === hash) return { unchanged: true, path: item.path, size: item.size, mtimeMs: item.mtimeMs };
-    const parsed = path.extname(item.path).toLowerCase() === ".json" ? { exports: [], imports: [], dependencies: [] } : parseSource(source);
+    const parsed = parseSource(source, item.path);
     return {
       id: sha(`${item.projectId}:${item.path}`).slice(0, 24),
       path: safeString(item.path, 500),
@@ -283,20 +249,26 @@ export class CodeGraph {
     this.db.prepare("DELETE FROM code_modules WHERE project_id = ? AND path = ?").run(projectId, modulePath);
   }
 
+  // Resolution belongs to the parser: `./util` means util.ts in JavaScript, `from .util import x`
+  // means util/__init__.py in Python, and `[[decisions/x]]` in prose means a Markdown file. Each
+  // parser proposes candidates in preference order and the first one that actually exists wins, so
+  // a parser may guess freely — a wrong guess costs an edge, never a wrong edge.
   #resolveImport(fromPath, specifier, inventory) {
-    if (!specifier.startsWith("./") && !specifier.startsWith("../")) return null;
-    const base = path.posix.normalize(path.posix.join(path.posix.dirname(fromPath), specifier));
-    if (!base || base === ".." || base.startsWith("../") || base.startsWith("/")) return null;
-    for (const suffix of [...LEAF_EXTENSIONS, ...INDEX_EXTENSIONS]) {
-      const candidate = path.posix.normalize(`${base}${suffix}`);
-      if (inventory.has(candidate)) return candidate;
+    const parser = REGISTRY.for(fromPath);
+    if (!parser) return null;
+    for (const candidate of parser.resolve(specifier, fromPath).slice(0, 20)) {
+      const normalized = path.posix.normalize(candidate);
+      if (normalized && !normalized.startsWith("..") && inventory.has(normalized)) return normalized;
     }
     return null;
   }
 
   #rebuildEdges(projectId) {
     const inventory = new Set(this.db.prepare("SELECT path FROM code_modules WHERE project_id = ?").all(projectId).map((row) => row.path));
-    const imports = this.db.prepare("SELECT from_path, specifier, kind FROM code_imports WHERE project_id = ? AND is_bare = 0 ORDER BY from_path, specifier").all(projectId);
+    // Every recorded import is offered for resolution, not just the ones classified as intra-project.
+    // Python's `from mypkg.core import x` is "bare" by its parser's externality rule and still names a
+    // file in this repo; resolution is what decides, and it only ever answers with a file that exists.
+    const imports = this.db.prepare("SELECT from_path, specifier, kind FROM code_imports WHERE project_id = ? ORDER BY from_path, specifier").all(projectId);
     this.db.prepare("DELETE FROM code_edges WHERE project_id = ?").run(projectId);
     const insert = this.db.prepare("INSERT OR IGNORE INTO code_edges (project_id, from_path, to_path, kind) VALUES (?, ?, ?, ?)");
     for (const item of imports) {
@@ -607,7 +579,11 @@ export class CodeGraph {
     const importedBy = uniqueSorted(incoming.get(modulePath) || []);
     return {
       path: module.path,
+      // The graph is no longer single-language, so what kind of artifact this is has become part of
+      // the answer: "python" and "markdown" tell an agent how to read it before it opens the file.
+      language: module.language || null,
       exports: exports.slice(0, 10),
+      dependencies: uniqueSorted(parseJson(module.dependencies, [])).slice(0, 10),
       imports: imports.slice(0, 10),
       importedBy: importedBy.slice(0, 10),
       truncated: { exports: exports.length > 10, imports: imports.length > 10, importedBy: importedBy.length > 10 },

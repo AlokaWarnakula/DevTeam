@@ -7,6 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import { CodeGraph } from "./codegraph.mjs";
 import { KnowledgeVault } from "./knowledge.mjs";
 import { buildBudgetedBrief, clipUtf8, DEFAULT_BRIEF_BUDGET } from "./brief.mjs";
+import { DEFAULT_ROLES, loadProjectRoles, planningRole, roleBehaviour, ROLES_CONFIG_PATH } from "./roles.mjs";
 import {
   boundedCheckpointText,
   buildCheckpointCapsule,
@@ -24,6 +25,9 @@ import {
   matchCheckCommand,
   normalizeCheckCommand,
   packageScriptCommands,
+  projectDeclaredCommands,
+  resolveLocalBinary,
+  CHECKS_CONFIG_PATH,
   runVerifiedCheck,
   VERIFIED_CHECKS_PER_REPORT,
 } from "./checks.mjs";
@@ -38,11 +42,12 @@ const CANDIDATE_SCAN_CEILING = 500;
 // How many read-only assignments one agent may hold at once, on top of its single write claim. A
 // guard against one agent draining the review queue, not a correctness rule — reviews take no lease.
 const MAX_CONCURRENT_READ_CLAIMS = 3;
-// Roles that read the tree rather than change it, and therefore wait for pending writers.
-const VERIFIER_ROLES = ["reviewer", "security-reviewer", "tester"];
-// The same list as SQL literals, for conditions that are shared between statements with different
-// parameter positions. Fixed, known-safe strings — never anything a caller supplies.
-const VERIFIER_ROLE_LIST = VERIFIER_ROLES.map((role) => `'${role}'`).join(", ");
+// Whether an assignment reads the work rather than changing it — and therefore waits for pending
+// writers, earns the right to approve, and puts its task in review — is a column on the row,
+// resolved from the project's role config when the assignment was created (see roles.mjs). It is
+// deliberately NOT a list of role names here: a project that calls its reviewing role `fact-checker`
+// or `structural-engineer` must schedule identically, and no domain vocabulary belongs in this SQL.
+const VERIFIES = "verifies = 1";
 // Which assignments depend, directly or transitively, on which. Written once so the candidate scan
 // and the scheduler's explanation walk the same edges.
 const DEPENDENCY_CLOSURE_CTE = `
@@ -87,7 +92,7 @@ const BLOCKING_WRITER_CONDITIONS = `pending_write.task_id = a.task_id
                 -- without an order they gate each other forever. Creation order breaks the tie
                 -- deterministically: a verifier waits only for verifiers older than itself.
                 AND (
-                  lower(pending_write.role) NOT IN (${VERIFIER_ROLE_LIST})
+                  pending_write.verifies = 0
                   OR pending_write.created_at < a.created_at
                   OR (pending_write.created_at = a.created_at AND pending_write.id < a.id)
                 )`;
@@ -119,6 +124,8 @@ const fromJson = (value, fallback = null) => {
 };
 
 export class DevTeamStore extends EventEmitter {
+  // Per-project role config, cached by the file's mtime (see projectRoles).
+  #roleCache = new Map();
   constructor(dataDir, { liveness = {}, knowledge = {}, codegraph = {}, checkpoint = {}, checks = {} } = {}) {
     super();
     this.dataDir = path.resolve(dataDir);
@@ -449,8 +456,26 @@ export class DevTeamStore extends EventEmitter {
       ["projects", "check_sandbox", "INTEGER NOT NULL DEFAULT 0"],       // confine node checks to the project root
       ["assignment_checks", "superseded_at", "TEXT"],           // only the latest report attempt describes the work as it stands                                   // 'human' or 'agent', so authorship never depends on a nullable FK
       ["assignments", "verifying_at", "TEXT"],                  // set while DevTeam is running this report's checks off the event loop
+      // Role behaviour, resolved from the project's role config when the assignment is created. The
+      // scheduler keys off these rather than off role *names*, so a project can call its reviewing
+      // role `fact-checker` without a single name reaching any SQL. See roles.mjs.
+      ["assignments", "verifies", "INTEGER NOT NULL DEFAULT 0"],
+      ["assignments", "plans", "INTEGER NOT NULL DEFAULT 0"],
     ]) {
       try { this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`); } catch { /* already present */ }
+    }
+    // Rows written before role behaviour was a column carry the software role names that used to be
+    // hardcoded. Backfill them from exactly those names, once, so an existing database schedules
+    // identically after the upgrade. Guarded by a metadata key rather than repeated on every start:
+    // re-deriving these from config each boot would silently rewrite the snapshot an assignment was
+    // created under whenever a project edited its roles.
+    if (!this.db.prepare("SELECT value FROM metadata WHERE key = 'role_behaviour_backfilled'").get()) {
+      this.db.exec(`
+        UPDATE assignments SET verifies = 1
+          WHERE lower(role) IN ('reviewer', 'security-reviewer', 'tester');
+        UPDATE assignments SET plans = 1 WHERE lower(role) = 'planner';
+      `);
+      this.db.prepare("INSERT INTO metadata (key, value) VALUES ('role_behaviour_backfilled', ?)").run(now());
     }
     // One agent may hold at most one claimed assignment at a time. Self-heal any legacy
     // double-claims (keep the earliest) before enforcing it at the schema level, so the
@@ -546,14 +571,15 @@ export class DevTeamStore extends EventEmitter {
     const task = this.db.prepare("SELECT status FROM tasks WHERE id = ?").get(taskId);
     if (!task || ["accepted", "blocked", "cancelled"].includes(task.status)) return task?.status || null;
     const openAssignments = this.db.prepare(`
-      SELECT role FROM assignments
+      SELECT verifies, plans FROM assignments
       WHERE task_id = ? AND status IN ('queued', 'claimed')
     `).all(taskId);
-    const reviewRoles = new Set(["reviewer", "security-reviewer", "tester"]);
+    // Role behaviour, not role names: a project whose planning role is called `scoping` and whose
+    // verifying role is called `fact-checker` moves through the same three states.
     let status = "review";
-    if (openAssignments.some((assignment) => String(assignment.role).toLowerCase() === "planner")) {
+    if (openAssignments.some((assignment) => assignment.plans)) {
       status = "planning";
-    } else if (openAssignments.some((assignment) => !reviewRoles.has(String(assignment.role).toLowerCase()))) {
+    } else if (openAssignments.some((assignment) => !assignment.verifies)) {
       status = "active";
     }
     if (task.status !== status) {
@@ -836,41 +862,56 @@ export class DevTeamStore extends EventEmitter {
   // Role checklists a planner can attach to review work so the team systematically
   // covers the usual blind spots instead of eyeballing a diff. Attached automatically
   // to review/security/test assignments unless the caller overrides them.
-  static CHECKLIST_TEMPLATES = {
-    "security-reviewer": [
-      "Authentication: no broken/missing auth on protected paths",
-      "Session handling: fixation, regeneration, secure/httponly cookies",
-      "Authorization: object-level and function-level access checks",
-      "Input validation and injection (SQL/command/template/XSS)",
-      "Secrets: none logged, committed, or returned in responses",
-      "Rate limiting / abuse protection on sensitive endpoints",
-      "Error handling does not leak stack traces or internals",
-      "Dependencies: no known-vulnerable or unpinned additions",
-    ],
-    reviewer: [
-      "Correctness: does it do what the task asked?",
-      "Edge cases and boundary conditions handled",
-      "Error and failure paths are handled, not swallowed",
-      "No dead code, debug logs, or leftover TODOs",
-      "Readable and consistent with the surrounding code",
-      "Tests cover the change and actually run",
-    ],
-    tester: [
-      "Happy path verified end to end",
-      "Edge cases and invalid input covered",
-      "Failure modes and error states exercised",
-      "Regression: existing behaviour still passes",
-      "Checks are reproducible and named in the report",
-    ],
-  };
-
-  checklistTemplates() {
-    return DevTeamStore.CHECKLIST_TEMPLATES;
+  // A project's roles, cached until its `.devteam/roles.json` changes on disk. The mtime check keeps
+  // an edit picked up without a restart while not re-reading the file on every assignment.
+  projectRoles(projectId) {
+    const project = this.db.prepare("SELECT root FROM projects WHERE id = ?").get(projectId);
+    if (!project) return { roles: DEFAULT_ROLES, source: "default" };
+    const cached = this.#roleCache.get(projectId);
+    let stamp = 0;
+    try { stamp = statSync(path.join(project.root, ROLES_CONFIG_PATH)).mtimeMs; } catch { stamp = 0; }
+    if (cached && cached.mtimeMs === stamp) return cached;
+    const loaded = loadProjectRoles(project.root);
+    this.#roleCache.set(projectId, loaded);
+    return loaded;
   }
 
-  #resolveChecklist(role, provided) {
+  // What a role name means *in this project*: whether it verifies, plans, or writes by default, and
+  // the checklist its assignments carry. An unknown name is ordinary work rather than an error.
+  roleBehaviour(projectId, role) {
+    return roleBehaviour(this.projectRoles(projectId).roles, role);
+  }
+
+  // The role a seeded planning assignment is created in for this project.
+  planningRoleFor(projectId) {
+    return planningRole(this.projectRoles(projectId).roles);
+  }
+
+  // The role catalogue for a project, for the dashboard's assignment form and for agents asking what
+  // roles this room understands. Includes whether the config came from the project or the defaults,
+  // and surfaces a malformed config rather than pretending the defaults were chosen.
+  roleCatalogue(projectId) {
+    const loaded = this.projectRoles(projectId);
+    return {
+      source: loaded.source,
+      configPath: ROLES_CONFIG_PATH,
+      ...(loaded.error ? { error: loaded.error } : {}),
+      roles: Object.entries(loaded.roles).map(([name, definition]) => ({ name, ...definition })),
+    };
+  }
+
+  // Did this assignment read the work rather than change it? Asked of the assignment row rather than
+  // of the role name recorded on the event, so a project that renamed its reviewing role still earns
+  // approval standing, and a role renamed *after* the fact cannot retroactively grant it.
+  #assignmentVerifies(assignmentId) {
+    if (!assignmentId) return false;
+    return Boolean(this.db.prepare("SELECT verifies FROM assignments WHERE id = ?").get(assignmentId)?.verifies);
+  }
+
+  #resolveChecklist(projectId, role, provided) {
     if (Array.isArray(provided)) return provided.map((item) => String(item).trim()).filter(Boolean).slice(0, 40);
-    return DevTeamStore.CHECKLIST_TEMPLATES[String(role || "").toLowerCase()] || null;
+    const checklist = this.roleBehaviour(projectId, role).checklist;
+    return checklist.length ? checklist : null;
   }
 
   #storeChecklist(assignmentId, items) {
@@ -1193,6 +1234,7 @@ export class DevTeamStore extends EventEmitter {
     const plannerAssignmentId = randomUUID();
     const stamp = now();
     const approvals = Math.max(1, Math.min(8, Number(requiredApprovals) || 2));
+    const planningRoleName = this.planningRoleFor(projectId);
     this.#transaction(() => {
       this.db.prepare(`
         INSERT INTO tasks (id, project_id, title, description, status, version, required_approvals,
@@ -1202,9 +1244,9 @@ export class DevTeamStore extends EventEmitter {
         ["manual", "per_task", "adaptive", "per_assignment"].includes(sessionPolicy) ? sessionPolicy : "per_task",
         baseRuntimeProfile ? json(this.#validatedBaseRuntimeProfile(baseRuntimeProfile)) : null, stamp, stamp);
       this.db.prepare(`
-        INSERT INTO assignments (id, task_id, title, description, role, requires_write, status, created_at)
-        VALUES (?, ?, ?, ?, 'planner', 0, 'queued', ?)
-      `).run(plannerAssignmentId, taskId, "Create the implementation plan", "Inspect the project, propose a concrete plan, then assign implementation and review work to the team.", stamp);
+        INSERT INTO assignments (id, task_id, title, description, role, requires_write, status, created_at, plans)
+        VALUES (?, ?, ?, ?, ?, 0, 'queued', ?, 1)
+      `).run(plannerAssignmentId, taskId, "Create the implementation plan", "Inspect the project, propose a concrete plan, then assign implementation and review work to the team.", planningRoleName, stamp);
       this.#event(taskId, null, "task.created", `Task created: ${title.trim()}`, { projectId, requiredApprovals: approvals });
     });
     this.assignmentAssessment({ assignmentId: plannerAssignmentId });
@@ -1412,6 +1454,61 @@ export class DevTeamStore extends EventEmitter {
         settle(/^[0-9a-f]{40,64}$/i.test(head) ? head.toLowerCase() : null);
       });
     });
+  }
+
+  // T1.4 — git is optional, so drift detection cannot depend on it.
+  //
+  // A checkpoint's fingerprint is how a fresh session learns the workspace moved under it. That was
+  // git HEAD plus the task version, which for a project that is not a repository — a research folder,
+  // a manuscript, a data directory — collapses to the task version alone: nothing notices files
+  // changing outside DevTeam's knowledge.
+  //
+  // The substitute is a bounded digest of the work's own scope: each file's project-relative path,
+  // size and mtime. It is not a content hash and does not try to be — it answers "did this move
+  // while I was away", which is exactly what a fingerprint is for, at a cost that stays flat on a
+  // large tree because it walks the declared write scope rather than the project.
+  #workspaceDigest(projectRoot, scopes) {
+    if (!projectRoot) return null;
+    const root = path.resolve(projectRoot);
+    const parts = [];
+    let seen = 0;
+    const visit = (absolute, relative, depth) => {
+      if (seen >= 400 || depth > 6) return;
+      let info;
+      try { info = statSync(absolute, { throwIfNoEntry: false }); } catch { return; }
+      if (!info) return;
+      if (info.isDirectory()) {
+        let entries;
+        try { entries = readdirSync(absolute, { withFileTypes: true }); } catch { return; }
+        for (const entry of entries.slice(0, 200)) {
+          if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+          visit(path.join(absolute, entry.name), `${relative}/${entry.name}`, depth + 1);
+        }
+        return;
+      }
+      if (!info.isFile()) return;
+      seen += 1;
+      parts.push(`${relative}:${info.size}:${Math.trunc(info.mtimeMs)}`);
+    };
+    // An empty scope means the whole project; walking all of it would be unbounded, so that case
+    // digests the project's top level only. A declared scope is the useful case and the common one.
+    const targets = (Array.isArray(scopes) && scopes.length ? scopes : [""]).slice(0, 20);
+    for (const scope of targets) {
+      const relative = String(scope || "").replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+      const absolute = relative ? path.resolve(root, relative) : root;
+      if (absolute !== root && !absolute.startsWith(root + path.sep)) continue;
+      visit(absolute, relative || ".", relative ? 0 : 5);
+    }
+    if (!parts.length) return null;
+    return createHash("sha256").update(parts.sort().join("\n")).digest("hex").slice(0, 32);
+  }
+
+  // Whether this project is a git repository at all. Surfaced rather than inferred, so a non-repo
+  // project reads as "git is not in play here" instead of "git said nothing".
+  #isRepository(projectRoot) {
+    if (!projectRoot) return false;
+    try { return Boolean(statSync(path.join(projectRoot, ".git"), { throwIfNoEntry: false })); }
+    catch { return false; }
   }
 
   #checkpointRecord(row, { includeCapsule = false } = {}) {
@@ -1664,7 +1761,14 @@ export class DevTeamStore extends EventEmitter {
           nextAction: safe(derivedNextAction, 1_200, "nextAction"),
           currentRuntime: { provider: safe(agent.provider, 200, "agentProvider"), profile: compactRuntimeProfile },
           nextSessionRecommendation,
-          repositoryFingerprint: { taskVersion: Number(task.version), gitHead: repositoryHead },
+          repositoryFingerprint: {
+            taskVersion: Number(task.version),
+            gitHead: repositoryHead,
+            // Git is optional. Without it the fingerprint would be the task version alone, so a
+            // scope digest carries the same signal for a project that is not a repository.
+            isRepository: this.#isRepository(task.project_root),
+            workspaceDigest: this.#workspaceDigest(task.project_root, assignment ? this.#writeScopeFor(assignment.id) : []),
+          },
         },
         sections: [
           { key: "decisions", items: [...supplied.decisions, ...automaticDecisions], maxItems: 30 },
@@ -1884,12 +1988,19 @@ export class DevTeamStore extends EventEmitter {
     const warnings = [];
     if (Number(fingerprint.taskVersion) !== Number(outcome.taskVersionNow)) warnings.push("The task version changed since the checkpoint. Re-read the task and inspect the current files before writing.");
     if (fingerprint.gitHead && currentHead && fingerprint.gitHead !== currentHead) warnings.push("Git HEAD changed since the checkpoint. Inspect the repository diff before writing.");
+    // A project with no git still gets a drift signal, from the digest of the work's own scope.
+    const currentDigest = fingerprint.workspaceDigest
+      ? this.#workspaceDigest(this.getTask(taskId).project_root, outcome.assignment?.id ? this.#writeScopeFor(outcome.assignment.id) : [])
+      : null;
+    if (fingerprint.workspaceDigest && currentDigest && fingerprint.workspaceDigest !== currentDigest) {
+      warnings.push("Files in this assignment's scope changed since the checkpoint. Re-read them before writing.");
+    }
     this.#changed("session.checkpoint_claimed", taskId);
     return {
       takenOver: true,
       taskId,
       ...outcome,
-      repositoryFingerprintNow: { taskVersion: outcome.taskVersionNow, gitHead: currentHead },
+      repositoryFingerprintNow: { taskVersion: outcome.taskVersionNow, gitHead: currentHead, workspaceDigest: currentDigest },
       warnings,
       next: "Read the bounded capsule, verify the repository and task state, then continue under the newly issued claim token.",
     };
@@ -2527,7 +2638,11 @@ export class DevTeamStore extends EventEmitter {
       id: randomUUID(), taskId, title: title.trim(), description: description.trim(), role: role.trim(),
       requiresWrite: requiresWrite ? 1 : 0, targetAgentName: targetAgentName?.trim() || null, createdAt: now(),
     };
-    const resolvedChecklist = this.#resolveChecklist(assignment.role, checklist);
+    // Resolve the role against *this project's* roles once, here, and store what the scheduler needs
+    // on the row. Doing it at creation rather than at scan time means editing a project's role config
+    // never silently re-classifies work that is already queued or in flight.
+    const behaviour = this.roleBehaviour(task.project_id, assignment.role);
+    const resolvedChecklist = this.#resolveChecklist(task.project_id, assignment.role, checklist);
     // A write assignment may declare the paths it will touch, enabling non-overlapping writers
     // to run in parallel; omitting them keeps the conservative whole-project lease.
     const writePaths = assignment.requiresWrite && Array.isArray(paths)
@@ -2544,9 +2659,10 @@ export class DevTeamStore extends EventEmitter {
     }
     this.#transaction(() => {
       this.db.prepare(`
-        INSERT INTO assignments (id, task_id, title, description, role, requires_write, target_agent_name, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)
-      `).run(assignment.id, taskId, assignment.title, assignment.description, assignment.role, assignment.requiresWrite, assignment.targetAgentName, assignment.createdAt);
+        INSERT INTO assignments (id, task_id, title, description, role, requires_write, target_agent_name, status, created_at, verifies, plans)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
+      `).run(assignment.id, taskId, assignment.title, assignment.description, assignment.role, assignment.requiresWrite, assignment.targetAgentName, assignment.createdAt,
+        behaviour.verifies ? 1 : 0, behaviour.plans ? 1 : 0);
       this.#storeChecklist(assignment.id, resolvedChecklist);
       if (writePaths.length) this.db.prepare("INSERT OR REPLACE INTO assignment_write_scopes (assignment_id, paths) VALUES (?, ?)").run(assignment.id, json(writePaths));
       for (const dependencyId of dependencyIds) {
@@ -2557,6 +2673,7 @@ export class DevTeamStore extends EventEmitter {
       this.#event(taskId, agentId, "assignment.created", assignment.title, {
         assignmentId: assignment.id,
         role: assignment.role,
+        verifies: behaviour.verifies,
         requiresWrite: Boolean(assignment.requiresWrite),
         targetAgentName: assignment.targetAgentName,
         checklist: resolvedChecklist || [],
@@ -2646,11 +2763,11 @@ export class DevTeamStore extends EventEmitter {
       {
         code: "awaiting_writer",
         sql: `(
-            lower(a.role) NOT IN (${VERIFIER_ROLES.map(() => "?").join(", ")}) OR NOT EXISTS (
+            a.verifies = 0 OR NOT EXISTS (
               SELECT 1 FROM assignments pending_write WHERE ${BLOCKING_WRITER_CONDITIONS}
             )
           )`,
-        params: VERIFIER_ROLES,
+        params: [],
       },
     ];
   }
@@ -3108,7 +3225,22 @@ export class DevTeamStore extends EventEmitter {
   availableCheckCommands(projectId) {
     const project = this.db.prepare("SELECT root FROM projects WHERE id = ?").get(projectId);
     if (!project) throw new Error("Project not found.");
-    return packageScriptCommands(project.root);
+    return this.#derivableCheckCommands(project.root);
+  }
+
+  // Everything this project *could* offer: what it declares for itself in .devteam/checks.json, plus
+  // whatever is derivable from package.json if it happens to be a Node package. Declared entries win
+  // on a name collision — a human writing the file is a stronger statement of intent than a script
+  // body DevTeam parsed. Every entry has its local-binary shim resolved here, so what the dashboard
+  // shows before enabling is exactly the argv that would run.
+  #derivableCheckCommands(projectRoot) {
+    const declared = projectDeclaredCommands(projectRoot);
+    const derived = packageScriptCommands(projectRoot).map((entry) => ({ ...entry, source: "package.json" }));
+    const byName = new Map();
+    for (const entry of [...derived, ...declared]) {
+      byName.set(entry.name, { ...entry, argv: resolveLocalBinary(projectRoot, entry.argv) });
+    }
+    return [...byName.values()].slice(0, CHECK_ALLOWLIST_LIMIT);
   }
 
   // Turn verification on (or off) for a project. Passing no commands snapshots the project's own
@@ -3118,7 +3250,7 @@ export class DevTeamStore extends EventEmitter {
   setProjectCheckCommands({ projectId, commands = null, sandbox = null }) {
     const project = this.db.prepare("SELECT id, root FROM projects WHERE id = ?").get(projectId);
     if (!project) throw new Error("Project not found.");
-    const requested = commands === null ? packageScriptCommands(project.root) : commands;
+    const requested = commands === null ? this.#derivableCheckCommands(project.root) : commands;
     if (!Array.isArray(requested)) throw new Error("Check commands must be a list.");
     const entries = [];
     const seen = new Set();
@@ -3127,7 +3259,9 @@ export class DevTeamStore extends EventEmitter {
       if (!entry) throw new Error(`Unusable check command: ${JSON.stringify(candidate)?.slice(0, 120)}. A command is a name plus an argv list whose program is a bare executable name.`);
       if (seen.has(entry.name)) continue;
       seen.add(entry.name);
-      entries.push(entry);
+      // A human typing `eslint` means the one installed in this project. Resolve it here, at the
+      // moment of pinning, so the stored argv is runnable rather than a name that fails to spawn.
+      entries.push({ ...entry, argv: resolveLocalBinary(project.root, entry.argv) });
     }
     const stamp = now();
     this.#transaction(() => {
@@ -3548,18 +3682,19 @@ export class DevTeamStore extends EventEmitter {
         // and write leases continue. Only the explicit blockTask/devteam_block path is task-wide.
         followUpAssignmentId = randomUUID();
         this.db.prepare(`
-          INSERT INTO assignments (id, task_id, title, description, role, requires_write, status, created_at)
-          VALUES (?, ?, ?, ?, 'planner', 0, 'queued', ?)
+          INSERT INTO assignments (id, task_id, title, description, role, requires_write, status, created_at, plans)
+          VALUES (?, ?, ?, ?, ?, 0, 'queued', ?, 1)
         `).run(
           followUpAssignmentId,
           assignment.task_id,
           `Resolve blocker: ${assignment.title}`,
           `Review the blocker reported for "${assignment.title}": ${message.trim()}. Re-scope the work, create a replacement assignment, or use devteam_block only if the entire task genuinely requires human input.`,
+          this.planningRoleFor(task.project_id),
           stamp,
         );
         this.#event(assignment.task_id, agentId, "assignment.created", `Resolve blocker: ${assignment.title}`, {
           assignmentId: followUpAssignmentId,
-          role: "planner",
+          role: this.planningRoleFor(task.project_id),
           requiresWrite: false,
           blockedAssignmentId: assignment.id,
         });
@@ -3659,7 +3794,7 @@ export class DevTeamStore extends EventEmitter {
     `).all(taskId, agentId).some((event) => {
       const metadata = fromJson(event.metadata, {});
       return metadata.version === task.version
-        && ["reviewer", "tester", "security-reviewer"].includes(String(metadata.role || "").toLowerCase())
+        && this.#assignmentVerifies(metadata.assignmentId)
         && (!Array.isArray(metadata.changedFiles) || metadata.changedFiles.length === 0);
     });
     if (!reviewEvidence) throw new Error("Approval requires a completed, read-only reviewer or tester assignment on the current task version.");
@@ -3755,20 +3890,21 @@ export class DevTeamStore extends EventEmitter {
     if (!cleanReason) throw new Error("A resume reason is required.");
     const stamp = now();
     const assignmentId = randomUUID();
+    const planningRoleName = this.planningRoleFor(task.project_id);
     let version;
     this.#transaction(() => {
       this.db.prepare("UPDATE tasks SET status = 'planning', version = version + 1, updated_at = ? WHERE id = ?")
         .run(stamp, taskId);
       this.db.prepare("DELETE FROM approvals WHERE task_id = ?").run(taskId);
       this.db.prepare(`
-        INSERT INTO assignments (id, task_id, title, description, role, requires_write, status, created_at)
-        VALUES (?, ?, 'Plan resumed task', ?, 'planner', 0, 'queued', ?)
-      `).run(assignmentId, taskId, `The human resumed this blocked task: ${cleanReason}. Inspect the current project state and create fresh implementation and review assignments; do not revive stale claims.`, stamp);
+        INSERT INTO assignments (id, task_id, title, description, role, requires_write, status, created_at, plans)
+        VALUES (?, ?, 'Plan resumed task', ?, ?, 0, 'queued', ?, 1)
+      `).run(assignmentId, taskId, `The human resumed this blocked task: ${cleanReason}. Inspect the current project state and create fresh implementation and review assignments; do not revive stale claims.`, planningRoleName, stamp);
       version = this.db.prepare("SELECT version FROM tasks WHERE id = ?").get(taskId).version;
       this.#event(taskId, null, "task.unblocked", `Human resumed the task: ${cleanReason}`, { reason: cleanReason, version });
       this.#event(taskId, null, "assignment.created", "Plan resumed task", {
         assignmentId,
-        role: "planner",
+        role: planningRoleName,
         requiresWrite: false,
         resumed: true,
       });
@@ -3872,12 +4008,13 @@ export class DevTeamStore extends EventEmitter {
         this.db.prepare("UPDATE tasks SET updated_at = ? WHERE id = ?").run(stamp, taskId);
       }
       const assignmentId = randomUUID();
+      const planningRoleName = this.planningRoleFor(task.project_id);
       const title = `Plan follow-up: ${firstLine}`;
       this.db.prepare(`
-        INSERT INTO assignments (id, task_id, title, description, role, requires_write, target_agent_name, status, created_at)
-        VALUES (?, ?, ?, ?, 'planner', 0, NULL, 'queued', ?)
-      `).run(assignmentId, taskId, title, `Plan the follow-up requested in chat: "${firstLine}". Split it into implementation and review work as needed.`, stamp);
-      this.#event(taskId, byAgentId, "assignment.created", title, { assignmentId, role: "planner", requiresWrite: false, targetAgentName: null, continuesEvent: eventId });
+        INSERT INTO assignments (id, task_id, title, description, role, requires_write, target_agent_name, status, created_at, plans)
+        VALUES (?, ?, ?, ?, ?, 0, NULL, 'queued', ?, 1)
+      `).run(assignmentId, taskId, title, `Plan the follow-up requested in chat: "${firstLine}". Split it into implementation and review work as needed.`, planningRoleName, stamp);
+      this.#event(taskId, byAgentId, "assignment.created", title, { assignmentId, role: planningRoleName, requiresWrite: false, targetAgentName: null, continuesEvent: eventId });
       this.#syncTaskStatus(taskId, stamp);
       const version = this.db.prepare("SELECT version FROM tasks WHERE id = ?").get(taskId).version;
       result = { taskId, eventId, reopened, version, assignmentId };
@@ -4027,6 +4164,9 @@ export class DevTeamStore extends EventEmitter {
         runtimeDecision,
       };
     });
+    // The roles this project understands travel with the task, so the dashboard's assignment form
+    // offers the project's own vocabulary rather than a hardcoded list of software job titles.
+    const roleCatalogue = this.roleCatalogue(task.project_id);
     const members = this.db.prepare(`
       SELECT m.role, ag.id AS agent_id, ag.name AS agent_name, ag.provider AS agent_provider, ag.status
       FROM task_members m JOIN agents ag ON ag.id = m.agent_id
@@ -4075,7 +4215,7 @@ export class DevTeamStore extends EventEmitter {
     const codeGraphState = this.codegraph.projectState(task.project_id);
     const sessionCheckpoints = this.sessionCheckpointsForTask(taskId);
     return {
-      ...task, assignments, approvals, events, proposals, blackboard, projectBlackboard, knowledge, members, sessionCheckpoints,
+      ...task, assignments, approvals, events, proposals, blackboard, projectBlackboard, knowledge, members, sessionCheckpoints, roleCatalogue,
       knowledgeVault: {
         automated: this.knowledge.enabled,
         path: path.join(task.project_root, "knowledge"),

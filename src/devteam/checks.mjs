@@ -123,6 +123,74 @@ export function normalizeCheckCommand(entry) {
 
 // What the project's own package.json offers, for a human to review before enabling verification.
 // Scripts DevTeam cannot run faithfully are simply absent rather than silently mangled.
+export const CHECKS_CONFIG_PATH = path.join(".devteam", "checks.json");
+
+// T1.3 — a project declares its own checks, with explicit argv, independent of package.json.
+//
+// Deriving the allowlist from package.json scripts assumes the project is a Node package. A research
+// project, a data pipeline, a book, an infrastructure repo — none of them have one, so verification
+// was simply unavailable and every check they reported stayed agent-asserted forever.
+//
+// The security rules are unchanged and deliberately so: each entry still goes through
+// normalizeCheckCommand, so the program must be a bare executable name, interpreters and package
+// runners are still refused, there is still no shell, and the human still has to enable it. This
+// widens *what can be declared*, not what DevTeam is willing to run.
+export function projectDeclaredCommands(projectRoot) {
+  if (!projectRoot) return [];
+  let parsed;
+  try { parsed = JSON.parse(readFileSync(path.join(projectRoot, CHECKS_CONFIG_PATH), "utf8")); }
+  catch { return []; }
+  const list = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.checks) ? parsed.checks : []);
+  const commands = [];
+  for (const candidate of list.slice(0, CHECK_ALLOWLIST_LIMIT)) {
+    const entry = normalizeCheckCommand(candidate);
+    if (entry) commands.push({ ...entry, source: "project" });
+  }
+  return commands;
+}
+
+// On Windows a locally installed tool is a `.cmd` shim, and spawn with shell:false cannot run it —
+// every such check graded `unavailable` forever, which is the same as having no verification while
+// looking like it works. Shelling out to run the shim would hand back the shell this whole file
+// exists to avoid, so instead the shim is read *at snapshot time* and rewritten to run its real
+// entry point under node directly.
+//
+// Resolution happens once, when a human enables verification, and the resolved argv is what gets
+// pinned — so this cannot become a live re-read of node_modules any more than the package.json
+// snapshot can.
+export function resolveLocalBinary(projectRoot, argv) {
+  if (!projectRoot || !Array.isArray(argv) || !argv.length) return argv;
+  const [program, ...args] = argv;
+  if (program === "node" || program.includes("/") || program.includes("\\")) return argv;
+  const binDirectory = path.join(projectRoot, "node_modules", ".bin");
+  for (const candidate of [`${program}.cmd`, `${program}.CMD`, program]) {
+    const shim = path.join(binDirectory, candidate);
+    let contents;
+    try { contents = readFileSync(shim, "utf8"); } catch { continue; }
+    if (contents.length > 64 * 1024) continue;
+    // The entry point a Node shim points at, in either the .cmd or the shebang-script form: a
+    // path-like token ending in a script extension. Bounded and anchored on a real extension, so
+    // arbitrary text inside the shim cannot become a target. The leading `%dp0%` / `$basedir` the
+    // shim uses to mean its own directory is stripped, because that directory is where we resolve
+    // from — leaving it in would turn the path absolute and escape the project.
+    const target = contents.match(/[^"'\s]*\.(?:c|m)?js\b/);
+    if (!target) continue;
+    const relativeTarget = target[0]
+      .replace(/^%[^%]*%/, "")
+      .replace(/^\$\{?[A-Za-z_]\w*\}?/, "")
+      .split("\\").join("/")
+      .replace(/^\/+/, "");
+    if (!relativeTarget) continue;
+    const resolved = path.resolve(binDirectory, relativeTarget);
+    const relative = path.relative(projectRoot, resolved);
+    // Never outside the project. A shim pointing elsewhere is not something to run on its say-so.
+    if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) continue;
+    try { if (!statSync(resolved).isFile()) continue; } catch { continue; }
+    return ["node", relative.split(path.sep).join("/"), ...args];
+  }
+  return argv;
+}
+
 export function packageScriptCommands(projectRoot) {
   if (!projectRoot) return [];
   let manifest;

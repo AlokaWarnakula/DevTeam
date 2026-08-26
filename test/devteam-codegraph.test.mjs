@@ -80,12 +80,12 @@ test("safe discovery skips ignored, secret, oversized, binary, and linked files 
   if (linked) assert.ok(!modules(store, project.id).some((row) => row.path === "src/linked.js"));
 
   const task = store.createTask({ projectId: project.id, title: "Reject escapes", description: "Do not index outside paths." });
-  const agent = store.connectAgent({ name: "Worker", provider: "test" });
+  const agent = store.connectAgent({ name: "Worker", provider: "test", freshTaskId: task.id });
   const claim = store.claimNextAssignment(agent.id);
   const outside = path.join(path.dirname(projectRoot), "outside-codegraph.js");
   await writeFile(outside, "export const escaped = true;");
   t.after(() => rm(outside, { force: true }));
-  store.completeAssignment({
+  await store.completeAssignment({
     agentId: agent.id,
     assignmentId: claim.id,
     message: "Reported unsafe paths for validation.",
@@ -103,11 +103,11 @@ test("incremental edits, deletions, unresolved targets, and renames rebuild deri
   const originalA = modules(store, project.id).find((row) => row.path === "src/a.js");
   assert.deepEqual(edges(store, project.id), [{ from_path: "src/a.js", to_path: "src/old.ts" }]);
   const task = store.createTask({ projectId: project.id, title: "Increment graph", description: "Exercise incremental updates." });
-  const agent = store.connectAgent({ name: "Worker", provider: "test" });
+  const agent = store.connectAgent({ name: "Worker", provider: "test", freshTaskId: task.id });
   const plan = store.claimNextAssignment(agent.id);
 
   await put(projectRoot, "src/missing.ts", "export const later = true;");
-  store.completeAssignment({ agentId: agent.id, assignmentId: plan.id, message: "Added the missing target.", changedFiles: ["src/missing.ts"] });
+  await store.completeAssignment({ agentId: agent.id, assignmentId: plan.id, message: "Added the missing target.", changedFiles: ["src/missing.ts"] });
   assert.deepEqual(edges(store, project.id), [
     { from_path: "src/a.js", to_path: "src/missing.ts" },
     { from_path: "src/a.js", to_path: "src/old.ts" },
@@ -117,14 +117,14 @@ test("incremental edits, deletions, unresolved targets, and renames rebuild deri
   const edit = store.createAssignment({ taskId: task.id, title: "Edit imports", description: "Change the edge.", requiresWrite: true, targetAgentName: "Worker" });
   const editClaim = store.claimNextAssignment(agent.id);
   await put(projectRoot, "src/a.js", "import './other';");
-  store.completeAssignment({ agentId: agent.id, assignmentId: editClaim.id, message: "Changed imports.", changedFiles: ["src/a.js"] });
+  await store.completeAssignment({ agentId: agent.id, assignmentId: editClaim.id, message: "Changed imports.", changedFiles: ["src/a.js"] });
   assert.deepEqual(edges(store, project.id), [{ from_path: "src/a.js", to_path: "src/other.ts" }]);
 
   const move = store.createAssignment({ taskId: task.id, title: "Rename module", description: "Move the file.", requiresWrite: true, targetAgentName: "Worker" });
   const moveClaim = store.claimNextAssignment(agent.id);
   await rename(path.join(projectRoot, "src", "other.ts"), path.join(projectRoot, "src", "renamed.ts"));
   await put(projectRoot, "src/a.js", "import './renamed';");
-  store.completeAssignment({ agentId: agent.id, assignmentId: moveClaim.id, message: "Renamed module.", changedFiles: ["src/other.ts", "src/renamed.ts", "src/a.js"] });
+  await store.completeAssignment({ agentId: agent.id, assignmentId: moveClaim.id, message: "Renamed module.", changedFiles: ["src/other.ts", "src/renamed.ts", "src/a.js"] });
   assert.ok(!modules(store, project.id).some((row) => row.path === "src/other.ts"));
   assert.ok(modules(store, project.id).some((row) => row.path === "src/renamed.ts"));
   assert.deepEqual(edges(store, project.id), [{ from_path: "src/a.js", to_path: "src/renamed.ts" }]);
@@ -132,7 +132,7 @@ test("incremental edits, deletions, unresolved targets, and renames rebuild deri
   const remove = store.createAssignment({ taskId: task.id, title: "Delete module", description: "Remove the target.", requiresWrite: true, targetAgentName: "Worker" });
   const removeClaim = store.claimNextAssignment(agent.id);
   await rm(path.join(projectRoot, "src", "renamed.ts"));
-  store.completeAssignment({ agentId: agent.id, assignmentId: removeClaim.id, message: "Deleted module.", changedFiles: ["src/renamed.ts"] });
+  await store.completeAssignment({ agentId: agent.id, assignmentId: removeClaim.id, message: "Deleted module.", changedFiles: ["src/renamed.ts"] });
   assert.ok(!modules(store, project.id).some((row) => row.path === "src/renamed.ts"));
   assert.deepEqual(edges(store, project.id), []);
 });
@@ -143,9 +143,9 @@ test("bounded reconciliation catches manual drift and initialized state does not
   assert.equal(stateBefore.initialized, 1);
   await put(projectRoot, "src/a.js", "export const after = true;\nexport const more = true;");
   const task = store.createTask({ projectId: project.id, title: "Manual drift", description: "Reconcile an unreported edit." });
-  const agent = store.connectAgent({ name: "Reader", provider: "test" });
+  const agent = store.connectAgent({ name: "Reader", provider: "test", freshTaskId: task.id });
   const claim = store.claimNextAssignment(agent.id);
-  store.completeAssignment({ agentId: agent.id, assignmentId: claim.id, message: "Changed manually but omitted changedFiles." });
+  await store.completeAssignment({ agentId: agent.id, assignmentId: claim.id, message: "Changed manually but omitted changedFiles." });
   store.taskBrief(agent.id, task.id);
   assert.deepEqual(JSON.parse(modules(store, project.id).find((row) => row.path === "src/a.js").exports), ["after", "more"]);
 
@@ -208,9 +208,9 @@ test("directory and whole-project scopes produce bounded automatic code context"
   for (let index = 0; index < 12; index += 1) files[`src/extra/m${index}.js`] = "export const x = true;";
   const { store, project } = await fixture(t, files);
   const task = store.createTask({ projectId: project.id, title: "Context", description: "Bound the graph context." });
-  const agent = store.connectAgent({ name: "Context Agent", provider: "test" });
+  const agent = store.connectAgent({ name: "Context Agent", provider: "test", freshTaskId: task.id });
   const plan = store.claimNextAssignment(agent.id);
-  store.completeAssignment({ agentId: agent.id, assignmentId: plan.id, message: "Planned." });
+  await store.completeAssignment({ agentId: agent.id, assignmentId: plan.id, message: "Planned." });
   const directory = store.codegraph.codeContext(task.id, { scopes: ["src/feature/**"] });
   assert.ok(directory.some((item) => item.path === "src/feature/a.js"));
   assert.ok(directory.some((item) => item.path === "src/feature/b.js"));
@@ -244,10 +244,10 @@ test("disabled mode is a clean no-op and CodeGraph failures never break assignme
   store.codegraph.enabled = true;
   store.codegraph.initializeProject(project.id);
   const task = store.createTask({ projectId: project.id, title: "Error isolation", description: "Graph errors are non-fatal." });
-  const agent = store.connectAgent({ name: "Worker", provider: "test" });
+  const agent = store.connectAgent({ name: "Worker", provider: "test", freshTaskId: task.id });
   const claim = store.claimNextAssignment(agent.id);
   store.codegraph.syncTask = () => { throw new Error("synthetic graph failure"); };
-  const result = store.completeAssignment({ agentId: agent.id, assignmentId: claim.id, message: "Coordination still completes.", changedFiles: ["src/a.js"] });
+  const result = await store.completeAssignment({ agentId: agent.id, assignmentId: claim.id, message: "Coordination still completes.", changedFiles: ["src/a.js"] });
   assert.equal(result.completed, true);
   assert.match(store.taskDetail(task.id).codeGraph.error.message, /synthetic graph failure/);
 });

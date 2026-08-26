@@ -42,12 +42,12 @@ const MUTANTS = [
     name: "M4  review gate removed",
     from: `        code: "awaiting_writer",
         sql: \`(
-            lower(a.role) NOT IN (\${VERIFIER_ROLES.map(() => "?").join(", ")}) OR NOT EXISTS (
+            a.verifies = 0 OR NOT EXISTS (
               SELECT 1 FROM assignments pending_write WHERE \${BLOCKING_WRITER_CONDITIONS}
             )
           )\`,`,
     to: `        code: "awaiting_writer",
-        sql: \`(\${VERIFIER_ROLES.map(() => "? IS NOT NULL").join(" AND ")})\`,`,
+        sql: "1 = 1",`,
   },
   {
     name: "M5  targeting predicate removed",
@@ -105,7 +105,7 @@ const MUTANTS = [
   {
     name: "M12 verifier creation-order tiebreak removed",
     from: `                AND (
-                  lower(pending_write.role) NOT IN (\${VERIFIER_ROLE_LIST})
+                  pending_write.verifies = 0
                   OR pending_write.created_at < a.created_at
                   OR (pending_write.created_at = a.created_at AND pending_write.id < a.id)
                 )`,

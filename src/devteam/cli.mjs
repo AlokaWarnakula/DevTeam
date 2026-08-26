@@ -1,9 +1,10 @@
-import { cpSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { DevTeamStore } from "./store.mjs";
 import { startDevTeamServer } from "./server.mjs";
+import { DEFAULT_ROLES, loadProjectRoles, ROLES_CONFIG_PATH } from "./roles.mjs";
 
 export const defaultDataDir = () => process.env.LOCALAPPDATA
   ? path.join(process.env.LOCALAPPDATA, "DevTeam")
@@ -42,6 +43,11 @@ Usage:
   devteam sync-skill --dest PATH     Copy the current skill into a folder your AI agent
                                      reads skills from. Works for any agent. Re-run after
                                      you change the skill so it does not run a stale copy.
+  devteam roles [--project PATH]     Show the roles a project uses.
+  devteam roles --init [--project PATH]
+                                     Write .devteam/roles.json seeded from the defaults, so a
+                                     project can use its own vocabulary (analyst, fact-checker,
+                                     editor) instead of software job titles.
 `;
 
 export async function runDevTeamCli(args = process.argv.slice(2)) {
@@ -82,6 +88,27 @@ export async function runDevTeamCli(args = process.argv.slice(2)) {
     const store = new DevTeamStore(dataDir);
     console.log(store.token);
     store.close();
+    return;
+  }
+
+  if (command === "roles") {
+    const projectRoot = path.resolve(option(args, "--project", process.cwd()));
+    const file = path.join(projectRoot, ROLES_CONFIG_PATH);
+    const loaded = loadProjectRoles(projectRoot);
+    if (!args.includes("--init")) {
+      if (loaded.error) console.error(loaded.error);
+      console.log(JSON.stringify({ source: loaded.source, file, roles: loaded.roles }, null, 2));
+      return;
+    }
+    if (existsSync(file)) throw new Error(`${file} already exists. Edit it, or delete it first.`);
+    mkdirSync(path.dirname(file), { recursive: true });
+    // Seeded from the software defaults so the file starts as something to edit rather than
+    // something to invent. Rename these freely — only `verifies` and `plans` mean anything to the
+    // scheduler, and every other name in here is just vocabulary.
+    writeFileSync(file, `${JSON.stringify({ roles: DEFAULT_ROLES }, null, 2)}\n`, "utf8");
+    console.log(`Wrote ${file}`);
+    console.log("Rename these roles to your project's own vocabulary. Keep at least one role with");
+    console.log('"verifies": true (it can review and approve) and one with "plans": true.');
     return;
   }
 

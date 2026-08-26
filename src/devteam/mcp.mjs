@@ -360,7 +360,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
       taskId: z.string().uuid(),
       title: z.string().min(1).max(160),
       description: z.string().min(1).max(12000),
-      role: z.enum(["planner", "implementer", "reviewer", "security-reviewer", "tester", "researcher"]).default("implementer"),
+      role: z.string().min(1).max(40).default("implementer").describe("A role this project defines. Call devteam_roles to see them — a project may use its own vocabulary (analyst, fact-checker, editor) rather than software job titles. A role that verifies makes this a review assignment to the scheduler."),
       requiresWrite: z.boolean().default(false),
       targetAgentName: z.string().max(80).optional(),
       checklist: z.array(z.string().max(300)).max(40).optional().describe("Points the assignee must address; overrides the default checklist for the role"),
@@ -381,7 +381,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
       kind: z.enum(["role", "handoff", "plan", "decision"]).default("role"),
       summary: z.string().min(1).max(2000).describe("One line the team votes on, e.g. 'I take the security-reviewer role'"),
       details: z.object({
-        role: z.enum(["planner", "implementer", "reviewer", "security-reviewer", "tester", "researcher"]).optional(),
+        role: z.string().min(1).max(40).optional().describe("A role this project defines; see devteam_roles"),
         targetAgentName: z.string().max(80).optional().describe("Agent the role or handoff is for; defaults to the proposer"),
         title: z.string().max(160).optional(),
         description: z.string().max(4000).optional(),
@@ -533,6 +533,21 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
   }, safe(async (args) => {
     requireIdentity(args.agentId);
     return withInbox(args.agentId, store.approveTask(args));
+  }));
+
+  server.registerTool("devteam_roles", {
+    title: "List the roles this project uses",
+    description: "The roles this project defines, and what each one means to the scheduler. A project sets these in .devteam/roles.json and may use its own vocabulary — `analyst`, `fact-checker`, `domain-expert`, `copy-editor` — rather than software job titles. Two behaviours matter: a role that `verifies` reads the work rather than changing it, so its assignments wait for pending writers and completing one earns the right to approve or request changes; a role that `plans` decides what the team does next. Read this before devteam_assign if you are creating work in a project you have not seen.",
+    inputSchema: {
+      agentId: z.string().uuid(),
+      taskId: z.string().uuid().describe("Any task in the project whose roles you want"),
+    },
+  }, safe(async ({ agentId, taskId }) => {
+    requireIdentity(agentId);
+    store.assertMembership(agentId, taskId);
+    const task = store.getTask(taskId);
+    if (!task) throw new Error("Task not found.");
+    return withInbox(agentId, store.roleCatalogue(task.project_id));
   }));
 
   server.registerTool("devteam_block", {
