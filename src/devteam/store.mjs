@@ -31,8 +31,15 @@ import {
 // A task in one of these states hands out no work; named once so the candidate scan and the
 // scheduler's explanation can never disagree about what "closed" means.
 const CLOSED_TASK_STATUSES = ["accepted", "blocked", "cancelled"];
+// How far the candidate scan will look past lease-blocked and runtime-gated work before giving up.
+// Generous for a local single-user server, and bounded so a pathological board cannot stall a claim.
+const CANDIDATE_PAGE_SIZE = 20;
+const CANDIDATE_SCAN_CEILING = 500;
 // Roles that read the tree rather than change it, and therefore wait for pending writers.
 const VERIFIER_ROLES = ["reviewer", "security-reviewer", "tester"];
+// The same list as SQL literals, for conditions that are shared between statements with different
+// parameter positions. Fixed, known-safe strings — never anything a caller supplies.
+const VERIFIER_ROLE_LIST = VERIFIER_ROLES.map((role) => `'${role}'`).join(", ");
 // Which assignments depend, directly or transitively, on which. Written once so the candidate scan
 // and the scheduler's explanation walk the same edges.
 const DEPENDENCY_CLOSURE_CTE = `
@@ -51,6 +58,9 @@ const BLOCKING_WRITER_CONDITIONS = `pending_write.task_id = a.task_id
                 -- An assignment can never be the writer it is waiting for. Without this, a
                 -- reviewer/tester that itself declares write access matches its own row here and
                 -- is excluded from every scan forever, with nothing reported as blocking it.
+                -- (Kept explicit for the reader: the creation-order rule below now also excludes
+                -- the self row, since nothing is strictly older than itself. Mutation testing
+                -- confirms removing this line changes no behavior — it states the intent.)
                 AND pending_write.id != a.id
                 AND pending_write.requires_write = 1
                 AND pending_write.status IN ('queued', 'claimed')
@@ -58,7 +68,39 @@ const BLOCKING_WRITER_CONDITIONS = `pending_write.task_id = a.task_id
                   SELECT 1 FROM dependency_closure
                   WHERE dependency_closure.assignment_id = pending_write.id
                     AND dependency_closure.prerequisite_id = a.id
+                )
+                -- A writer that cannot start yet is not about to change anything, so waiting for it
+                -- buys nothing and costs liveness. Without this, the review gate and the dependency
+                -- gate compose into a waits-for cycle that never resolves: V1 waits for W1, W1
+                -- depends on V2, V2 waits for W2, W2 depends on V1 — four assignments, an acyclic
+                -- dependency graph, every agent present, and a board that never moves again. The
+                -- exclusion above only breaks that cycle when it is one hop long.
+                AND NOT EXISTS (
+                  SELECT 1 FROM assignment_dependencies blocking_link
+                  JOIN assignments blocking ON blocking.id = blocking_link.depends_on_assignment_id
+                  WHERE blocking_link.assignment_id = pending_write.id AND blocking.status != 'done'
+                )
+                -- Two verifiers that both declare write access are each other's pending writer, so
+                -- without an order they gate each other forever. Creation order breaks the tie
+                -- deterministically: a verifier waits only for verifiers older than itself.
+                AND (
+                  lower(pending_write.role) NOT IN (${VERIFIER_ROLE_LIST})
+                  OR pending_write.created_at < a.created_at
+                  OR (pending_write.created_at = a.created_at AND pending_write.id < a.id)
                 )`;
+
+// Why the two conditions above are enough to guarantee the board always drains: every waits-for edge
+// now points at something strictly older, or at something with no outgoing edges at all. A verifier
+// waits for a writer only when that writer has no unmet dependencies — so the writer has no outgoing
+// dependency edge — and a writer has an outgoing review edge only when it is itself a verifier, in
+// which case the creation-order rule makes that edge point backwards. Dependency edges always point
+// backwards too, since a dependency must already exist to be referenced. A graph whose every edge
+// points backwards or into a sink cannot contain a cycle.
+//
+// The cost is that a verifier may occasionally start just before a distant queued writer runs. That
+// is already handled: a completing writer with changed files bumps the task version and clears the
+// approvals built on the old one, so a review overtaken by later work is invalidated rather than
+// trusted. Liveness is the better trade.
 
 // A path scope of "" is the whole-project lease; spell that out wherever a scope reaches a human.
 const scopeLabel = (scope) => (scope === "" ? "the whole project" : scope);
@@ -2666,7 +2708,12 @@ export class DevTeamStore extends EventEmitter {
       // on its own to say which one held an assignment back. The write lease is not part of it: it
       // is no longer project-wide, so it is resolved per path in the loop below and non-overlapping
       // writers run in parallel.
-      const candidates = this.db.prepare(`
+      // The write lease and the runtime gate are resolved per candidate below rather than in SQL,
+      // so a fixed window would let work that *is* claimable hide behind a screenful of lease-blocked
+      // rows — the scan would hand out nothing while whyNotClaimable correctly reported the item as
+      // claimable. Page instead of truncating, so the two can only disagree on a board larger than
+      // any this server is meant to hold.
+      const readCandidatePage = (offset) => this.db.prepare(`
         ${DEPENDENCY_CLOSURE_CTE}
         SELECT a.*, t.project_id, t.title AS task_title, t.description AS task_description,
           t.session_policy AS task_session_policy,
@@ -2676,15 +2723,22 @@ export class DevTeamStore extends EventEmitter {
         JOIN projects p ON p.id = t.project_id
         WHERE ${predicates.map((predicate) => predicate.sql).join("\n          AND ")}
         ORDER BY CASE WHEN a.target_agent_name IS NOT NULL THEN 0 ELSE 1 END, a.created_at ASC
-        LIMIT 20
-      `).all(...predicates.flatMap((predicate) => predicate.params));
+        LIMIT ? OFFSET ?
+      `).all(...predicates.flatMap((predicate) => predicate.params), CANDIDATE_PAGE_SIZE, offset);
+      const heldLeases = this.#heldWriteLeases();
+      const stamp = now();
+      let firstRuntimeGate = null;
+      const candidates = [];
+      for (let offset = 0; offset < CANDIDATE_SCAN_CEILING; offset += CANDIDATE_PAGE_SIZE) {
+        const page = readCandidatePage(offset);
+        if (!page.length) break;
+        candidates.push(...page);
+        if (page.length < CANDIDATE_PAGE_SIZE) break;
+      }
       if (!candidates.length) {
         this.db.prepare("UPDATE agents SET status = 'waiting', last_seen = ? WHERE id = ?").run(now(), agentId);
         return null;
       }
-      const heldLeases = this.#heldWriteLeases();
-      const stamp = now();
-      let firstRuntimeGate = null;
       for (const candidate of candidates) {
         // A write assignment is claimable only if its declared paths don't overlap a write
         // lease already held by another agent in the same project. Undeclared paths mean the
@@ -2766,7 +2820,16 @@ export class DevTeamStore extends EventEmitter {
   // presented as an idle agent sitting next to claimable work with blockedBy: []. Pass no agentId
   // for the agent-agnostic view the dashboard shows on a queued item; pass one to answer the
   // question an idle agent actually has, which is "why can *I* not claim this?".
-  whyNotClaimable(assignmentId, agentId = null) {
+  whyNotClaimable(assignmentId, agentId = null, { refreshLiveness = true } = {}) {
+    // claimNextAssignment reaps dead sessions and recovers their orphaned claims before it looks at
+    // the queue. Answering without doing the same made the explanation report work as "held by
+    // someone else" that the very next claim call handed straight over. Only when an agent is
+    // actually asking: the dashboard's agent-agnostic call is a read, and the server already runs a
+    // periodic reaper for it.
+    if (agentId && refreshLiveness) {
+      this.#reapStaleAgents();
+      this.#recoverOrphanedClaims();
+    }
     const assignment = this.db.prepare(`
       SELECT a.*, t.status AS task_status, t.project_id, p.root AS project_root
       FROM assignments a
@@ -2920,9 +2983,11 @@ export class DevTeamStore extends EventEmitter {
     const rooms = [...new Set([...this.#memberTaskIds(agentId), ...invited])]
       .filter((room) => !taskId || room === taskId);
     if (taskId && !rooms.includes(taskId)) this.assertMembership(agentId, taskId);
+    this.#reapStaleAgents();
+    this.#recoverOrphanedClaims();
     const queued = rooms.flatMap((room) => this.db.prepare(`
       SELECT a.id FROM assignments a WHERE a.task_id = ? AND a.status = 'queued' ORDER BY a.created_at ASC
-    `).all(room).map((row) => this.whyNotClaimable(row.id, agentId)));
+    `).all(room).map((row) => this.whyNotClaimable(row.id, agentId, { refreshLiveness: false })));
     const held = this.db.prepare("SELECT id, title FROM assignments WHERE agent_id = ? AND status = 'claimed' LIMIT 1").get(agentId);
     return {
       agentId,

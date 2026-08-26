@@ -403,3 +403,38 @@ test("the explanation surfaces authorize before they compute, and are not an exi
   assert.equal(store.assignmentRoom("00000000-0000-4000-8000-000000000000"), null);
   assert.throws(() => store.assertExplainable(outsider.id, task.id), /not a member/i);
 });
+
+test("the explanation answers against the same liveness the scan will act on", async (t) => {
+  // claimNextAssignment reaps dead sessions and recovers their orphaned claims before it looks at
+  // the queue. whyNotClaimable did not, so it reported work as "held by someone else" that the very
+  // next claim call handed straight over — an idle agent asking why it had nothing to do was told a
+  // stale answer about the exact assignment it was about to be given.
+  const { store, task } = await explainFixture(t);
+  const first = store.connectAgent({ name: "First", provider: "fixture" });
+  const second = store.connectAgent({ name: "Second", provider: "fixture" });
+  store.joinTask(first.id, task.id, "contributor");
+  store.joinTask(second.id, task.id, "contributor");
+  for (let round = 0; round < 4; round += 1) {
+    for (const agentId of [first.id, second.id]) {
+      const plan = store.claimNextAssignment(agentId);
+      if (plan?.claimToken) store.completeAssignment({ agentId, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+    }
+  }
+
+  const work = store.createAssignment({
+    taskId: task.id, title: "Orphaned work", description: "Write.",
+    role: "implementer", requiresWrite: true, paths: ["src"],
+  });
+  const claim = store.claimNextAssignment(first.id);
+  assert.equal(claim.id, work.id);
+
+  // A hard transport death: the session row goes disconnected without releasing its claim.
+  store.db.prepare("UPDATE agents SET status = 'disconnected', disconnected_at = ? WHERE id = ?")
+    .run(new Date().toISOString(), first.id);
+
+  const explanation = store.whyNotClaimable(work.id, second.id);
+  assert.equal(explanation.claimable, true,
+    "the explanation recovers the orphaned claim first, exactly as the scan is about to");
+  assert.deepEqual(explanation.reasons.filter((reason) => reason.blocking), []);
+  assert.equal(store.claimNextAssignment(second.id)?.id, work.id, "and the scan then hands it over, agreeing");
+});
