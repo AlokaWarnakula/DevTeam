@@ -126,11 +126,37 @@ function syncTaskUrl() {
   history.replaceState({}, "", `${url.pathname}${url.search}`);
 }
 
-async function api(url, options = {}) {
+// On a loopback server the browser is handed a session cookie when it loads the page, so nothing
+// here ever sees a 401. On a server bound to anything else there is no free cookie — the token has
+// to be presented once, exchanged for a session, and the original request retried. Asking only when
+// the server actually refuses keeps the local case exactly as friction-free as it was.
+let authenticating = null;
+async function api(url, options = {}, { retry = true } = {}) {
   const response = await fetch(url, { ...options, headers: { "Content-Type": "application/json", ...options.headers } });
+  if (response.status === 401 && retry) {
+    const authenticated = await authenticate();
+    if (authenticated) return api(url, options, { retry: false });
+  }
   const body = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(body.error || `Request failed (${response.status})`);
   return body;
+}
+
+async function authenticate() {
+  // One prompt at a time, however many polls discover the 401 together.
+  if (authenticating) return authenticating;
+  authenticating = (async () => {
+    const token = prompt("This DevTeam server requires its token.\n\nPaste the value of DEVTEAM_TOKEN (or a named token issued from the dashboard):");
+    if (!token || !token.trim()) return false;
+    const response = await fetch("/api/session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: token.trim() }),
+    });
+    return response.ok;
+  })();
+  try { return await authenticating; }
+  finally { authenticating = null; }
 }
 
 function storageGet(key) {

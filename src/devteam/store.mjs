@@ -8,6 +8,7 @@ import { CodeGraph } from "./codegraph.mjs";
 import { KnowledgeVault } from "./knowledge.mjs";
 import { buildBudgetedBrief, clipUtf8, DEFAULT_BRIEF_BUDGET } from "./brief.mjs";
 import { DEFAULT_ROLES, loadProjectRoles, planningRole, roleBehaviour, ROLES_CONFIG_PATH } from "./roles.mjs";
+import { hashToken, mintToken, normalizeTokenLabel, tokensMatch } from "./access.mjs";
 import {
   boundedCheckpointText,
   buildCheckpointCapsule,
@@ -632,6 +633,17 @@ export class DevTeamStore extends EventEmitter {
         finished_at TEXT,
         outcome TEXT
       );
+      -- T4.1: named, revocable credentials. Only the hash is kept, so this table is a list of who
+      -- may connect, never a list of live secrets. The shared token in the metadata table still
+      -- works for the single-user localhost case it was designed for.
+      CREATE TABLE IF NOT EXISTS access_tokens (
+        id TEXT PRIMARY KEY,
+        label TEXT NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL,
+        last_used_at TEXT,
+        revoked_at TEXT
+      );
       CREATE INDEX IF NOT EXISTS idx_jobs_task ON jobs(task_id, started_at DESC);
       CREATE INDEX IF NOT EXISTS idx_jobs_running ON jobs(state, started_at);
       CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project_id, status);
@@ -739,6 +751,66 @@ export class DevTeamStore extends EventEmitter {
     const token = randomBytes(24).toString("base64url");
     this.db.prepare("INSERT INTO metadata (key, value) VALUES ('auth_token', ?)").run(token);
     return token;
+  }
+
+  // Adopt an operator-supplied shared token (DEVTEAM_TOKEN). Persisted, so agents configured with
+  // it keep working across restarts and the value in the data directory never disagrees with the
+  // value that actually authenticates.
+  setSharedToken(token) {
+    const clean = String(token || "").trim();
+    if (clean.length < 16) throw new Error("A shared token must be at least 16 characters.");
+    const existing = this.db.prepare("SELECT value FROM metadata WHERE key = 'auth_token'").get();
+    if (existing) this.db.prepare("UPDATE metadata SET value = ? WHERE key = 'auth_token'").run(clean);
+    else this.db.prepare("INSERT INTO metadata (key, value) VALUES ('auth_token', ?)").run(clean);
+    this.token = clean;
+    return clean;
+  }
+
+  // T4.1 — named, revocable credentials alongside the shared one.
+  //
+  // One shared bearer token is right for one person on one machine: every agent pastes the same
+  // string and there is nothing to manage. It is wrong the moment more than one *party* is
+  // involved, for two reasons that matter more than secrecy — a compromised or misbehaving agent
+  // cannot be cut off without re-keying everybody, and the record cannot say which credential did
+  // something, only that a valid one did.
+  //
+  // Only the hash is stored, so the database is not a list of live secrets. The plaintext is
+  // returned exactly once, at mint time, and cannot be recovered afterwards.
+  mintAccessToken({ label }) {
+    const clean = normalizeTokenLabel(label);
+    const token = mintToken();
+    const id = randomUUID();
+    this.db.prepare(`
+      INSERT INTO access_tokens (id, label, token_hash, created_at) VALUES (?, ?, ?, ?)
+    `).run(id, clean, hashToken(token), now());
+    return { id, label: clean, token, createdAt: now() };
+  }
+
+  revokeAccessToken(id) {
+    const row = this.db.prepare("SELECT * FROM access_tokens WHERE id = ?").get(id);
+    if (!row) throw new Error("No such token.");
+    if (row.revoked_at) return { id, label: row.label, revokedAt: row.revoked_at, alreadyRevoked: true };
+    const stamp = now();
+    this.db.prepare("UPDATE access_tokens SET revoked_at = ? WHERE id = ?").run(stamp, id);
+    return { id, label: row.label, revokedAt: stamp, alreadyRevoked: false };
+  }
+
+  // Never returns the secret — there is nothing here that could re-issue one.
+  accessTokens() {
+    return this.db.prepare("SELECT id, label, created_at, last_used_at, revoked_at FROM access_tokens ORDER BY created_at ASC").all();
+  }
+
+  // Resolve a presented bearer to the credential it is, or null. A revoked token is not a
+  // credential; last use is stamped so the dashboard can show which agent is actually using which
+  // token, which is the audit trail one shared string could never give.
+  resolveAccessToken(presented) {
+    if (!presented) return null;
+    if (tokensMatch(presented, this.token)) return { kind: "shared", id: null, label: "Shared server token" };
+    const row = this.db.prepare("SELECT * FROM access_tokens WHERE token_hash = ? AND revoked_at IS NULL")
+      .get(hashToken(presented));
+    if (!row) return null;
+    this.db.prepare("UPDATE access_tokens SET last_used_at = ? WHERE id = ?").run(now(), row.id);
+    return { kind: "agent", id: row.id, label: row.label };
   }
 
   #transaction(callback) {

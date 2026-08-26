@@ -11,6 +11,14 @@ import { DevTeamStore } from "./store.mjs";
 import { createDevTeamMcpServer } from "./mcp.mjs";
 import { ManagedRuntimeSupervisor } from "./runtime/managed.mjs";
 import { normalizeRuntimeProfile, resolveRuntimeRequirement } from "./runtime/index.mjs";
+import {
+  checkExposureRequirements,
+  decideApiAccess,
+  exposureMode,
+  hostnameOf,
+  shouldIssueDashboardCookie,
+  tokensMatch,
+} from "./access.mjs";
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.resolve(moduleDir, "../../public");
@@ -70,7 +78,15 @@ export async function startDevTeamServer({
   managed = {},
 } = {}) {
   if (!dataDir) throw new Error("dataDir is required.");
+  // T4.1 — the one place DevTeam declines to start. A server reachable from the network whose
+  // credential is the one auto-generated for a single-user localhost tool is a worse outcome than
+  // no server, and an operator who means to expose it can say so with a real secret.
+  const exposure = checkExposureRequirements({ host, token: process.env.DEVTEAM_TOKEN });
+  if (!exposure.ok) throw new Error(exposure.error);
   const store = new DevTeamStore(dataDir, { liveness, knowledge, codegraph, checkpoint });
+  // An operator-supplied token replaces the generated one, so what authenticates is the secret they
+  // chose rather than a string sitting in the data directory.
+  if (process.env.DEVTEAM_TOKEN) store.setSharedToken(process.env.DEVTEAM_TOKEN);
   const supervisor = new ManagedRuntimeSupervisor(managed);
   const attachmentRoot = path.resolve(dataDir, "attachments");
   const root = requireDirectory(workspaceRoot);
@@ -89,55 +105,82 @@ export async function startDevTeamServer({
     }),
   );
   const hasDashSession = (req) => parseCookies(req).devteam_dash === dashSecret;
-  const hasBearer = (req) => req.get("authorization") === `Bearer ${store.token}`;
+  // T4.1 — a bearer is now resolved to *which* credential it is: the shared server token, or a
+  // named token that can be revoked on its own. `null` means no credential, and nothing below
+  // distinguishes "wrong token" from "no token" in what it says back.
+  const bearerOf = (req) => {
+    const header = req.get("authorization") || "";
+    const presented = header.startsWith("Bearer ") ? header.slice(7).trim() : null;
+    return presented ? store.resolveAccessToken(presented) : null;
+  };
+  const credentialOf = (req) => bearerOf(req) || (hasDashSession(req) ? { kind: "dashboard", id: null, label: "Dashboard session" } : null);
   const mcpAuth = (req, res, next) => {
-    if (!hasBearer(req)) {
+    const credential = bearerOf(req);
+    if (!credential) {
       return res.status(401).json({ error: "Invalid DevTeam token." });
     }
+    req.devteamCredential = credential;
     next();
   };
 
-  // DevTeam is a local-only control plane. Reject requests whose Host is not loopback
-  // (blunts DNS-rebinding) and mutating requests carrying a foreign Origin (blocks a random
-  // web page from POSTing tasks, messages, or votes into the room). Native clients and the
-  // same-origin dashboard send either no Origin or a loopback Origin and are allowed.
-  const LOCAL_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
-  const hostnameOf = (value = "") => {
-    const raw = String(value).trim();
-    if (raw.startsWith("[")) return raw.slice(1, raw.indexOf("]")); // [::1]:port
-    return raw.split(":")[0];
-  };
+  // T4.1 — the access rules live in access.mjs, stated once and unit-tested without a socket.
+  //
+  // Loopback (the default, and what every existing install runs): unchanged. Reads are open to the
+  // local dashboard, writes need the session cookie or a bearer, a foreign Origin is refused, and a
+  // non-loopback Host is refused outright, which is what blunts DNS rebinding.
+  //
+  // Exposed (any other bind address): there is no trusted read. Everything needs a credential, the
+  // cookie is never handed out for free, and the server refuses to start at all behind a weak token.
+  const mode = exposureMode(host);
   const apiGuard = (req, res, next) => {
-    if (!LOCAL_HOSTS.has(hostnameOf(req.headers.host))) {
-      return res.status(403).json({ error: "DevTeam only accepts local (loopback) connections." });
-    }
-    const origin = req.get("origin");
-    if (origin) {
-      let originHost;
-      try { originHost = new URL(origin).hostname; } catch { return res.status(403).json({ error: "Invalid Origin header." }); }
-      if (!LOCAL_HOSTS.has(originHost)) {
-        return res.status(403).json({ error: "Cross-origin requests are not allowed." });
-      }
-    }
+    const decision = decideApiAccess({
+      mode,
+      method: req.method,
+      hostHeader: req.headers.host,
+      origin: req.get("origin") || null,
+      credential: credentialOf(req),
+      allowedOrigins: [hostnameOf(host)],
+    });
+    if (!decision.allow) return res.status(decision.status).json({ error: decision.error });
     next();
   };
-  // Hand the browser a dashboard session cookie on its (loopback) page load, so its later
-  // control-plane calls carry a credential without ever exposing the MCP bearer token in the page.
+  // Hand the browser a dashboard session cookie on its page load, so its later control-plane calls
+  // carry a credential without ever exposing the MCP bearer token in the page. Only on a document
+  // load, never on /api: issuing it on any GET is what let one unauthenticated request collect a
+  // cookie and the next one trade it at /api/setup for the bearer token.
   app.use((req, res, next) => {
-    if (req.method === "GET" && LOCAL_HOSTS.has(hostnameOf(req.headers.host)) && !hasDashSession(req)) {
+    if (shouldIssueDashboardCookie({ mode, method: req.method, path: req.path, accept: req.get("accept") || "", hasSession: hasDashSession(req) })) {
       res.setHeader("Set-Cookie", `devteam_dash=${dashSecret}; HttpOnly; SameSite=Strict; Path=/`);
     }
     next();
   });
+  // Exchanging the token for a dashboard session. This is the only /api route that must be reachable
+  // without a credential — it is where a credential is presented — so it is mounted ahead of the
+  // guard and does its own checking. Attempts are counted and slowed, because an endpoint that says
+  // yes or no to a secret is a guessing oracle if it will answer forever.
+  const loginAttempts = new Map();
+  app.post("/api/session", express.json({ limit: "4kb" }), (req, res) => {
+    const from = req.ip || "unknown";
+    const attempts = loginAttempts.get(from) || { count: 0, until: 0 };
+    if (attempts.until > Date.now()) {
+      return res.status(429).json({ error: "Too many attempts. Wait a minute and try again." });
+    }
+    const presented = String(req.body?.token || "").trim();
+    const credential = presented && (tokensMatch(presented, store.token) ? { kind: "shared" } : store.resolveAccessToken(presented));
+    if (!credential) {
+      const count = attempts.count + 1;
+      loginAttempts.set(from, { count, until: count >= 5 ? Date.now() + 60_000 : 0 });
+      return res.status(401).json({ error: "That token is not valid for this server." });
+    }
+    loginAttempts.delete(from);
+    res.setHeader("Set-Cookie", `devteam_dash=${dashSecret}; HttpOnly; SameSite=Strict; Path=/`);
+    res.json({ ok: true, credential: credential.label || "Shared server token" });
+  });
   app.use("/api", apiGuard);
-  // Every state-changing control-plane call must present the dashboard session or the bearer token.
-  // Read-only GETs stay open to the loopback dashboard (already origin/host-guarded above).
-  const MUTATING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
   const requireControlAuth = (req, res, next) => {
-    if (hasDashSession(req) || hasBearer(req)) return next();
+    if (credentialOf(req)) return next();
     return res.status(401).json({ error: "This action requires the DevTeam dashboard session or bearer token." });
   };
-  app.use("/api", (req, res, next) => (MUTATING_METHODS.has(req.method) ? requireControlAuth(req, res, next) : next()));
 
   const checkpointInvitation = (task, result) => [
     `Continue DevTeam task “${result.checkpoint.capsule?.task?.title || task.id}” in a fresh session.`,
@@ -189,7 +232,10 @@ export async function startDevTeamServer({
   app.get("/api/config", (req, res) => res.json({
     name: "DevTeam",
     version: "0.2.0",
-    localOnly: host === "127.0.0.1" || host === "localhost",
+    localOnly: mode === "loopback",
+    // The dashboard needs to know which world it is in: on an exposed server nothing is readable
+    // without a credential, so it must ask for one rather than rendering an empty board.
+    accessMode: mode,
     mcpUrl: `${req.protocol}://${req.get("host")}/mcp`,
     idleWaitSeconds: 45,
     liveness: store.liveness,
@@ -200,6 +246,23 @@ export async function startDevTeamServer({
     mcpUrl: `${req.protocol}://${req.get("host")}/mcp`,
     token: store.token,
   }));
+  // T4.1 — named credentials. One shared token is right for one person on one machine; the moment
+  // more than one party is involved, a credential you cannot revoke without re-keying everybody is
+  // the problem. The plaintext is returned once here and never again — the server keeps only a hash.
+  app.get("/api/tokens", requireControlAuth, (req, res) => res.json({
+    mode,
+    sharedTokenInUse: true,
+    tokens: store.accessTokens(),
+  }));
+  app.post("/api/tokens", requireControlAuth, (req, res) => {
+    requireFields(req.body, ["label"]);
+    const minted = store.mintAccessToken({ label: req.body.label });
+    res.json({
+      ...minted,
+      note: "Copy this now: DevTeam stores only a hash of it and cannot show it again.",
+    });
+  });
+  app.delete("/api/tokens/:id", requireControlAuth, (req, res) => res.json(store.revokeAccessToken(req.params.id)));
   app.get("/api/state", (req, res) => {
     const taskId = Object.hasOwn(req.query, "taskId") ? req.query.taskId || null : undefined;
     const snapshot = store.snapshot(taskId);
@@ -560,6 +623,7 @@ export async function startDevTeamServer({
     server: httpServer,
     store,
     url,
+    accessMode: mode,
     mcpUrl: `${url}/mcp`,
     async close() {
       clearInterval(reaper);

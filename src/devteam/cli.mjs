@@ -39,7 +39,13 @@ const help = `DevTeam — local AI development team portal
 Usage:
   devteam start [--port 7331] [--workspace PATH] [--data-dir PATH] [--open]
   devteam doctor [--data-dir PATH]
-  devteam token [--data-dir PATH]
+  devteam token [--data-dir PATH]     Print the shared server token.
+  devteam token --list               Named tokens, when each was last used, which are revoked.
+  devteam token --new "Codex desktop"
+                                     Issue a named token for one agent or person. Printed once;
+                                     DevTeam keeps only a hash. Revoke it without re-keying
+                                     everyone else.
+  devteam token --revoke ID
   devteam sync-skill --dest PATH     Copy the current skill into a folder your AI agent
                                      reads skills from. Works for any agent. Re-run after
                                      you change the skill so it does not run a stale copy.
@@ -89,8 +95,31 @@ export async function runDevTeamCli(args = process.argv.slice(2)) {
     // database as an observer: no directory lock, and none of the startup recovery a second owner
     // would otherwise run against a live scheduler.
     const store = new DevTeamStore(dataDir, { exclusive: false });
-    console.log(store.token);
-    store.close();
+    try {
+      const label = option(args, "--new", null);
+      const revoke = option(args, "--revoke", null);
+      if (label) {
+        const minted = store.mintAccessToken({ label });
+        console.log(minted.token);
+        console.error(`Issued “${minted.label}” (id ${minted.id}). Copy it now: DevTeam stores only a hash and cannot show it again.`);
+      } else if (revoke) {
+        const result = store.revokeAccessToken(revoke);
+        console.error(result.alreadyRevoked
+          ? `“${result.label}” was already revoked at ${result.revokedAt}.`
+          : `Revoked “${result.label}”. Any agent still using it is refused from now on.`);
+      } else if (args.includes("--list")) {
+        const rows = store.accessTokens();
+        if (!rows.length) console.log("No named tokens. Every agent is using the shared server token.");
+        for (const row of rows) {
+          const state = row.revoked_at ? `revoked ${row.revoked_at}` : `last used ${row.last_used_at || "never"}`;
+          console.log(`${row.id}  ${row.label.padEnd(24)}  ${state}`);
+        }
+      } else {
+        console.log(store.token);
+      }
+    } finally {
+      store.close();
+    }
     return;
   }
 
