@@ -89,6 +89,7 @@
         <div class="divider"></div>
       </div>
       <div class="panel-title"><h3>Work queue</h3><span id="assignment-count" class="count">0</span></div>
+      <div id="regressions" class="regressions hidden"></div>
       <div id="assignment-list" class="assignment-list"></div>
       <div class="divider"></div>
       <div id="checkpoint-section" class="checkpoint-section hidden">
@@ -216,7 +217,7 @@
       <label>Type<select name="kind" id="proposal-kind"><option value="role">Assign a role</option><option value="decision">Record a decision</option></select></label>
       <label>Summary (what the team votes on)<input name="summary" maxlength="200" placeholder="Codex takes the security-reviewer role" required></label>
       <div id="role-fields">
-        <label>Role<select name="role"><option value="implementer">implementer</option><option value="reviewer">reviewer</option><option value="security-reviewer">security-reviewer</option><option value="tester">tester</option><option value="researcher">researcher</option><option value="planner">planner</option></select></label>
+        <label>Role<select name="role" id="proposal-role"></select></label>
         <label>For agent<select name="targetAgentName" id="proposal-agent"><option value="">Anyone available</option></select></label>
         <p class="hint role-agent-hint">One connected agent can take different roles in sequence. A review by the same agent is self-review, not independent consensus.</p>
         <label>What should they do?<textarea name="description" rows="3" placeholder="Describe the work for this role…"></textarea></label>

@@ -1106,6 +1106,83 @@
   text-transform: uppercase;
 }
 
+/* Checks run off the event loop, so a claimed assignment can be busy for minutes without changing
+   status. This says what it is doing, so an in-flight report never reads as a stalled one. */
+.verifying {
+  display: grid;
+  gap: 3px;
+  margin-top: 7px;
+  padding: 7px 8px;
+  border-left: 2px solid var(--blue);
+  border-radius: 0 6px 6px 0;
+  background: color-mix(in srgb, var(--blue) 10%, transparent);
+  color: #b6c0cc;
+  font-size: 10.5px;
+}
+
+.verifying strong {
+  color: var(--blue);
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+/* Work a reviewer sent back. A reopened assignment otherwise reads as an ordinary queued item,
+   which is how rework used to disappear into the board. */
+.rework {
+  display: grid;
+  gap: 4px;
+  margin-top: 7px;
+  padding: 7px 8px;
+  border-left: 2px solid var(--red);
+  border-radius: 0 6px 6px 0;
+  background: color-mix(in srgb, var(--red) 10%, transparent);
+  color: #b6c0cc;
+  font-size: 10.5px;
+}
+
+.rework strong {
+  color: var(--red);
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.finding-list {
+  margin: 2px 0 0;
+  padding-left: 15px;
+  display: grid;
+  gap: 3px;
+}
+
+.finding-list li { line-height: 1.4; }
+.finding-list code { color: var(--blue); font-size: 10px; }
+.finding-list small { color: #6d7785; margin-left: 5px; }
+
+/* A check that used to pass and now does not. Above the assignments, because a broken shared check
+   belongs to the team rather than to whichever assignment happened to run it. */
+.regressions { display: grid; gap: 6px; margin-top: 14px; }
+
+.regression {
+  display: grid;
+  gap: 3px;
+  padding: 8px 9px;
+  border: 1px solid color-mix(in srgb, var(--red) 35%, var(--line));
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--red) 8%, transparent);
+  color: #b6c0cc;
+  font-size: 10.5px;
+}
+
+.regression strong {
+  color: var(--red);
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.regression small { color: #6d7785; }
+
 .role-agent-hint {
   margin-top: -5px;
 }

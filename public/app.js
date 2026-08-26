@@ -21,7 +21,39 @@ const freshness = (stamp) => {
   return "cold";
 };
 const initials = (name = "AI") => name.split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toUpperCase();
+// Only the software defaults get a nicer present-participle label; a project that defines its own
+// vocabulary falls back to the role name itself, which reads fine ("Ana · fact-checker").
 const ROLE_VERB = { planner: "planning", implementer: "implementing", reviewer: "reviewing", "security-reviewer": "security review", tester: "testing", researcher: "researching" };
+
+// The roles the selected task's project defines. Populated from the task payload so the dropdown
+// offers this project's vocabulary rather than a list of job titles baked into the HTML.
+// Checks that used to pass and now do not, with who is suspected. Shown above the assignment list
+// because a broken shared check is the team's problem, not one assignment's.
+function renderRegressions(task) {
+  const container = $("#regressions");
+  if (!container) return;
+  const open = task.regressions || [];
+  container.classList.toggle("hidden", open.length === 0);
+  if (!open.length) { container.innerHTML = ""; return; }
+  container.innerHTML = `<div class="section-label">Broken checks</div>` + open.map((regression) => {
+    const suspects = (regression.suspects || []).map((suspect) => `${escapeHtml(suspect.title)}${suspect.author ? ` · ${escapeHtml(suspect.author)}` : ""}`).join("; ");
+    const blame = regression.suspects?.length === 1
+      ? `Last green before ${suspects}`
+      : (regression.suspects?.length ? `${regression.suspects.length} changes landed since it was green: ${suspects}` : "Nothing changed files since it was green");
+    return `<div class="regression"><strong>${escapeHtml(regression.label)} regressed</strong><span>${blame}</span>${regression.fixAssignmentId ? `<small>A fix is queued.</small>` : ""}</div>`;
+  }).join("");
+}
+
+function renderRoleOptions(select, catalogue, selected) {
+  if (!select) return;
+  const roles = catalogue?.roles?.length ? catalogue.roles : [{ name: "implementer" }];
+  const keep = selected || select.value;
+  select.innerHTML = roles.map((role) => {
+    const marks = [role.plans ? "plans" : null, role.verifies ? "verifies" : null, role.writes ? "writes" : null].filter(Boolean);
+    return `<option value="${escapeHtml(role.name)}" title="${escapeHtml(role.description || "")}">${escapeHtml(role.name)}${marks.length ? ` · ${marks.join(", ")}` : ""}</option>`;
+  }).join("");
+  if (keep && roles.some((role) => role.name === keep)) select.value = keep;
+}
 const MODEL_CLASSES = ["economy", "balanced", "strong", "frontier", "specialized"];
 const EFFORT_CLASSES = ["light", "medium", "high", "extra_high", "maximum"];
 // A live "doing X" line for an agent: what it is working on right now, or how long it has waited.
@@ -390,6 +422,11 @@ function renderTask(task) {
     const release = item.status === "claimed" && item.requires_write
       ? `<button class="mini release" data-release="${item.id}" data-release-title="${escapeHtml(item.title)}" title="Force-release this stuck write lease (asks you to confirm the title)">Release lease</button>`
       : "";
+    // Completed work can go back to its author without stopping the task. This is the human's half
+    // of the same loop reviewers drive with devteam_request_changes.
+    const sendBack = item.status === "done"
+      ? `<button class="mini send-back" data-send-back="${item.id}" data-send-back-title="${escapeHtml(item.title)}" title="Send this work back to its author for changes, with your reasons attached">Request changes</button>`
+      : "";
     const checkpoint = item.status === "claimed" && item.agent_id
       ? `<button class="mini checkpoint" data-checkpoint-assignment="${item.id}" title="Create a bounded checkpoint and fresh-session invitation without releasing this claim">Checkpoint & rotate</button>`
       : "";
@@ -404,6 +441,19 @@ function renderTask(task) {
     const hold = item.schedulingHold
       ? `<div class="scheduling-hold"><strong>Held back</strong><span>${escapeHtml(item.schedulingHold.detail)}</span></div>`
       : "";
+    // Verification runs off the event loop, so a report can be in flight for minutes while the
+    // assignment still reads "claimed". Say what it is actually doing rather than looking idle.
+    const verifying = item.verifying_at
+      ? `<div class="verifying"><strong>Checks running</strong><span>DevTeam is running this report's checks — started ${escapeHtml(relativeTime(item.verifying_at))}</span></div>`
+      : "";
+    // Work sent back for changes reads as an ordinary queued item unless the card says otherwise,
+    // which is exactly how rework used to get silently lost.
+    const findings = item.findings?.length
+      ? `<ul class="finding-list">${item.findings.map((finding) => `<li>${finding.path ? `<code>${escapeHtml(finding.path)}</code> ` : ""}${escapeHtml(finding.detail)}<small>${escapeHtml(finding.requested_by_name)}</small></li>`).join("")}</ul>`
+      : "";
+    const rework = item.rework_requested_at
+      ? `<div class="rework"><strong>Changes requested${Number(item.rework_count) > 1 ? ` · ${Number(item.rework_count)} times` : ""}</strong><span>${escapeHtml(item.rework_summary || "Sent back to its author.")}</span>${findings}</div>`
+      : (item.findings?.length ? `<div class="rework"><strong>Open findings</strong>${findings}</div>` : "");
     const assessment = item.assessment;
     const assessmentView = assessment
       ? `<div class="complexity"><strong>${escapeHtml(assessment.level)} · score ${Number(assessment.score)}</strong><span>${escapeHtml(assignmentRuntimeLabel(item))}</span><small>${assessment.reasons.slice(0, 2).map((reason) => escapeHtml(reason.detail)).join(" · ") || "Scoped baseline work."}</small></div>`
@@ -412,8 +462,10 @@ function renderTask(task) {
     const runtime = item.status === "queued" && assessment
       ? `<button class="mini runtime" data-runtime-assignment="${item.id}" title="Review the provider-neutral runtime recommendation">Runtime settings</button>`
       : "";
-    return `<div class="assignment"><div class="assignment-top"><strong>${escapeHtml(item.title)}</strong><span class="role">${escapeHtml(item.role)}</span></div><p>${escapeHtml(item.agent_name ? `${item.agent_name} · ${item.status}` : item.status)}${item.requires_write ? " · write lease" : ""}</p>${assessmentView}${runtimeDecision}${hold}${blockedBy}${checks}${scope}${checklist}<div class="assignment-actions">${runtime}${checkpoint}${release}</div></div>`;
+    return `<div class="assignment"><div class="assignment-top"><strong>${escapeHtml(item.title)}</strong><span class="role">${escapeHtml(item.role)}</span></div><p>${escapeHtml(item.agent_name ? `${item.agent_name} · ${item.status}` : item.status)}${item.requires_write ? " · write lease" : ""}</p>${assessmentView}${runtimeDecision}${verifying}${rework}${hold}${blockedBy}${checks}${scope}${checklist}<div class="assignment-actions">${runtime}${sendBack}${checkpoint}${release}</div></div>`;
   }).join("") || `<p class="hint">Waiting for the plan</p>`;
+  renderRegressions(task);
+  renderRoleOptions($("#proposal-role"), task.roleCatalogue);
   renderSessionCheckpoints(task);
   renderBlackboard(task);
   const approvals = task.approvals.length;
@@ -857,6 +909,22 @@ document.addEventListener("click", async (event) => {
     if (!confirm(`Force-release the write lease for “${title}”?\n\nOnly do this if the agent has genuinely crashed or is stuck — a still-running writer would lose its lease. Type nothing; this confirms the exact title for you.`)) return;
     try { await api(`/api/assignments/${releaseButton.dataset.release}/force-release`, { method: "POST", body: JSON.stringify({ confirmTitle: title }) }); await refresh(); toast("Write lease released back to the queue"); }
     catch (error) { toast(error.message); }
+    return;
+  }
+  const sendBackButton = event.target.closest("[data-send-back]");
+  if (sendBackButton) {
+    const title = sendBackButton.dataset.sendBackTitle;
+    const summary = prompt(`Send “${title}” back to its author for changes.\n\nWhat needs to change? (one line)`);
+    if (summary === null || !summary.trim()) return;
+    const detail = prompt("Specific findings, one per line (optional). The author is handed these when it picks the work back up.") || "";
+    const findings = detail.split("\n").map((line) => line.trim()).filter(Boolean).slice(0, 50);
+    try {
+      const result = await api(`/api/tasks/${state.selectedTask.id}/assignments/${sendBackButton.dataset.sendBack}/request-changes`, {
+        method: "POST", body: JSON.stringify({ summary: summary.trim(), findings }),
+      });
+      await refresh();
+      toast(result.routedTo ? `Sent back to ${result.routedTo}` : "Sent back to the queue");
+    } catch (error) { toast(error.message); }
     return;
   }
   const checkpointButton = event.target.closest("[data-checkpoint-assignment]");
