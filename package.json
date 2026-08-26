@@ -11,7 +11,9 @@
     "dev": "node bin/devteam.mjs start",
     "start": "node bin/devteam.mjs start",
     "test": "node --test",
-    "doctor": "node bin/devteam.mjs doctor"
+    "doctor": "node bin/devteam.mjs doctor",
+    "soak": "node tools/scheduler-soak.mjs",
+    "mutation": "node tools/mutate-scheduler.mjs"
   },
   "engines": {
     "node": ">=22.13"

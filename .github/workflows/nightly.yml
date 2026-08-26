@@ -1,0 +1,71 @@
+# T4.5 — the scheduled half of scheduler regression safety.
+#
+# The committed property suite runs 24 enumerated seeds because `node --test` has to finish quickly.
+# That is enough to catch a reproducible deadlock and not enough to find a rare one. This job runs
+# the randomised soak and the mutation tool nightly, where taking ten minutes costs nobody anything.
+#
+# When the soak fails it names a seed: put that seed in SEEDS in
+# test/devteam-scheduler-properties.test.mjs and it becomes a permanent regression test. That is the
+# workflow this exists to feed — the failure is the deliverable, not the red tick.
+name: nightly
+
+on:
+  schedule:
+    # 03:00 UTC. Nothing here depends on the hour; it just needs to be outside a working day.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: "How many scheduler boards to soak"
+        required: false
+        default: "400"
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: test suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - run: node --test
+
+  soak:
+    name: scheduler soak
+    runs-on: ubuntu-latest
+    # Long by design. The default 6h limit would let a genuine hang burn the runner all night.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      # Randomised offset by default, so consecutive nights cover different boards rather than
+      # re-proving the same ones.
+      - run: node tools/scheduler-soak.mjs --seeds ${{ github.event.inputs.seeds || '400' }}
+
+  mutation:
+    name: scheduler mutation coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      # Edits store.mjs in place and restores it; a clean checkout is exactly the state it needs.
+      # It exits non-zero on a surviving mutant *or* on an anchor that no longer matches the code,
+      # because a mutant testing nothing is a silent loss of coverage.
+      - run: node tools/mutate-scheduler.mjs
+      - name: confirm the checkout was left untouched
+        run: git diff --exit-code
