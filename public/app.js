@@ -1368,22 +1368,11 @@ async function loadProjectCheckCommands(projectId, form) {
   const list = $("#project-check-commands");
   list.innerHTML = `<p class="hint">Loading…</p>`;
   form.elements.verificationEnabled.checked = false;
-  form.elements.checkRunner.value = "host";
+  form.elements.checkSandbox.checked = false;
   try {
     const config = await api(`/api/projects/${projectId}/check-commands`);
     form.elements.verificationEnabled.checked = config.verificationEnabled;
-    form.elements.checkRunner.value = config.runner || (config.sandbox ? "node-permission" : "host");
-    // Say what this host can actually provide. Offering a container runner that will grade every
-    // check unavailable is worse than not offering it.
-    const hint = $("#check-runner-hint");
-    if (hint) {
-      const status = config.containerRuntime
-        ? `Container runtime available: ${config.containerRuntime}.${config.container ? ` Image: ${config.container.image}.` : " No container.image declared in .devteam/checks.json yet."}`
-        : "No container runtime (docker or podman) found on this machine, so the container option would grade every check unavailable.";
-      if (!hint.querySelector(".runner-status")) hint.insertAdjacentHTML("beforeend", `<br><span class="runner-status"></span>`);
-      // textContent, so nothing read off disk is ever parsed as markup.
-      hint.querySelector(".runner-status").textContent = status;
-    }
+    form.elements.checkSandbox.checked = Boolean(config.sandbox);
     // Commands already approved, plus what this project's package.json would add. Scripts DevTeam
     // cannot run without a shell are simply absent — it never guesses at what a script body meant.
     const approved = new Map(config.commands.map((entry) => [entry.name, entry]));
@@ -1413,7 +1402,7 @@ $("#project-edit-form").addEventListener("submit", async (event) => {
       method: "PUT",
       body: JSON.stringify({
         ...(values.verificationEnabled ? {} : { commands: [] }),
-        runner: values.checkRunner || "host",
+        sandbox: Boolean(values.checkSandbox),
       }),
     });
     form.closest("dialog").close(); await refresh(); toast("Project updated");

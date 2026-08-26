@@ -198,7 +198,7 @@ On Windows a locally installed tool is a `.cmd` shim that `spawn` cannot run wit
 
 Git is optional. A session checkpoint's drift fingerprint records whether the project is a repository at all, and for one that is not, a bounded **workspace digest** of the assignment's own write scope takes git HEAD's place — so a fresh session taking over a manuscript is still told that files moved while it was away.
 
-Checks run in one of three places, chosen per project in the dashboard. **On this machine** is the default and behaves as it always has. **Confined to this folder** uses Node's own permission model, so a test file cannot read `~/.ssh` — it narrows exfiltration but cannot stop execution, because real suites shell out. **In a container** is the one that closes execution: the project names an image in `.devteam/checks.json` and DevTeam runs the check with no network, no inherited environment, nothing mounted but the project directory, and bounded memory and processes. It needs Docker or Podman and adds no dependency if you never select it — and if you do select it and no runtime is available, checks grade `unavailable` rather than quietly running unconfined.
+Checks run on this machine by default. A project may also confine them: **Confine checks to this folder** uses Node's own permission model, so a test file an agent wrote cannot read `~/.ssh` or `~/.aws`. It narrows what a check can reach without stopping it from executing, because real suites shell out and blocking that would make the sandbox unusable rather than safe. Anything DevTeam cannot confine is refused rather than run unconfined, so "sandboxed" never quietly means "not really".
 
 ### Roles are the project's own vocabulary
 

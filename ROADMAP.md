@@ -43,15 +43,36 @@ part, so it is recorded in each item's ✅ DONE section:
 |---|---|---|
 | **T0.4** | A durable `jobs` table and one-process-per-data-directory | Multi-process. Nothing has hit a measured limit, and the roadmap's own ordering puts durability first |
 | **T4.1** | The cookie handout closed, revocable named tokens, an explicit exposed mode | Users, roles, TLS termination. A tunnel is still the right way to reach it remotely |
-| **T4.4** | Container execution as an opt-in per-project runner | Any hard dependency. No runtime installed means DevTeam behaves exactly as before |
+| **T4.4** | Nothing — the Node permission-model sandbox that already existed is the answer for now | A container runner. It was built, then removed as a moving part with no payoff for local single-user use; see *Future optional improvements* |
 | **T4.5** | A nightly GitHub Actions workflow running the suite, the soak and the mutation tool | Making the soak part of `node --test` |
 
-**What is genuinely still open is judgement, not code:** the standing "things to deliberately not
+**What is genuinely still open is judgement, not code.** The standing "things to deliberately not
 do" list below still holds, and the next real work is whatever using the room actually exposes.
+
+### Future optional improvements
+
+Nothing here is needed for the tool as it is used today. Each is written down so that the *decision*
+survives, and so a future session does not rebuild something that was already weighed and declined.
+
+| # | Improvement | What would trigger it |
+|---|---|---|
+| F1 | **Container-isolated checks.** Run a project's verified checks inside Docker/Podman: no network, nothing mounted but the project directory, no inherited environment. Built once and removed as an unused moving part — the working design, and the two traps below, are recorded so it need not be rediscovered | Pointing DevTeam at a repository you did not write, where "run the tests" means executing a stranger's code as you |
+| F2 | **Multi-process / many projects at once.** The durable job table (T0.4) was the prerequisite and exists; the second half is deliberately unbuilt | A measured limit — the board visibly waiting on one process, not a suspicion that it might |
+| F3 | **Users and roles on the control plane.** Today a credential is a credential; there is no "this person may read but not force-release" | More than one human sharing one room |
+| F4 | **TLS / a hosted deployment story.** An SSH tunnel to a loopback bind is the current answer and a good one | Wanting to reach the room from a phone or another machine routinely |
+| F5 | **Feeding reliability into scheduling.** `teamReliability()` exists and is deliberately advisory rather than a gate | Evidence that a human reading it is not enough |
+
+**Two traps F1 already paid for, worth keeping even though the code went:**
+
+1. Probing a container runtime with `--version` is wrong — the CLI answers happily while the daemon
+   is stopped. Every check would then be graded a *failure* rather than *unavailable*, telling an
+   agent its work is broken when nothing ran. Probe with `info`, which needs the daemon.
+2. The exit codes a runtime reserves for its own setup failures (125/126/127) must grade
+   `unavailable`, not `failed`, because the daemon can stop between the probe and the run.
 
 ### Current state
 
-- **277 tests passing** (`node --test`).
+- **270 tests passing** (`node --test`).
 - Working tree has substantial uncommitted work across `src/`, `test/`, `public/`, `skills/` and the
   docs. **Nothing has been committed** — review and commit before starting anything new.
 - Two new source modules since the audit: `src/devteam/roles.mjs` (T1.1) and
@@ -71,7 +92,7 @@ node tools/mutate-scheduler.mjs
 It exits 0 when every behavioural mutant is caught, so it is safe to gate on. The nightly workflow
 (`.github/workflows/nightly.yml`) runs both of these plus a 400-board soak.
 
-Expect **277 passing** from the suite, and **12 caught / 1 equivalent** from the mutation tool (M9 is
+Expect **270 passing** from the suite, and **12 caught / 1 equivalent** from the mutation tool (M9 is
 a documented equivalent mutant, not a coverage gap).
 
 For anything touching the scheduler, also run a soak from a fresh offset:
@@ -961,32 +982,24 @@ narrative — which is what you need when a task went wrong and you want to know
 **Do.** A read-only timeline export (Markdown) reconstructing the whole task: assignments, claims,
 reports, checks, reviews, decisions.
 
-### T4.4 — Sandboxing agents' checks properly — **M** — ✅ DONE
+### T4.4 — Sandboxing agents' checks properly — **M** — ⏸ BUILT, THEN REMOVED ON PURPOSE
 
-**Now.** Three runners, chosen per project: `host` (as before), `node-permission` (the old
-`sandbox: true`), and `container`. The container runner is the only one that closes execution rather
-than narrowing it.
+**What exists today.** Opt-in Node permission-model confinement (`sandboxFlagsFor`), limited to
+`node`: a check can read and write only the project root and the temp directory, so a test file an
+agent wrote cannot reach `~/.ssh`. Child processes stay allowed, because real suites shell out, so
+this narrows exfiltration without closing execution. Anything it cannot confine is refused rather
+than run unconfined — "sandboxed" never quietly means "not really".
 
-**The project names the image** in `.devteam/checks.json`; DevTeam supplies the confinement — no
-network, no inherited environment, a bind mount of the project directory and nothing else, a tmpfs
-`/tmp`, bounded memory and pids, `--rm`, and the invoking user where the platform has one. The image
-reference is validated *as a reference*, because anything else in that string becomes arguments to
-`docker run` — the same class of mistake as a shell in an argv.
+**A container runner was built and then taken back out.** It worked and was tested, but it added a
+runtime dependency, a third option in the dashboard, an image to declare per project, and a probe
+that has to distinguish "Docker installed" from "Docker running" — a permanent moving part for a
+protection that only matters when running checks for code you do not trust. For a single-user local
+tool pointed at its owner's own projects, that trade was wrong. It is recorded under *Future optional
+improvements* instead, with the two traps its removal already paid for.
 
-**No dependency was added.** With no runtime installed, DevTeam behaves exactly as it did before.
-What it never does is fall back: a project that asked for a container and did not get one grades
-`unavailable`, which grants no pass. Same rule as the node sandbox, for the same reason —
-"sandboxed" must never quietly mean "not really".
-
-**The bug worth remembering.** The runtime probe was `docker --version`, which answers happily while
-Docker Desktop is stopped. DevTeam would then select the container runner and grade every refused
-container as a **failed check** — telling an agent its work was broken when nothing had run at all,
-which is the exact inversion of what verified checks are for. The probe is now `info`, which needs a
-daemon, and the exit codes a runtime reserves for its own failures (125/126/127) grade `unavailable`
-rather than `failed`, because the daemon can also stop *between* the probe and the run.
-
-**Deliberately NOT done:** building or pinning images for a project, and any attempt to sandbox the
-*agent* rather than the check. The first is the project's decision; the second is the host's.
+**When to reconsider:** the moment DevTeam is pointed at a repository you did not write — a client's,
+or something cloned to be evaluated — "run the tests" means executing a stranger's code as you, and
+nothing short of a container closes that.
 
 ### T4.5 — Scheduler regression safety — **S** — ✅ DONE *(and permanent)*
 
@@ -1077,10 +1090,9 @@ deliberately. Two independent reviews (correctness and security) produced these.
   wrote, as the host user, outside whatever sandbox the agent itself runs in. The allowlist pin
   protects *which argv* runs, not what that argv reads off disk — the project root is the real
   boundary. Documented at the top of `checks.mjs`. Optional Node permission-model confinement exists
-  (`sandboxFlagsFor`) and narrows exfiltration without closing execution. **T4.4 closed it:** a
-  project may now run its checks in a container instead, with no network and nothing mounted but the
-  project directory. That is opt-in, so this entry still describes the default — the host runner is
-  what a project gets until someone chooses otherwise.
+  (`sandboxFlagsFor`) and narrows exfiltration without closing execution. A container runner would
+  close it and was deliberately not kept — see T4.4. **This is therefore a live, accepted risk**, and
+  the reason enabling verification is a human decision per project rather than a default.
 - **Enabling verification snapshots *all* derivable `package.json` scripts**, including `start` and
   `dev`. The dashboard shows exactly what would be allowed before enabling, which is the mitigation.
   Trim per project if that matters.
