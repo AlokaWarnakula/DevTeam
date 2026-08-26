@@ -1094,6 +1094,9 @@ export class DevTeamStore extends EventEmitter {
     }
     if (nextName === project.name && nextRoot === project.root) return project;
     this.db.prepare("UPDATE projects SET name = ?, root = ? WHERE id = ?").run(nextName, nextRoot, projectId);
+    // A check allowlist is approved against the tree it was reviewed in. Repointing the root would
+    // otherwise silently start executing those commands somewhere the human never looked.
+    if (nextRoot !== project.root) this.db.prepare("DELETE FROM project_check_commands WHERE project_id = ?").run(projectId);
     if (nextRoot !== project.root) {
       try { this.knowledge.initializeProject(projectId); }
       catch (error) { this.knowledgeErrors.set(`project:${projectId}`, { message: error.message, at: now() }); }
@@ -2848,8 +2851,17 @@ export class DevTeamStore extends EventEmitter {
           }
         }
         if (!overlaps.length) continue;
-        add("write_lease_conflict", `Its write lease overlaps one “${lease.holder || "another agent"}” already holds for “${lease.title}”: ${overlaps.map((pair) => `${scopeLabel(pair.wanted)} vs ${scopeLabel(pair.held)}`).join(", ")}.`,
-          { conflictingAssignmentId: lease.id, conflictingTitle: lease.title, holder: lease.holder, paths: overlaps });
+        // Write leases are project-wide, so the blocker may live in a task room the caller has no
+        // business seeing. The overlapping *paths* are what makes the stall legible and they are
+        // already visible in this room; the other room's assignment title, id and holder are not.
+        const sameRoom = lease.taskId === assignment.task_id;
+        const pathSummary = overlaps.map((pair) => `${scopeLabel(pair.wanted)} vs ${scopeLabel(pair.held)}`).join(", ");
+        add("write_lease_conflict", sameRoom
+          ? `Its write lease overlaps one “${lease.holder || "another agent"}” already holds for “${lease.title}”: ${pathSummary}.`
+          : `Its write lease overlaps one another agent already holds in a different task room in this project: ${pathSummary}.`,
+        sameRoom
+          ? { conflictingAssignmentId: lease.id, conflictingTitle: lease.title, holder: lease.holder, paths: overlaps, sameRoom }
+          : { conflictingAssignmentId: null, conflictingTitle: null, holder: null, paths: overlaps, sameRoom });
       }
     }
 
@@ -2921,6 +2933,13 @@ export class DevTeamStore extends EventEmitter {
       claimable: queued.filter((entry) => entry.claimable).map((entry) => entry.assignmentId),
       assignments: queued,
     };
+  }
+
+  // The room an assignment belongs to, without computing anything about it. Lets a caller authorize
+  // *before* doing the work, and answer "no such assignment" and "not your room" identically so the
+  // explainer is not an existence oracle.
+  assignmentRoom(assignmentId) {
+    return this.db.prepare("SELECT task_id FROM assignments WHERE id = ?").get(assignmentId)?.task_id || null;
   }
 
   // Membership check for the explanation surfaces: an agent may ask about an assignment in a room it
@@ -3013,6 +3032,12 @@ export class DevTeamStore extends EventEmitter {
     const allowlist = task?.project_id ? this.projectCheckCommands(task.project_id) : [];
     const records = [];
     let executed = 0;
+    // spawnSync blocks the event loop, so the configured timeout is the budget for the *report*, not
+    // for each command in it. Without this, ten allowlisted checks at the default timeout could hold
+    // the whole server — MCP, dashboard, SSE, heartbeats — for twenty minutes on one tool call, and
+    // the refusal path deliberately leaves the claim intact, so it could be replayed forever.
+    const budgetStartedAt = Date.now();
+    const remainingBudget = () => this.checkTimeoutMs - (Date.now() - budgetStartedAt);
     for (const item of Array.isArray(checks) ? checks.slice(0, 100) : []) {
       const isObject = item && typeof item === "object" && !Array.isArray(item);
       const requested = isObject ? String(item.command ?? "").trim() : "";
@@ -3030,13 +3055,16 @@ export class DevTeamStore extends EventEmitter {
       } else if (entry && executed >= VERIFIED_CHECKS_PER_REPORT) {
         record.status = "unavailable";
         record.output = `Only ${VERIFIED_CHECKS_PER_REPORT} commands are executed per report.`;
+      } else if (entry && remainingBudget() <= 1000) {
+        record.status = "unavailable";
+        record.output = `The ${this.checkTimeoutMs}ms verification budget for this report was already spent.`;
       } else if (entry) {
         executed += 1;
         record.command = entry.argv;
         Object.assign(record, runVerifiedCheck({
           argv: entry.argv,
           cwd: task.project_root,  // pinned to the project root; nothing selects a working directory
-          timeoutMs: this.checkTimeoutMs,
+          timeoutMs: remainingBudget(),
         }));
       }
       records.push(record);
@@ -3062,7 +3090,7 @@ export class DevTeamStore extends EventEmitter {
   // with their normalized path scopes, for per-path conflict resolution.
   #heldWriteLeases() {
     return this.db.prepare(`
-      SELECT a.id, a.title, ag.name AS holder, t.project_id AS projectId, p.root AS root
+      SELECT a.id, a.title, a.task_id AS taskId, ag.name AS holder, t.project_id AS projectId, p.root AS root
       FROM assignments a
       JOIN tasks t ON t.id = a.task_id
       JOIN projects p ON p.id = t.project_id
@@ -3071,7 +3099,7 @@ export class DevTeamStore extends EventEmitter {
         AND ag.status != 'disconnected'
         AND t.status NOT IN ('accepted', 'blocked', 'cancelled')
     `).all().map((row) => ({
-      id: row.id, title: row.title, holder: row.holder, projectId: row.projectId,
+      id: row.id, title: row.title, taskId: row.taskId, holder: row.holder, projectId: row.projectId,
       scopes: this.#resolveScopesOnDisk(row.root, this.#writeScopeFor(row.id)),
     }));
   }

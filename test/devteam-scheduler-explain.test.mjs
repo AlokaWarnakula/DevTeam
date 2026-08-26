@@ -332,3 +332,74 @@ test("an idle agent can ask why the whole board is unclaimable, without seeing o
   store.joinTask(outsider.id, elsewhere.id, "contributor");
   assert.throws(() => store.assertExplainable(outsider.id, task.id), /not a member/i);
 });
+
+test("a write-lease conflict never carries a foreign task room's title or holder", async (t) => {
+  // Write leases are project-wide, so the agent blocking you may be working in a room you are not
+  // in. Before this was caught in review, the explanation named that room's assignment title, id and
+  // holder, and #schedulingHold carried the same string into taskDetail for the room you *are* in.
+  const { store, project, task } = await explainFixture(t);
+  const insider = store.connectAgent({ name: "Insider", provider: "fixture" });
+  const outsider = store.connectAgent({ name: "Outsider", provider: "fixture" });
+  const confidential = store.createTask({ projectId: project.id, title: "Confidential", description: "Another room." });
+  store.joinTask(insider.id, confidential.id, "contributor");
+  store.joinTask(outsider.id, task.id, "contributor");
+  // Both rooms seed a planner assignment; drain every one of them so the leases below are the only
+  // work on the board.
+  for (let round = 0; round < 6; round += 1) {
+    for (const agentId of [insider.id, outsider.id]) {
+      const plan = store.claimNextAssignment(agentId);
+      if (plan?.claimToken) store.completeAssignment({ agentId, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+    }
+  }
+
+  store.createAssignment({
+    taskId: confidential.id, title: "Rewrite the MERGER pricing engine", description: "Confidential.",
+    role: "implementer", requiresWrite: true, paths: ["src"],
+  });
+  const mine = store.createAssignment({
+    taskId: task.id, title: "Ordinary work", description: "Open.",
+    role: "implementer", requiresWrite: true, paths: ["src"],
+  });
+  const held = store.claimNextAssignment(insider.id);
+  assert.equal(held.title, "Rewrite the MERGER pricing engine");
+
+  const chain = store.whyNotClaimable(mine.id, outsider.id);
+  const conflict = reasonFor(chain, "write_lease_conflict");
+  assert.ok(conflict, "the stall is still explained");
+  assert.equal(conflict.sameRoom, false);
+  assert.equal(conflict.holder, null, "the holder in another room is not named");
+  assert.equal(conflict.conflictingTitle, null);
+  assert.equal(conflict.conflictingAssignmentId, null);
+  assert.doesNotMatch(conflict.detail, /MERGER|Insider/, "and nothing leaks through the prose either");
+  assert.ok(conflict.paths.length, "the overlapping paths stay, since they are what makes the stall legible");
+  assert.match(conflict.detail, /src/);
+
+  // The same string reaches the dashboard through taskDetail, so it must be redacted there too.
+  const card = store.taskDetail(task.id).assignments.find((item) => item.id === mine.id);
+  assert.doesNotMatch(card.schedulingHold.detail, /MERGER|Insider/);
+
+  // Within one room the full detail is still useful and is still given.
+  const sibling = store.createAssignment({
+    taskId: confidential.id, title: "Sibling work", description: "Same room.",
+    role: "implementer", requiresWrite: true, paths: ["src"],
+  });
+  const sameRoom = reasonFor(store.whyNotClaimable(sibling.id, insider.id), "write_lease_conflict");
+  assert.equal(sameRoom.sameRoom, true);
+  assert.equal(sameRoom.holder, "Insider");
+  assert.match(sameRoom.detail, /Rewrite the MERGER pricing engine/);
+});
+
+test("the explanation surfaces authorize before they compute, and are not an existence oracle", async (t) => {
+  const { store, project, task } = await explainFixture(t);
+  // The second room must exist before the outsider connects: a lone active task is pinned as
+  // implicit membership at connect time, which would make it a member of the room under test.
+  const elsewhere = store.createTask({ projectId: project.id, title: "Elsewhere", description: "Not yours." });
+  const outsider = store.connectAgent({ name: "Outsider", provider: "fixture" });
+  store.joinTask(outsider.id, elsewhere.id, "contributor");
+  const foreign = store.createAssignment({ taskId: task.id, title: "Private work", description: "Not yours.", role: "implementer" });
+
+  // assignmentRoom answers the authorization question without computing the explanation.
+  assert.equal(store.assignmentRoom(foreign.id), task.id);
+  assert.equal(store.assignmentRoom("00000000-0000-4000-8000-000000000000"), null);
+  assert.throws(() => store.assertExplainable(outsider.id, task.id), /not a member/i);
+});

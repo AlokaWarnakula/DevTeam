@@ -6,6 +6,7 @@ import path from "node:path";
 import { DevTeamStore } from "../src/devteam/store.mjs";
 import {
   boundCheckOutput,
+  isSafeCheckArgv,
   matchCheckCommand,
   normalizeCheckCommand,
   packageScriptCommands,
@@ -276,4 +277,94 @@ test("captured output is bounded and package scripts are read without being trus
   assert.deepEqual(packageScriptCommands(projectRoot), [], "an unreadable manifest offers nothing rather than throwing");
   await writeFile(path.join(projectRoot, "package.json"), JSON.stringify({ scripts: "not-an-object" }), "utf8");
   assert.deepEqual(packageScriptCommands(projectRoot), []);
+});
+
+// --- hardening added after an independent security review ----------------------------------------
+
+test("an allowlist entry may not itself be a way to run something else", () => {
+  // Every one of these was accepted before the review. Each hands back the shell, the network, or a
+  // live re-read of package.json — undoing shell:false or the pinned snapshot. The credential that
+  // reaches the allowlist endpoint is not strong enough to treat "a human sent it" as review.
+  for (const argv of [
+    ["node", "-e", "require('fs').writeFileSync('PWNED','x')"],
+    ["node", "--eval=1"],
+    ["node", "-p", "1"],
+    ["node", "--require", "./hook.mjs"],
+    ["node", "--import", "./tools/hook.mjs", "--test"],
+    ["node", "--experimental-loader", "./l.mjs"],
+    ["cmd", "/c", "whoami"],
+    ["cmd.exe", "/c", "whoami"],
+    ["powershell", "-c", "ls"],
+    ["sh", "-c", "ls"],
+    ["bash", "-lc", "ls"],
+    ["env", "node", "x.mjs"],
+    ["xargs", "node"],
+    ["npx", "tsc"],
+    ["npm", "run", "test"],       // resolves the script body at run time, defeating the snapshot
+    ["yarn", "test"],
+    ["bun", "test"],
+    ["node", "../../../evil.mjs"],
+    ["node", "a/../../b.mjs"],
+  ]) {
+    assert.equal(normalizeCheckCommand({ name: "x", argv }), null, `must refuse: ${JSON.stringify(argv)}`);
+    assert.equal(isSafeCheckArgv(argv), false, `must refuse: ${JSON.stringify(argv)}`);
+  }
+  // The same rules apply to a package.json script body, so a snapshot cannot smuggle one in.
+  for (const body of ["cmd /c whoami", "npm run build", "node --import ./h.mjs --test", "node ../../../evil.mjs"]) {
+    assert.equal(parseScriptCommand(body), null, `must refuse: ${body}`);
+  }
+  // Ordinary checks still work.
+  assert.deepEqual(normalizeCheckCommand({ name: "unit", argv: ["node", "--test"] }), { name: "unit", argv: ["node", "--test"] });
+  assert.deepEqual(parseScriptCommand("node --test"), ["node", "--test"]);
+  assert.deepEqual(parseScriptCommand("eslint src --max-warnings=0"), ["eslint", "src", "--max-warnings=0"]);
+});
+
+test("a failing command cannot launder itself into 'not run' by drowning the output buffer", async (t) => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "devteam-checks-flood-"));
+  t.after(async () => { await rm(projectRoot, { recursive: true, force: true }); });
+  // Exits non-zero AND prints past the 2MB capture limit. Graded "unavailable" before the review,
+  // which let the report complete; an exit status we could not read is not a pass.
+  const flooded = runVerifiedCheck({
+    argv: ["node", "--eval", "process.stdout.write('x'.repeat(4*1024*1024)); process.exit(7);"],
+    cwd: projectRoot, timeoutMs: 30_000,
+  });
+  assert.equal(flooded.status, "failed", "an unreadable result is a failure, never a pass");
+  assert.equal(flooded.verified, true);
+  assert.match(flooded.output, /cannot count as a pass/);
+});
+
+test("the verification timeout bounds the whole report, not each command in it", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-checks-budget-data-"));
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "devteam-checks-budget-project-"));
+  await writeFile(path.join(projectRoot, "hang.mjs"), "setTimeout(() => {}, 60000);\n", "utf8");
+  await writeFile(path.join(projectRoot, "package.json"), JSON.stringify({
+    name: "budget-fixture", scripts: { slow: "node hang.mjs" },
+  }), "utf8");
+  // spawnSync blocks the event loop, so ten allowlisted hangs must not be able to hold the whole
+  // server for ten timeouts' worth of wall clock on a single tool call.
+  const store = new DevTeamStore(dataDir, { knowledge: { enabled: false }, codegraph: { enabled: false }, checks: { timeoutMs: 2000 } });
+  t.after(async () => {
+    try { store.close(); } catch { /* already closed */ }
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  });
+  const project = store.ensureProject("Budget project", projectRoot);
+  const task = store.createTask({ projectId: project.id, title: "Budget", description: "Exercise the report budget." });
+  store.setProjectCheckCommands({ projectId: project.id });
+  const agent = store.connectAgent({ name: "Reporter", provider: "fixture" });
+  const plan = store.claimNextAssignment(agent.id);
+  store.completeAssignment({ agentId: agent.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+  const claim = claimWork(store, agent, task);
+
+  const startedAt = Date.now();
+  const result = store.completeAssignment({
+    agentId: agent.id, assignmentId: claim.id, claimToken: claim.claimToken, message: "Done.", status: "blocked",
+    checks: Array.from({ length: 10 }, (unused, index) => ({ label: `slow ${index}`, command: "slow" })),
+  });
+  const elapsed = Date.now() - startedAt;
+  assert.ok(elapsed < 8000, `ten hanging checks must share one budget, took ${elapsed}ms`);
+  const ran = result.checks.filter((record) => record.verified);
+  assert.equal(ran.length, 1, "the first check spends the budget; the rest are not run");
+  assert.ok(result.checks.slice(1).every((record) => record.status === "unavailable"));
+  assert.match(result.checks[9].output, /budget/);
 });

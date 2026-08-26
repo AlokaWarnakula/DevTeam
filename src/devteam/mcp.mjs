@@ -518,9 +518,12 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
     requireIdentity(agentId);
     store.heartbeat(agentId);
     if (!assignmentId) return withInbox(agentId, store.whyNoClaimableWork(agentId, taskId || null));
-    const explanation = store.whyNotClaimable(assignmentId, agentId);
-    store.assertExplainable(agentId, explanation.taskId);
-    return withInbox(agentId, explanation);
+    // Authorize before computing: whyNotClaimable resolves write scopes on disk, and an unauthorized
+    // caller should not be able to spend that work — nor tell a missing assignment from a private one.
+    const room = store.assignmentRoom(assignmentId);
+    if (!room) throw new Error("You are not a member of this task room. Call devteam_join first.");
+    store.assertExplainable(agentId, room);
+    return withInbox(agentId, store.whyNotClaimable(assignmentId, agentId));
   }));
 
   server.registerTool("devteam_approve", {

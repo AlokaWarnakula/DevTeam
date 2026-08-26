@@ -380,7 +380,23 @@ export class KnowledgeVault {
       const role = String(metadata.role || "contributor").toLowerCase();
       const project = this.db.prepare("SELECT root FROM projects WHERE id = ?").get(projectId);
       const changedFiles = project ? normalizeProjectFiles(project.root, metadata.changedFiles) : [];
-      const checks = Array.isArray(metadata.checks) ? metadata.checks.map((item) => clip(item, 500)).filter(Boolean).slice(0, 50) : [];
+      // Prefer the graded records over the bare labels. The vault is what agents read back as
+      // ground truth and what gets exported into the repo, so it is the last place that should blur
+      // "DevTeam ran this" into "an agent said this".
+      const records = Array.isArray(metadata.checkRecords) ? metadata.checkRecords : null;
+      const checks = records
+        ? records.slice(0, 50).map((record) => {
+          const label = clip(String(record?.label ?? ""), 500);
+          if (!label) return "";
+          if (record?.status === "passed") return `${label} — verified by DevTeam (exit 0)`;
+          if (record?.status === "failed") return `${label} — verified failure${record.exitCode == null ? "" : ` (exit ${record.exitCode})`}`;
+          if (record?.status === "unavailable") return `${label} — not run`;
+          return `${label} — agent-asserted, unverified`;
+        }).filter(Boolean)
+        : (Array.isArray(metadata.checks) ? metadata.checks.map((item) => `${clip(item, 500)} — agent-asserted, unverified`).filter(Boolean).slice(0, 50) : []);
+      // Note: the note's own status field is this vault's lifecycle state (verified / disputed /
+      // superseded), which is a different question from whether a check was executed. That
+      // distinction lives in the check lines above, where it belongs.
       const assignment = metadata.assignmentId
         ? this.db.prepare("SELECT title FROM assignments WHERE id = ?").get(metadata.assignmentId)
         : null;
