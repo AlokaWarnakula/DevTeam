@@ -8,6 +8,7 @@ import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { DevTeamStore } from "./store.mjs";
+import { detectContainerRuntime } from "./checks.mjs";
 import { createDevTeamMcpServer } from "./mcp.mjs";
 import { ManagedRuntimeSupervisor } from "./runtime/managed.mjs";
 import { normalizeRuntimeProfile, resolveRuntimeRequirement } from "./runtime/index.mjs";
@@ -363,6 +364,12 @@ export async function startDevTeamServer({
       projectId: req.params.projectId,
       verificationEnabled: commands.length > 0,
       sandbox: store.projectCheckSandbox(req.params.projectId),
+      // T4.4: which runner executes these, the image the project declares for the container runner,
+      // and whether this host can actually provide one — so the dashboard offers a choice that is
+      // real rather than one that silently grades every check unavailable.
+      runner: store.projectCheckRunner(req.params.projectId),
+      container: store.projectContainer(req.params.projectId),
+      containerRuntime: detectContainerRuntime(),
       commands,
       available: store.availableCheckCommands(req.params.projectId),
     });
@@ -373,6 +380,7 @@ export async function startDevTeamServer({
     res.json(store.setProjectCheckCommands({
       projectId: req.params.projectId,
       commands: Array.isArray(req.body?.commands) ? req.body.commands : null,
+      runner: typeof req.body?.runner === "string" ? req.body.runner : null,
       sandbox: typeof req.body?.sandbox === "boolean" ? req.body.sandbox : null,
     }));
   });

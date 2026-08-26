@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { readFileSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -40,6 +40,13 @@ import path from "node:path";
 //   suites shell out (this project's own tests run git), so this narrows exfiltration rather than
 //   closing execution. It applies to `node` only; anything else is refused rather than run
 //   unconfined, so "sandboxed" never quietly means "not really".
+//
+//   A project may instead opt into the CONTAINER runner (T4.4), which is the only thing here that
+//   closes execution rather than narrowing it: the check runs in an image the project names, with no
+//   network, no inherited environment, bounded memory and processes, and nothing bind-mounted but
+//   the project directory itself. It depends on a container runtime being installed, and on nothing
+//   else — with none available, a project that asked for one grades `unavailable` and DevTeam does
+//   NOT fall back to running the check unconfined. Same rule as the node sandbox, same reason.
 
 export const CHECK_ARGV_LIMIT = 30;
 export const CHECK_ARGUMENT_LIMIT = 200;
@@ -135,6 +142,29 @@ export const CHECKS_CONFIG_PATH = path.join(".devteam", "checks.json");
 // normalizeCheckCommand, so the program must be a bare executable name, interpreters and package
 // runners are still refused, there is still no shell, and the human still has to enable it. This
 // widens *what can be declared*, not what DevTeam is willing to run.
+// T4.4 — the container settings a project declares for itself, alongside its checks.
+//
+// The image is the project's decision and nobody else's: only the person who knows what the suite
+// needs can name something it will actually run in. DevTeam supplies the confinement — no network,
+// a read-write bind of the project and nothing else, bounded memory, processes and time — and
+// refuses to guess an image, because a guessed image that happens to run the suite would be a
+// sandbox whose contents nobody chose.
+export function projectContainerConfig(projectRoot) {
+  if (!projectRoot) return null;
+  let parsed;
+  try { parsed = JSON.parse(readFileSync(path.join(projectRoot, CHECKS_CONFIG_PATH), "utf8")); }
+  catch { return null; }
+  const declared = parsed?.container;
+  if (!declared || typeof declared !== "object" || Array.isArray(declared)) return null;
+  const image = String(declared.image ?? "").trim();
+  // An image reference, not a sentence: registry/name:tag or @digest. Anything else would become
+  // arguments to `docker run` — which is the same class of mistake as a shell in an argv.
+  if (!image || image.length > 200 || !/^[A-Za-z0-9][\w.\-/:@]*$/.test(image)) return null;
+  const network = declared.network === "bridge" ? "bridge" : "none";
+  const memory = /^\d{1,4}[mg]$/i.test(String(declared.memory ?? "")) ? String(declared.memory) : "2g";
+  return { image, network, memory };
+}
+
 export function projectDeclaredCommands(projectRoot) {
   if (!projectRoot) return [];
   let parsed;
@@ -251,6 +281,88 @@ export function sandboxFlagsFor(program, cwd) {
   return flags;
 }
 
+// T4.4 — container execution, as an optional per-project runner.
+//
+// Node's permission model narrows what a check can *read and write*; it cannot stop it executing,
+// because real suites shell out and blocking that made the sandbox unusable rather than safe. A
+// container is the only answer that closes execution too, and it becomes worth its cost the moment
+// DevTeam runs checks for a project you do not fully trust.
+//
+// It is opt-in per project and depends on nothing: with no container runtime installed, DevTeam
+// behaves exactly as it did. What it never does is fall back to running unconfined — a project that
+// asked for a container and did not get one grades `unavailable`, for the same reason the node
+// sandbox refuses to run anything it cannot confine. "Sandboxed" must never quietly mean "not
+// really".
+export const CONTAINER_RUNTIMES = ["docker", "podman"];
+
+export function containerRunCommand({ runtime, argv, cwd, container }) {
+  const [program, ...args] = argv;
+  const flags = [
+    "run", "--rm",
+    // No network at all unless the project says otherwise. A check that can reach the network can
+    // exfiltrate the repository it is checking, which is most of what this is for.
+    `--network=${container.network}`,
+    `--memory=${container.memory}`,
+    "--pids-limit=512",
+    // The project, and nothing else on the host. Read-write because suites write: build output,
+    // snapshots, coverage. /tmp is a tmpfs so scratch writes never touch the host at all.
+    "--mount", `type=bind,src=${cwd},dst=/work`,
+    "--tmpfs", "/tmp:rw,size=256m",
+    "--workdir", "/work",
+    // No environment is inherited. The host's variables are the operator's, and this is the one
+    // execution path where DevTeam can withhold them completely.
+    "--env", "CI=1",
+  ];
+  // Run as the invoking user where the platform has one, so a container-written file is not left
+  // root-owned in the project.
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  const gid = typeof process.getgid === "function" ? process.getgid() : null;
+  if (uid !== null && gid !== null) flags.push("--user", `${uid}:${gid}`);
+  return { executable: runtime, args: [...flags, container.image, program, ...args] };
+}
+
+// Which container runtime this host can actually run something with, or null.
+//
+// The probe is `info`, not `--version`, and the difference matters more than it looks: the CLI being
+// installed says nothing about the daemon being up. Docker Desktop stopped is the common case on a
+// laptop, and `docker --version` answers happily while every `docker run` fails. DevTeam would then
+// select the container runner and grade each refused container as a *failed check* — telling an
+// agent its work is broken when the truth is that DevTeam could not run anything at all.
+//
+// Probed once per process. The answer can go stale if the daemon stops while DevTeam runs, which is
+// why the exit codes a runtime reserves for its own failures are also mapped to `unavailable` below.
+let containerRuntimeCache;
+export function detectContainerRuntime({ refresh = false } = {}) {
+  if (!refresh && containerRuntimeCache !== undefined) return containerRuntimeCache;
+  containerRuntimeCache = null;
+  for (const runtime of CONTAINER_RUNTIMES) {
+    const probe = spawnSync(runtime, ["info", "--format", "{{.ServerVersion}}"], {
+      windowsHide: true, shell: false, timeout: 15_000, encoding: "utf8",
+    });
+    if (!probe.error && probe.status === 0) { containerRuntimeCache = runtime; break; }
+  }
+  return containerRuntimeCache;
+}
+
+// Exit codes a container runtime reserves for "I could not run your command": the daemon refused,
+// the entry point was not executable, or it was not found in the image. None of them are the check
+// failing, and recording them as a failure would refuse an honest report for something the agent
+// has no way to fix.
+const CONTAINER_SETUP_EXIT_CODES = new Set([125, 126, 127]);
+
+// The daemon can stop between the probe and the run, and an image can lack the program entirely. A
+// container that never started is not a check that failed, and grading it as one would tell an agent
+// its work is broken over something it has no way to fix.
+export function gradeContainerResult(result, { runtime, program }) {
+  if (!CONTAINER_SETUP_EXIT_CODES.has(result.exitCode)) return result;
+  return {
+    ...result,
+    verified: false,
+    status: "unavailable",
+    output: boundCheckOutput(`[DevTeam] ${runtime} could not start the container for "${program}" (exit ${result.exitCode}). Nothing ran, so nothing is recorded as verified.\n${result.output || ""}`),
+  };
+}
+
 // The environment the check runs in: the operator's, minus anything that looks like a credential.
 function scrubbedEnvironment() {
   return Object.fromEntries(Object.entries(process.env).filter(([name]) => !SECRET_ENV_PATTERN.test(name)));
@@ -269,10 +381,29 @@ function scrubbedEnvironment() {
 // Every verdict below is the one the synchronous version produced for the same situation. The four
 // states spawnSync gave for free (clean exit, timeout kill, output flood, never started) are each
 // tracked explicitly here, because spawn hands back a stream instead of a result.
-export function runVerifiedCheck({ argv, cwd, timeoutMs = DEFAULT_CHECK_TIMEOUT_MS, sandbox = false }) {
+export function runVerifiedCheck({ argv, cwd, timeoutMs = DEFAULT_CHECK_TIMEOUT_MS, sandbox = false, runner = null, container = null }) {
   const [program, ...args] = argv;
-  const confinement = sandbox ? sandboxFlagsFor(program, cwd) : null;
-  if (sandbox && !confinement) {
+  // `sandbox: true` is the old spelling of the node-permission runner, kept so existing projects
+  // and callers behave identically.
+  const mode = runner || (sandbox ? "node-permission" : "host");
+  if (mode === "container") {
+    const unavailable = (message) => Promise.resolve({
+      verified: false, status: "unavailable", exitCode: null, durationMs: 0, timedOut: false,
+      output: boundCheckOutput(message),
+    });
+    if (!container) {
+      return unavailable(`This project runs checks in a container, but no image is declared. Add a "container": { "image": "…" } block to ${CHECKS_CONFIG_PATH}. "${program}" was not run.`);
+    }
+    const runtime = detectContainerRuntime();
+    if (!runtime) {
+      return unavailable(`This project runs checks in a container, and no container runtime (${CONTAINER_RUNTIMES.join(" or ")}) is available on this host. "${program}" was not run — DevTeam will not fall back to running it unconfined.`);
+    }
+    const command = containerRunCommand({ runtime, argv, cwd, container });
+    return spawnCheck({ executable: command.executable, args: command.args, cwd, timeoutMs, env: scrubbedEnvironment() })
+      .then((result) => gradeContainerResult(result, { runtime, program }));
+  }
+  const confinement = mode === "node-permission" ? sandboxFlagsFor(program, cwd) : null;
+  if (mode === "node-permission" && !confinement) {
     return Promise.resolve({
       verified: false, status: "unavailable", exitCode: null, durationMs: 0, timedOut: false,
       output: boundCheckOutput(`This project runs checks sandboxed, and DevTeam can only confine "node". "${program}" was not run.`),
@@ -280,16 +411,30 @@ export function runVerifiedCheck({ argv, cwd, timeoutMs = DEFAULT_CHECK_TIMEOUT_
   }
   // Run the same Node that runs DevTeam rather than whatever "node" happens to resolve to on PATH.
   const executable = program === "node" ? process.execPath : program;
+  return spawnCheck({
+    executable,
+    args: confinement ? [...confinement, ...args] : args,
+    cwd,
+    timeoutMs,
+    env: scrubbedEnvironment(),
+  });
+}
+
+// Spawning and grading, shared by every runner. Which process to start is the runner's decision;
+// how its result becomes a verdict must not be, or a second runner would quietly grade differently
+// from the first — and the four states here (clean exit, timeout kill, output flood, never started)
+// are exactly the distinctions that make a verified check worth more than an assertion.
+function spawnCheck({ executable, args, cwd, timeoutMs, env }) {
   const timeout = Math.min(Math.max(1000, Number(timeoutMs) || DEFAULT_CHECK_TIMEOUT_MS), MAX_CHECK_TIMEOUT_MS);
   const startedAt = Date.now();
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawn(executable, confinement ? [...confinement, ...args] : args, {
+      child = spawn(executable, args, {
         cwd,
         shell: false, // never: the argv reaches the OS verbatim, so an argument can never become syntax
         windowsHide: true,
-        env: scrubbedEnvironment(),
+        env,
       });
     } catch (error) {
       resolve(spawnFailure(error, Date.now() - startedAt));

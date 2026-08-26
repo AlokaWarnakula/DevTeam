@@ -26,6 +26,7 @@ import {
   matchCheckCommand,
   normalizeCheckCommand,
   packageScriptCommands,
+  projectContainerConfig,
   projectDeclaredCommands,
   resolveLocalBinary,
   CHECKS_CONFIG_PATH,
@@ -124,6 +125,17 @@ const fromJson = (value, fallback = null) => {
   }
 };
 
+// Whether the process recorded in the instance lock still exists. Signal 0 asks without sending
+// anything. EPERM means it exists and belongs to somebody else, which still counts as alive; only
+// ESRCH means gone. An unknown pid is treated as alive so a malformed lock never opens the door.
+function holdingProcessIsAlive(pid) {
+  const id = Number(pid);
+  if (!Number.isInteger(id) || id <= 0) return true;
+  if (id === process.pid) return true;
+  try { process.kill(id, 0); return true; }
+  catch (error) { return error?.code !== "ESRCH"; }
+}
+
 export class DevTeamStore extends EventEmitter {
   // Per-project role config, cached by the file's mtime (see projectRoles).
   #roleCache = new Map();
@@ -209,7 +221,11 @@ export class DevTeamStore extends EventEmitter {
     const lock = existing ? fromJson(existing.value, null) : null;
     if (lock?.instanceId && lock.instanceId !== this.instanceId) {
       const age = Date.now() - Date.parse(lock.heartbeatAt || lock.startedAt || 0);
-      if (Number.isFinite(age) && age < DevTeamStore.INSTANCE_LOCK_STALE_MS) {
+      // A dead process holds nothing. A clean shutdown releases the lock, but a SIGKILL cannot, and
+      // waiting out the stale window then means the tool refuses to restart for two minutes after
+      // any hard kill — which is exactly how a safety measure trains people to work around it. The
+      // lock is always same-machine (it guards a local directory), so the pid can simply be asked.
+      if (holdingProcessIsAlive(lock.pid) && Number.isFinite(age) && age < DevTeamStore.INSTANCE_LOCK_STALE_MS) {
         this.db.close();
         throw new Error([
           `Another DevTeam server is already using this data directory`,
@@ -684,6 +700,10 @@ export class DevTeamStore extends EventEmitter {
       ["events", "author_name", "TEXT"],                                   // who wrote it, kept even after the agent row is purged
       ["events", "author_kind", "TEXT"],
       ["projects", "check_sandbox", "INTEGER NOT NULL DEFAULT 0"],       // confine node checks to the project root
+      // T4.4: which runner executes this project's verified checks — 'host', 'node-permission' or
+      // 'container'. Null means "whatever check_sandbox said", so an existing project keeps its
+      // current behaviour without a migration that has to guess at intent.
+      ["projects", "check_runner", "TEXT"],
       ["assignment_checks", "superseded_at", "TEXT"],           // only the latest report attempt describes the work as it stands                                   // 'human' or 'agent', so authorship never depends on a nullable FK
       ["assignments", "verifying_at", "TEXT"],                  // set while DevTeam is running this report's checks off the event loop
       ["assignments", "rework_count", "INTEGER NOT NULL DEFAULT 0"], // how many times a reviewer has sent this work back
@@ -3542,6 +3562,23 @@ export class DevTeamStore extends EventEmitter {
     return Boolean(this.db.prepare("SELECT check_sandbox FROM projects WHERE id = ?").get(projectId)?.check_sandbox);
   }
 
+  // Which runner this project's checks execute under. The boolean that came before is still the
+  // fallback, so a project configured before containers existed reads exactly as it did.
+  projectCheckRunner(projectId) {
+    const row = this.db.prepare("SELECT check_sandbox, check_runner FROM projects WHERE id = ?").get(projectId);
+    if (!row) return "host";
+    if (row.check_runner === "container" || row.check_runner === "node-permission" || row.check_runner === "host") return row.check_runner;
+    return row.check_sandbox ? "node-permission" : "host";
+  }
+
+  // The container the project declares for itself, or null. Read from the project's own config
+  // rather than stored, so changing the image is an edit to a file the human owns — and never
+  // something an agent can talk DevTeam into by reporting a check.
+  projectContainer(projectId) {
+    const project = this.db.prepare("SELECT root FROM projects WHERE id = ?").get(projectId);
+    return project ? projectContainerConfig(project.root) : null;
+  }
+
   projectCheckCommands(projectId) {
     return this.db.prepare("SELECT name, argv FROM project_check_commands WHERE project_id = ? ORDER BY name ASC")
       .all(projectId)
@@ -3576,7 +3613,7 @@ export class DevTeamStore extends EventEmitter {
   // package.json scripts; passing an explicit list stores exactly that; passing an empty list turns
   // verification back off. Snapshotting is what keeps this safe — an agent that later edits a script
   // body changes nothing, because the argv DevTeam runs was pinned here by a human.
-  setProjectCheckCommands({ projectId, commands = null, sandbox = null }) {
+  setProjectCheckCommands({ projectId, commands = null, sandbox = null, runner = null }) {
     const project = this.db.prepare("SELECT id, root FROM projects WHERE id = ?").get(projectId);
     if (!project) throw new Error("Project not found.");
     const requested = commands === null ? this.#derivableCheckCommands(project.root) : commands;
@@ -3600,11 +3637,18 @@ export class DevTeamStore extends EventEmitter {
           .run(projectId, entry.name, json(entry.argv), stamp);
       }
       if (sandbox !== null) this.db.prepare("UPDATE projects SET check_sandbox = ? WHERE id = ?").run(sandbox ? 1 : 0, projectId);
+      if (runner !== null) {
+        if (!["host", "node-permission", "container"].includes(runner)) throw new Error(`Unknown check runner: ${runner}.`);
+        this.db.prepare("UPDATE projects SET check_runner = ?, check_sandbox = ? WHERE id = ?")
+          .run(runner, runner === "node-permission" ? 1 : 0, projectId);
+      }
     });
     this.#changed("project.check_commands");
     return {
       projectId, commands: entries, verificationEnabled: entries.length > 0,
       sandbox: this.projectCheckSandbox(projectId),
+      runner: this.projectCheckRunner(projectId),
+      container: this.projectContainer(projectId),
     };
   }
 
@@ -3637,6 +3681,8 @@ export class DevTeamStore extends EventEmitter {
   async #gradeReportedChecks(assignment, task, checks) {
     const allowlist = task?.project_id ? this.projectCheckCommands(task.project_id) : [];
     const sandbox = task?.project_id ? this.projectCheckSandbox(task.project_id) : false;
+    const runner = task?.project_id ? this.projectCheckRunner(task.project_id) : "host";
+    const container = runner === "container" && task?.project_id ? this.projectContainer(task.project_id) : null;
     const records = [];
     let executed = 0;
     // The configured timeout is the budget for the *report*, not for each command in it. Checks no
@@ -3674,6 +3720,8 @@ export class DevTeamStore extends EventEmitter {
           cwd: task.project_root,  // pinned to the project root; nothing selects a working directory
           timeoutMs: remainingBudget(),
           sandbox,
+          runner,
+          container,
         }));
       }
       records.push(record);

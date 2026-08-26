@@ -188,3 +188,22 @@ test("a CLI can read the database while the server owns it, without touching sch
   const stillLocked = store.db.prepare("SELECT value FROM metadata WHERE key = 'server_instance'").get();
   assert.ok(stillLocked, "an observer closing does not release someone else's lock");
 });
+
+test("a lock held by a process that no longer exists is not a lock", async (t) => {
+  // A clean shutdown releases the directory, but a SIGKILL cannot. Waiting out the stale window
+  // would mean refusing to restart for two minutes after any hard kill, which is how a safety
+  // measure teaches people to disable it. The lock guards a local directory, so the pid can be asked
+  // directly — and a fresh heartbeat from a dead pid is still a dead process.
+  const { store, open } = await fixture(t);
+  const lock = JSON.parse(store.db.prepare("SELECT value FROM metadata WHERE key = 'server_instance'").get().value);
+  store.db.prepare("UPDATE metadata SET value = ? WHERE key = 'server_instance'").run(JSON.stringify({
+    ...lock,
+    instanceId: "someone-elses-instance",
+    pid: 0x7fffffff, // a pid nothing on this machine is using
+    heartbeatAt: new Date().toISOString(),
+  }));
+  store.db.close();
+
+  const restarted = open();
+  assert.ok(restarted.instanceId, "the directory is taken over immediately rather than after a timeout");
+});
