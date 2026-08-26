@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 // Reported checks used to be believed. `checks: ["node --test: 142/142"]` was recorded because an
@@ -32,6 +33,13 @@ import path from "node:path";
 //   That is inherent to "run the repo's checks" and is the reason enabling it is a human decision.
 //   The child's environment is scrubbed of secret-looking variables (below), which narrows the blast
 //   radius but does not change the conclusion.
+//
+//   A project may opt into sandboxing, which confines a `node` check with Node's own permission
+//   model: it can then read and write only the project root and the temp directory, so a test file
+//   an agent wrote can no longer reach ~/.ssh or ~/.aws. Child processes stay allowed, because real
+//   suites shell out (this project's own tests run git), so this narrows exfiltration rather than
+//   closing execution. It applies to `node` only; anything else is refused rather than run
+//   unconfined, so "sandboxed" never quietly means "not really".
 
 export const CHECK_ARGV_LIMIT = 30;
 export const CHECK_ARGUMENT_LIMIT = 200;
@@ -158,6 +166,23 @@ export function boundCheckOutput(text, limit = CHECK_OUTPUT_LIMIT) {
   return `${head}\n… ${clean.length - head.length - tail.length} characters omitted …\n${tail}`;
 }
 
+// Confine a node check to the project root and the temp directory using Node's own permission
+// model. Both the directory and its subtree are granted, since the flag does not imply recursion.
+export function sandboxFlagsFor(program, cwd) {
+  if (program !== "node") return null;
+  const scopes = [cwd, os.tmpdir()];
+  const flags = ["--permission"];
+  for (const scope of scopes) {
+    const normalized = scope.replace(/[\\/]+$/, "");
+    flags.push(`--allow-fs-read=${normalized}`, `--allow-fs-read=${normalized}/*`);
+    flags.push(`--allow-fs-write=${normalized}`, `--allow-fs-write=${normalized}/*`);
+  }
+  // Real suites spawn processes (this project's own tests run git), so blocking that would make the
+  // sandbox unusable rather than safe. Exfiltration to disk is what this closes.
+  flags.push("--allow-child-process", "--allow-worker");
+  return flags;
+}
+
 // The environment the check runs in: the operator's, minus anything that looks like a credential.
 function scrubbedEnvironment() {
   return Object.fromEntries(Object.entries(process.env).filter(([name]) => !SECRET_ENV_PATTERN.test(name)));
@@ -170,13 +195,20 @@ function scrubbedEnvironment() {
 // gathered would be a smaller lie than the one this feature exists to stop. The pause is bounded —
 // and the caller bounds the *whole report*, not just each command, so one report can never hold the
 // event loop for longer than the configured timeout however many checks it carries.
-export function runVerifiedCheck({ argv, cwd, timeoutMs = DEFAULT_CHECK_TIMEOUT_MS }) {
+export function runVerifiedCheck({ argv, cwd, timeoutMs = DEFAULT_CHECK_TIMEOUT_MS, sandbox = false }) {
   const [program, ...args] = argv;
+  const confinement = sandbox ? sandboxFlagsFor(program, cwd) : null;
+  if (sandbox && !confinement) {
+    return {
+      verified: false, status: "unavailable", exitCode: null, durationMs: 0, timedOut: false,
+      output: boundCheckOutput(`This project runs checks sandboxed, and DevTeam can only confine "node". "${program}" was not run.`),
+    };
+  }
   // Run the same Node that runs DevTeam rather than whatever "node" happens to resolve to on PATH.
   const executable = program === "node" ? process.execPath : program;
   const timeout = Math.min(Math.max(1000, Number(timeoutMs) || DEFAULT_CHECK_TIMEOUT_MS), MAX_CHECK_TIMEOUT_MS);
   const startedAt = Date.now();
-  const result = spawnSync(executable, args, {
+  const result = spawnSync(executable, confinement ? [...confinement, ...args] : args, {
     cwd,
     shell: false, // never: the argv reaches the OS verbatim, so an argument can never become syntax
     windowsHide: true,

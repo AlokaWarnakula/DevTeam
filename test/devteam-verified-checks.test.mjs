@@ -12,6 +12,7 @@ import {
   packageScriptCommands,
   parseScriptCommand,
   runVerifiedCheck,
+  sandboxFlagsFor,
 } from "../src/devteam/checks.mjs";
 
 // A project whose package.json offers one passing script, one failing script, and several scripts
@@ -404,4 +405,41 @@ test("only the latest report attempt describes the work as it now stands", async
   const history = store.db.prepare("SELECT status, superseded_at FROM assignment_checks WHERE assignment_id = ?").all(claim.id);
   assert.equal(history.length, 3, "every attempt is kept");
   assert.equal(history.filter((row) => row.superseded_at).length, 2);
+});
+
+test("a sandboxed project confines its checks to the project folder", async (t) => {
+  const { store, project, task, agent, projectRoot } = await checksFixture(t);
+  // Honest work still passes: the temp directory stays writable, because real suites use it.
+  await writeFile(path.join(projectRoot, "scripts", "pass.mjs"),
+    "import {writeFileSync} from 'node:fs';import os from 'node:os';import path from 'node:path';\n"
+    + "writeFileSync(path.join(os.tmpdir(),'devteam-sandbox-probe.txt'),'ok');process.stdout.write('142/142 passing');\n", "utf8");
+  // A test file the agent wrote tries to read the operator's home directory.
+  await writeFile(path.join(projectRoot, "scripts", "fail.mjs"),
+    "import {readFileSync} from 'node:fs';import os from 'node:os';import path from 'node:path';\n"
+    + "readFileSync(path.join(os.homedir(),'.gitconfig'),'utf8');\n", "utf8");
+
+  assert.equal(store.projectCheckSandbox(project.id), false, "confinement is off unless the human asks for it");
+  store.setProjectCheckCommands({ projectId: project.id, sandbox: true });
+  assert.equal(store.projectCheckSandbox(project.id), true);
+
+  const claim = claimWork(store, agent, task);
+  const result = store.completeAssignment({
+    agentId: agent.id, assignmentId: claim.id, claimToken: claim.claimToken, message: "Done.", status: "blocked",
+    checks: [{ label: "unit tests", command: "test" }, { label: "exfiltration attempt", command: "lint" }],
+  });
+  const [honest, exfil] = result.checks;
+  assert.equal(honest.status, "passed", "the temp directory stays writable, so honest suites still run");
+  assert.equal(exfil.status, "failed", "reading outside the project folder is refused");
+  assert.match(exfil.output, /ERR_ACCESS_DENIED/);
+});
+
+test("confinement is refused rather than silently skipped for a program it cannot confine", () => {
+  // Only node can be confined this way. Running anything else unconfined while the project is marked
+  // sandboxed would make "sandboxed" mean nothing, so it is not run at all.
+  assert.equal(sandboxFlagsFor("git", "/tmp/x"), null);
+  assert.ok(sandboxFlagsFor("node", "/tmp/x").includes("--permission"));
+  const refused = runVerifiedCheck({ argv: ["git", "status"], cwd: os.tmpdir(), sandbox: true });
+  assert.equal(refused.status, "unavailable");
+  assert.equal(refused.verified, false);
+  assert.match(refused.output, /can only confine/);
 });

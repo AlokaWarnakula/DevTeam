@@ -299,6 +299,7 @@ export async function startDevTeamServer({
     res.json({
       projectId: req.params.projectId,
       verificationEnabled: commands.length > 0,
+      sandbox: store.projectCheckSandbox(req.params.projectId),
       commands,
       available: store.availableCheckCommands(req.params.projectId),
     });
@@ -309,6 +310,7 @@ export async function startDevTeamServer({
     res.json(store.setProjectCheckCommands({
       projectId: req.params.projectId,
       commands: Array.isArray(req.body?.commands) ? req.body.commands : null,
+      sandbox: typeof req.body?.sandbox === "boolean" ? req.body.sandbox : null,
     }));
   });
   app.get("/api/assignments/:assignmentId/why-not-claimable", (req, res) => {

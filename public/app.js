@@ -836,6 +836,7 @@ document.addEventListener("click", async (event) => {
     form.dataset.projectId = project.id;
     form.elements.name.value = project.name;
     form.elements.root.value = project.root;
+    loadProjectCheckCommands(project.id, form);
     $("#project-edit-dialog").showModal();
     return;
   }
@@ -1267,6 +1268,32 @@ $("#task-edit-form").addEventListener("submit", async (event) => {
   } catch (error) { toast(error.message); }
 });
 
+// The check allowlist is a human decision and nothing else can make it: show what enabling would
+// permit *before* it is enabled, so "yes" is an informed answer rather than a shrug.
+async function loadProjectCheckCommands(projectId, form) {
+  const list = $("#project-check-commands");
+  list.innerHTML = `<p class="hint">Loading…</p>`;
+  form.elements.verificationEnabled.checked = false;
+  form.elements.checkSandbox.checked = false;
+  try {
+    const config = await api(`/api/projects/${projectId}/check-commands`);
+    form.elements.verificationEnabled.checked = config.verificationEnabled;
+    form.elements.checkSandbox.checked = Boolean(config.sandbox);
+    // Commands already approved, plus what this project's package.json would add. Scripts DevTeam
+    // cannot run without a shell are simply absent — it never guesses at what a script body meant.
+    const approved = new Map(config.commands.map((entry) => [entry.name, entry]));
+    const offered = config.available.filter((entry) => !approved.has(entry.name));
+    const row = (entry, live) => `<div class="check-command ${live ? "approved" : ""}"><code>${escapeHtml(entry.name)}</code><span>${escapeHtml(entry.argv.join(" "))}</span></div>`;
+    list.innerHTML = [
+      config.commands.length ? `<p class="hint">Currently allowed:</p>${config.commands.map((entry) => row(entry, true)).join("")}` : "",
+      offered.length ? `<p class="hint">${config.verificationEnabled ? "Also available in package.json (saving re-snapshots all of them):" : "Would be allowed from package.json:"}</p>${offered.map((entry) => row(entry, false)).join("")}` : "",
+      config.commands.length || offered.length ? "" : `<p class="hint">This project's package.json offers no script DevTeam can run without a shell.</p>`,
+    ].filter(Boolean).join("");
+  } catch (error) {
+    list.innerHTML = `<p class="hint">Could not read the allowlist: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
 $("#project-edit-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.target;
@@ -1275,6 +1302,15 @@ $("#project-edit-form").addEventListener("submit", async (event) => {
   const values = Object.fromEntries(new FormData(form));
   try {
     await api(`/api/projects/${projectId}`, { method: "PATCH", body: JSON.stringify({ name: values.name, root: values.root }) });
+    // Saved after the folder, because re-pointing the folder clears the allowlist by design: the
+    // commands were approved against the tree the human was looking at.
+    await api(`/api/projects/${projectId}/check-commands`, {
+      method: "PUT",
+      body: JSON.stringify({
+        ...(values.verificationEnabled ? {} : { commands: [] }),
+        sandbox: Boolean(values.checkSandbox),
+      }),
+    });
     form.closest("dialog").close(); await refresh(); toast("Project updated");
   } catch (error) { toast(error.message); }
 });

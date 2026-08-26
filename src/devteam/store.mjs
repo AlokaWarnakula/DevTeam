@@ -437,6 +437,7 @@ export class DevTeamStore extends EventEmitter {
       ["agents", "session_policy_ack_task_id", "TEXT"],
       ["events", "author_name", "TEXT"],                                   // who wrote it, kept even after the agent row is purged
       ["events", "author_kind", "TEXT"],
+      ["projects", "check_sandbox", "INTEGER NOT NULL DEFAULT 0"],       // confine node checks to the project root
       ["assignment_checks", "superseded_at", "TEXT"],           // only the latest report attempt describes the work as it stands                                   // 'human' or 'agent', so authorship never depends on a nullable FK
     ]) {
       try { this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`); } catch { /* already present */ }
@@ -3025,6 +3026,12 @@ export class DevTeamStore extends EventEmitter {
 
   // The commands DevTeam is allowed to run for this project. This is the whole authority: an empty
   // list means nothing is ever executed and every reported check stays visibly agent-asserted.
+  // Whether this project confines its checks. Off by default: turning it on can break a suite that
+  // reaches outside the project root, so it is the human's decision like the allowlist itself.
+  projectCheckSandbox(projectId) {
+    return Boolean(this.db.prepare("SELECT check_sandbox FROM projects WHERE id = ?").get(projectId)?.check_sandbox);
+  }
+
   projectCheckCommands(projectId) {
     return this.db.prepare("SELECT name, argv FROM project_check_commands WHERE project_id = ? ORDER BY name ASC")
       .all(projectId)
@@ -3044,7 +3051,7 @@ export class DevTeamStore extends EventEmitter {
   // package.json scripts; passing an explicit list stores exactly that; passing an empty list turns
   // verification back off. Snapshotting is what keeps this safe — an agent that later edits a script
   // body changes nothing, because the argv DevTeam runs was pinned here by a human.
-  setProjectCheckCommands({ projectId, commands = null }) {
+  setProjectCheckCommands({ projectId, commands = null, sandbox = null }) {
     const project = this.db.prepare("SELECT id, root FROM projects WHERE id = ?").get(projectId);
     if (!project) throw new Error("Project not found.");
     const requested = commands === null ? packageScriptCommands(project.root) : commands;
@@ -3065,9 +3072,13 @@ export class DevTeamStore extends EventEmitter {
         this.db.prepare("INSERT INTO project_check_commands (project_id, name, argv, created_at) VALUES (?, ?, ?, ?)")
           .run(projectId, entry.name, json(entry.argv), stamp);
       }
+      if (sandbox !== null) this.db.prepare("UPDATE projects SET check_sandbox = ? WHERE id = ?").run(sandbox ? 1 : 0, projectId);
     });
     this.#changed("project.check_commands");
-    return { projectId, commands: entries, verificationEnabled: entries.length > 0 };
+    return {
+      projectId, commands: entries, verificationEnabled: entries.length > 0,
+      sandbox: this.projectCheckSandbox(projectId),
+    };
   }
 
   // What a report claimed and what DevTeam found. Every record says whether it was verified, so an
@@ -3098,6 +3109,7 @@ export class DevTeamStore extends EventEmitter {
   // from the project's allowlist. The selected entry's argv is what runs; the agent's text never is.
   #gradeReportedChecks(assignment, task, checks) {
     const allowlist = task?.project_id ? this.projectCheckCommands(task.project_id) : [];
+    const sandbox = task?.project_id ? this.projectCheckSandbox(task.project_id) : false;
     const records = [];
     let executed = 0;
     // spawnSync blocks the event loop, so the configured timeout is the budget for the *report*, not
@@ -3133,6 +3145,7 @@ export class DevTeamStore extends EventEmitter {
           argv: entry.argv,
           cwd: task.project_root,  // pinned to the project root; nothing selects a working directory
           timeoutMs: remainingBudget(),
+          sandbox,
         }));
       }
       records.push(record);

@@ -1022,6 +1022,48 @@
   text-transform: uppercase;
 }
 
+/* Verified-check configuration: what enabling would permit, shown before it is enabled. */
+.check-verification {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--amber) 30%, transparent);
+  border-radius: 8px;
+}
+
+.check-verification legend {
+  padding: 0 6px;
+  color: var(--amber);
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.check-verification label.inline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  font-size: 12px;
+}
+
+.check-verification label.inline input { width: auto; margin: 0; }
+
+.check-command-list { display: grid; gap: 4px; margin: 8px 0; }
+
+.check-command {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 4px 7px;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--fg, #cbd5e1) 6%, transparent);
+  font-size: 10.5px;
+  color: #9ca6b3;
+}
+
+.check-command.approved { background: color-mix(in srgb, var(--green, #34d399) 12%, transparent); }
+.check-command code { color: inherit; font-weight: 600; }
+
 /* Reported checks. A verified pass and an agent's word for it must not read alike. */
 .reported-checks {
   display: flex;
