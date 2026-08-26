@@ -1378,10 +1378,10 @@ async function loadProjectCheckCommands(projectId, form) {
     const hint = $("#check-runner-hint");
     if (hint) {
       const status = config.containerRuntime
-        ? `Container runtime available: ${escapeHtml(config.containerRuntime)}.${config.container ? ` Image: ${escapeHtml(config.container.image)}.` : " No container.image declared in .devteam/checks.json yet."}`
+        ? `Container runtime available: ${config.containerRuntime}.${config.container ? ` Image: ${config.container.image}.` : " No container.image declared in .devteam/checks.json yet."}`
         : "No container runtime (docker or podman) found on this machine, so the container option would grade every check unavailable.";
-      hint.dataset.runtime = status;
       if (!hint.querySelector(".runner-status")) hint.insertAdjacentHTML("beforeend", `<br><span class="runner-status"></span>`);
+      // textContent, so nothing read off disk is ever parsed as markup.
       hint.querySelector(".runner-status").textContent = status;
     }
     // Commands already approved, plus what this project's package.json would add. Scripts DevTeam
