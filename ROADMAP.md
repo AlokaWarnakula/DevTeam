@@ -161,8 +161,11 @@ joined each room.)*
 made multi-task use safe rather than silently broken, off-loop verification (T0.2) means one agent's
 long suite no longer freezes everyone, and one-write-plus-N-read claims (T0.3) lift the throughput
 cap — the multi-claim win is *cross-room*, since the review gate still holds a verifier behind
-writers in its own task. The remaining ceiling is the single process and the single SQLite file
-(T0.4), which is where "many projects at once" would start to hurt.
+writers in its own task. The remaining ceiling is the single process and the single SQLite
+file, and after T0.4 that is now a *stated* limit rather than an assumed one: a second server on the
+same data directory is refused outright, because two schedulers would recover each other's live
+claims as orphans. Raising it means multi-process, which stays undone until a measured limit forces
+it — "many projects at once" is where that would first hurt.
 
 ### Where the bugs have concentrated
 
@@ -1068,13 +1071,16 @@ deliberately. Two independent reviews (correctness and security) produced these.
   document load, so no request can collect a credential by asking and then trade it at
   `/api/setup`; named tokens are revocable; and a non-loopback bind refuses to start without a real
   secret. What remains accepted is narrower: on loopback, read-only `GET`s are open to anything that
-  can reach 127.0.0.1, which is the same trust boundary as the machine itself. After the argv hardening it no longer buys arbitrary code execution, only
-  "enable verification". See T4.1 if this ever leaves the machine.
+  can reach 127.0.0.1, which is the same trust boundary as the machine itself. Even that much no
+  longer buys arbitrary code execution after the argv hardening — at most "enable verification".
 - **Verification runs the project's own code.** `node --test` executes test files an agent just
   wrote, as the host user, outside whatever sandbox the agent itself runs in. The allowlist pin
   protects *which argv* runs, not what that argv reads off disk — the project root is the real
   boundary. Documented at the top of `checks.mjs`. Optional Node permission-model confinement exists
-  (`sandboxFlagsFor`) and narrows exfiltration; T4.4 is the real answer.
+  (`sandboxFlagsFor`) and narrows exfiltration without closing execution. **T4.4 closed it:** a
+  project may now run its checks in a container instead, with no network and nothing mounted but the
+  project directory. That is opt-in, so this entry still describes the default — the host runner is
+  what a project gets until someone chooses otherwise.
 - **Enabling verification snapshots *all* derivable `package.json` scripts**, including `start` and
   `dev`. The dashboard shows exactly what would be allowed before enabling, which is the mitigation.
   Trim per project if that matters.
