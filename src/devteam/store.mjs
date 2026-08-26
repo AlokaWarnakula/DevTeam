@@ -18,6 +18,92 @@ import {
   normalizeRuntimeProfile,
   resolveRuntimeRequirement,
 } from "./runtime/index.mjs";
+import {
+  CHECK_ALLOWLIST_LIMIT,
+  DEFAULT_CHECK_TIMEOUT_MS,
+  matchCheckCommand,
+  normalizeCheckCommand,
+  packageScriptCommands,
+  runVerifiedCheck,
+  VERIFIED_CHECKS_PER_REPORT,
+} from "./checks.mjs";
+
+// A task in one of these states hands out no work; named once so the candidate scan and the
+// scheduler's explanation can never disagree about what "closed" means.
+const CLOSED_TASK_STATUSES = ["accepted", "blocked", "cancelled"];
+// How far the candidate scan will look past lease-blocked and runtime-gated work before giving up.
+// Generous for a local single-user server, and bounded so a pathological board cannot stall a claim.
+const CANDIDATE_PAGE_SIZE = 20;
+const CANDIDATE_SCAN_CEILING = 500;
+// Roles that read the tree rather than change it, and therefore wait for pending writers.
+const VERIFIER_ROLES = ["reviewer", "security-reviewer", "tester"];
+// The same list as SQL literals, for conditions that are shared between statements with different
+// parameter positions. Fixed, known-safe strings — never anything a caller supplies.
+const VERIFIER_ROLE_LIST = VERIFIER_ROLES.map((role) => `'${role}'`).join(", ");
+// Which assignments depend, directly or transitively, on which. Written once so the candidate scan
+// and the scheduler's explanation walk the same edges.
+const DEPENDENCY_CLOSURE_CTE = `
+        WITH RECURSIVE dependency_closure(assignment_id, prerequisite_id) AS (
+          SELECT assignment_id, depends_on_assignment_id FROM assignment_dependencies
+          UNION
+          SELECT dependency_closure.assignment_id, dependency_link.depends_on_assignment_id
+          FROM dependency_closure
+          JOIN assignment_dependencies dependency_link
+            ON dependency_link.assignment_id = dependency_closure.prerequisite_id
+        )`;
+
+// The pending writers a verifier is waiting on. Used both by the scan's review-gating predicate
+// (which asks only whether any exist) and by the explanation (which names them).
+const BLOCKING_WRITER_CONDITIONS = `pending_write.task_id = a.task_id
+                -- An assignment can never be the writer it is waiting for. Without this, a
+                -- reviewer/tester that itself declares write access matches its own row here and
+                -- is excluded from every scan forever, with nothing reported as blocking it.
+                -- (Kept explicit for the reader: the creation-order rule below now also excludes
+                -- the self row, since nothing is strictly older than itself. Mutation testing
+                -- confirms removing this line changes no behavior — it states the intent.)
+                AND pending_write.id != a.id
+                AND pending_write.requires_write = 1
+                AND pending_write.status IN ('queued', 'claimed')
+                AND NOT EXISTS (
+                  SELECT 1 FROM dependency_closure
+                  WHERE dependency_closure.assignment_id = pending_write.id
+                    AND dependency_closure.prerequisite_id = a.id
+                )
+                -- A writer that cannot start yet is not about to change anything, so waiting for it
+                -- buys nothing and costs liveness. Without this, the review gate and the dependency
+                -- gate compose into a waits-for cycle that never resolves: V1 waits for W1, W1
+                -- depends on V2, V2 waits for W2, W2 depends on V1 — four assignments, an acyclic
+                -- dependency graph, every agent present, and a board that never moves again. The
+                -- exclusion above only breaks that cycle when it is one hop long.
+                AND NOT EXISTS (
+                  SELECT 1 FROM assignment_dependencies blocking_link
+                  JOIN assignments blocking ON blocking.id = blocking_link.depends_on_assignment_id
+                  WHERE blocking_link.assignment_id = pending_write.id AND blocking.status != 'done'
+                )
+                -- Two verifiers that both declare write access are each other's pending writer, so
+                -- without an order they gate each other forever. Creation order breaks the tie
+                -- deterministically: a verifier waits only for verifiers older than itself.
+                AND (
+                  lower(pending_write.role) NOT IN (${VERIFIER_ROLE_LIST})
+                  OR pending_write.created_at < a.created_at
+                  OR (pending_write.created_at = a.created_at AND pending_write.id < a.id)
+                )`;
+
+// Why the two conditions above are enough to guarantee the board always drains: every waits-for edge
+// now points at something strictly older, or at something with no outgoing edges at all. A verifier
+// waits for a writer only when that writer has no unmet dependencies — so the writer has no outgoing
+// dependency edge — and a writer has an outgoing review edge only when it is itself a verifier, in
+// which case the creation-order rule makes that edge point backwards. Dependency edges always point
+// backwards too, since a dependency must already exist to be referenced. A graph whose every edge
+// points backwards or into a sink cannot contain a cycle.
+//
+// The cost is that a verifier may occasionally start just before a distant queued writer runs. That
+// is already handled: a completing writer with changed files bumps the task version and clears the
+// approvals built on the old one, so a review overtaken by later work is invalidated rather than
+// trusted. Liveness is the better trade.
+
+// A path scope of "" is the whole-project lease; spell that out wherever a scope reaches a human.
+const scopeLabel = (scope) => (scope === "" ? "the whole project" : scope);
 
 const now = () => new Date().toISOString();
 const json = (value) => JSON.stringify(value ?? null);
@@ -30,7 +116,7 @@ const fromJson = (value, fallback = null) => {
 };
 
 export class DevTeamStore extends EventEmitter {
-  constructor(dataDir, { liveness = {}, knowledge = {}, codegraph = {}, checkpoint = {} } = {}) {
+  constructor(dataDir, { liveness = {}, knowledge = {}, codegraph = {}, checkpoint = {}, checks = {} } = {}) {
     super();
     this.dataDir = path.resolve(dataDir);
     mkdirSync(this.dataDir, { recursive: true });
@@ -38,6 +124,9 @@ export class DevTeamStore extends EventEmitter {
     this.db = new DatabaseSync(this.databasePath);
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
     this.#migrate();
+    // How long DevTeam will block while verifying one reported check. The ceiling lives in
+    // checks.mjs; this is the per-install default a host may lower.
+    this.checkTimeoutMs = Number(checks.timeoutMs) || DEFAULT_CHECK_TIMEOUT_MS;
     this.knowledge = new KnowledgeVault(this.db, knowledge);
     this.knowledgeErrors = new Map();
     this.codegraph = new CodeGraph(this.db, codegraph);
@@ -282,6 +371,35 @@ export class DevTeamStore extends EventEmitter {
         expires_at TEXT NULL
       );
 
+      -- The per-project allowlist of commands DevTeam may run to verify a reported check. Empty
+      -- means verification is off for the project and every check stays agent-asserted. Rows are a
+      -- pinned snapshot, never a live read of package.json: see the note in checks.mjs.
+      CREATE TABLE IF NOT EXISTS project_check_commands (
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        argv TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (project_id, name)
+      );
+
+      -- What a report actually claimed, and what DevTeam found when it looked.
+      CREATE TABLE IF NOT EXISTS assignment_checks (
+        id TEXT PRIMARY KEY,
+        assignment_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        label TEXT NOT NULL,
+        requested_command TEXT NULL,
+        command TEXT NULL,
+        verified INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL,
+        exit_code INTEGER NULL,
+        duration_ms INTEGER NULL,
+        output TEXT NULL,
+        created_at TEXT NOT NULL,
+        superseded_at TEXT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_assignment_checks ON assignment_checks(assignment_id, created_at);
       CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project_id, status);
       CREATE INDEX IF NOT EXISTS idx_assignments_queue ON assignments(status, target_agent_name, created_at);
       CREATE INDEX IF NOT EXISTS idx_assignments_task_status ON assignments(task_id, status);
@@ -318,7 +436,9 @@ export class DevTeamStore extends EventEmitter {
       ["agents", "replaced_by_agent_id", "TEXT"],
       ["agents", "session_policy_ack_task_id", "TEXT"],
       ["events", "author_name", "TEXT"],                                   // who wrote it, kept even after the agent row is purged
-      ["events", "author_kind", "TEXT"],                                   // 'human' or 'agent', so authorship never depends on a nullable FK
+      ["events", "author_kind", "TEXT"],
+      ["projects", "check_sandbox", "INTEGER NOT NULL DEFAULT 0"],       // confine node checks to the project root
+      ["assignment_checks", "superseded_at", "TEXT"],           // only the latest report attempt describes the work as it stands                                   // 'human' or 'agent', so authorship never depends on a nullable FK
     ]) {
       try { this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`); } catch { /* already present */ }
     }
@@ -1019,6 +1139,9 @@ export class DevTeamStore extends EventEmitter {
     }
     if (nextName === project.name && nextRoot === project.root) return project;
     this.db.prepare("UPDATE projects SET name = ?, root = ? WHERE id = ?").run(nextName, nextRoot, projectId);
+    // A check allowlist is approved against the tree it was reviewed in. Repointing the root would
+    // otherwise silently start executing those commands somewhere the human never looked.
+    if (nextRoot !== project.root) this.db.prepare("DELETE FROM project_check_commands WHERE project_id = ?").run(projectId);
     if (nextRoot !== project.root) {
       try { this.knowledge.initializeProject(projectId); }
       catch (error) { this.knowledgeErrors.set(`project:${projectId}`, { message: error.message, at: now() }); }
@@ -2421,6 +2544,149 @@ export class DevTeamStore extends EventEmitter {
     return { ...this.db.prepare("SELECT * FROM assignments WHERE id = ?").get(assignment.id), checklist: resolvedChecklist || [], writePaths, dependsOn: dependencyIds };
   }
 
+  // The candidate scan used to be one 55-line SELECT carrying membership, targeting, dependencies
+  // and review-gating at once, and both of the deadlocks this work exists to fix hid inside it. It
+  // is now this list: each entry is one named, individually evaluable predicate paired with the
+  // reason code that explains its failure. claimNextAssignment ANDs them together; whyNotClaimable
+  // runs them one at a time against a single assignment. Because both read this list, the query and
+  // the explanation cannot drift apart — tightening a predicate moves its explanation with it.
+  //
+  // Order matters and is the order a reader should think in: is it even open, may this agent work in
+  // that room, is the room open, is it addressed to someone else, is this agent's reach into the room
+  // wide enough, is its own work ready, and is it waiting on a writer.
+  #claimPredicates({ agentName, memberRooms, claimRooms }) {
+    const list = (values) => (values.length ? values.map(() => "?").join(", ") : null);
+    const claimRoomList = list(claimRooms);
+    // In a room the agent already belongs to it may take targeted-or-untargeted work; in a room it
+    // only reached by invitation, it may take *only* the assignment(s) addressed to it by name.
+    const memberRoomList = list(memberRooms);
+    return [
+      {
+        code: "assignment_not_queued",
+        sql: "a.status = 'queued'",
+        params: [],
+      },
+      {
+        // An agent only claims work inside task rooms it belongs to *as a contributor* (observers
+        // never claim), plus any room a queued assignment invited it into by name.
+        code: "room_not_claimable",
+        sql: claimRoomList ? `a.task_id IN (${claimRoomList})` : "0",
+        params: claimRooms,
+      },
+      {
+        code: "task_closed",
+        sql: `t.status NOT IN (${CLOSED_TASK_STATUSES.map(() => "?").join(", ")})`,
+        params: CLOSED_TASK_STATUSES,
+      },
+      {
+        // Targeting routes work to a teammate by name; it must not outlive that teammate. A target
+        // that is still connected keeps its exclusive hold (and its ORDER BY priority), but once
+        // nobody by that name is present the item returns to the general queue instead of sitting
+        // claimable-by-nobody and blocking every verifier behind it.
+        code: "targeted_elsewhere",
+        sql: `(
+            a.target_agent_name IS NULL
+            OR lower(a.target_agent_name) = lower(?)
+            OR NOT EXISTS (
+              SELECT 1 FROM agents present
+              WHERE lower(present.name) = lower(a.target_agent_name) AND present.status != 'disconnected'
+            )
+          )`,
+        params: [agentName],
+      },
+      {
+        code: "room_invitation_only",
+        sql: memberRoomList
+          ? `(a.task_id IN (${memberRoomList}) OR lower(a.target_agent_name) = lower(?))`
+          : "lower(a.target_agent_name) = lower(?)",
+        params: memberRoomList ? [...memberRooms, agentName] : [agentName],
+      },
+      {
+        code: "dependency_pending",
+        sql: `NOT EXISTS (
+            SELECT 1 FROM assignment_dependencies dependency_link
+            JOIN assignments dependency ON dependency.id = dependency_link.depends_on_assignment_id
+            WHERE dependency_link.assignment_id = a.id AND dependency.status != 'done'
+          )`,
+        params: [],
+      },
+      {
+        code: "awaiting_writer",
+        sql: `(
+            lower(a.role) NOT IN (${VERIFIER_ROLES.map(() => "?").join(", ")}) OR NOT EXISTS (
+              SELECT 1 FROM assignments pending_write WHERE ${BLOCKING_WRITER_CONDITIONS}
+            )
+          )`,
+        params: VERIFIER_ROLES,
+      },
+    ];
+  }
+
+  // Who the review-gating predicate matched. Same condition, asked for names instead of existence.
+  #blockingWriters(assignmentId) {
+    return this.db.prepare(`
+      ${DEPENDENCY_CLOSURE_CTE}
+      SELECT pending_write.id, pending_write.title, pending_write.status
+      FROM assignments a, assignments pending_write
+      WHERE a.id = ? AND ${BLOCKING_WRITER_CONDITIONS}
+      ORDER BY pending_write.created_at ASC
+    `).all(assignmentId);
+  }
+
+  // The dependency predicate's own inner SELECT, asked for rows instead of existence.
+  #pendingDependencies(assignmentId) {
+    return this.db.prepare(`
+      SELECT dependency.id, dependency.title, dependency.status
+      FROM assignment_dependencies dependency_link
+      JOIN assignments dependency ON dependency.id = dependency_link.depends_on_assignment_id
+      WHERE dependency_link.assignment_id = ? AND dependency.status != 'done'
+      ORDER BY dependency.created_at ASC
+    `).all(assignmentId);
+  }
+
+  // Which of the scan's predicates this one assignment fails, evaluated with the very SQL the scan
+  // composes. Agent-scoped predicates are skipped when there is no agent to scope them to.
+  #failedClaimPredicates(assignment, agent) {
+    const AGENT_SCOPED = ["room_not_claimable", "room_invitation_only", "targeted_elsewhere"];
+    const predicates = this.#claimPredicates(agent
+      ? {
+        agentName: agent.name,
+        memberRooms: this.#claimableTaskIds(agent.id),
+        claimRooms: this.#claimRoomsFor(agent),
+      }
+      : { agentName: "", memberRooms: [], claimRooms: [] });
+    const failed = [];
+    for (const predicate of predicates) {
+      if (!agent && AGENT_SCOPED.includes(predicate.code)) continue;
+      const passes = this.db.prepare(`
+        ${DEPENDENCY_CLOSURE_CTE}
+        SELECT 1 FROM assignments a
+        JOIN tasks t ON t.id = a.task_id
+        WHERE a.id = ? AND ${predicate.sql}
+        LIMIT 1
+      `).get(assignment.id, ...predicate.params);
+      if (!passes) failed.push(predicate.code);
+    }
+    return failed;
+  }
+
+  // The rooms this agent may be handed work in: its own contributor rooms, plus any active task
+  // where a queued assignment names it. A targeted assignment is an *invitation* — it lets the
+  // planner (or human) pull a specific agent into a new task's room without the agent having to
+  // devteam_join first, which is what makes a second task get picked up promptly instead of stalling
+  // until every other task is deleted. Untargeted work stays strictly room-scoped, so an agent
+  // invoked for one task is never silently conscripted into another it was not invited to.
+  #claimRoomsFor(agent) {
+    const invitedRooms = this.db.prepare(`
+      SELECT DISTINCT a.task_id FROM assignments a
+      JOIN tasks t ON t.id = a.task_id
+      WHERE a.status = 'queued' AND a.target_agent_name IS NOT NULL
+        AND lower(a.target_agent_name) = lower(?)
+        AND t.status NOT IN ('accepted', 'blocked', 'cancelled')
+    `).all(agent.name).map((row) => row.task_id);
+    return [...new Set([...this.#claimableTaskIds(agent.id), ...invitedRooms])];
+  }
+
   claimNextAssignment(agentId) {
     this.#reapStaleAgents();
     this.#recoverOrphanedClaims();
@@ -2430,103 +2696,52 @@ export class DevTeamStore extends EventEmitter {
     // it before taking another. Prevents a single busy agent from hoarding multiple write leases.
     const existingClaim = this.db.prepare("SELECT id FROM assignments WHERE agent_id = ? AND status = 'claimed' LIMIT 1").get(agentId);
     if (existingClaim) return null;
-    // An agent only claims work inside task rooms it belongs to *as a contributor* (observers
-    // never claim). This prevents an agent invoked for one project/task from silently claiming
-    // another's work, and stops an observer from taking on execution it only joined to watch.
-    // Rooms this agent may claim in: its own contributor rooms, plus any active task where a queued
-    // assignment explicitly names it. A targeted assignment is an *invitation* — it lets the planner
-    // (or human) pull a specific agent into a new task's room without the agent having to devteam_join
-    // first, which is what makes a second task get picked up promptly instead of stalling until every
-    // other task is deleted. Untargeted work stays strictly room-scoped, so an agent invoked for one
-    // task is never silently conscripted into another it was not invited to.
+    // This prevents an agent invoked for one project/task from silently claiming another's work,
+    // and stops an observer from taking on execution it only joined to watch.
     const memberRooms = this.#claimableTaskIds(agentId);
-    const invitedRooms = this.db.prepare(`
-      SELECT DISTINCT a.task_id FROM assignments a
-      JOIN tasks t ON t.id = a.task_id
-      WHERE a.status = 'queued' AND a.target_agent_name IS NOT NULL
-        AND lower(a.target_agent_name) = lower(?)
-        AND t.status NOT IN ('accepted', 'blocked', 'cancelled')
-    `).all(agent.name).map((row) => row.task_id);
-    const claimRooms = [...new Set([...memberRooms, ...invitedRooms])];
+    const claimRooms = this.#claimRoomsFor(agent);
     if (!claimRooms.length) {
       this.db.prepare("UPDATE agents SET status = CASE WHEN status = 'busy' THEN status ELSE 'waiting' END, last_seen = ? WHERE id = ?").run(now(), agentId);
       return null;
     }
-    const claimPlaceholders = claimRooms.map(() => "?").join(", ");
-    // In a room the agent already belongs to it may take targeted-or-untargeted work; in a room it
-    // only reached by invitation, it may take *only* the assignment(s) addressed to it by name.
-    const memberScopeClause = memberRooms.length
-      ? `(a.task_id IN (${memberRooms.map(() => "?").join(", ")}) OR lower(a.target_agent_name) = lower(?))`
-      : "lower(a.target_agent_name) = lower(?)";
-    const memberScopeParams = memberRooms.length ? [...memberRooms, agent.name] : [agent.name];
+    const predicates = this.#claimPredicates({ agentName: agent.name, memberRooms, claimRooms });
     const assignment = this.#transaction(() => {
-      // Fetch the eligible queue (membership + targeting + review gating). The write lease is
-      // no longer project-wide: we resolve it per path below so non-overlapping writers run
-      // in parallel.
-      const candidates = this.db.prepare(`
-        WITH RECURSIVE dependency_closure(assignment_id, prerequisite_id) AS (
-          SELECT assignment_id, depends_on_assignment_id
-          FROM assignment_dependencies
-          UNION
-          SELECT dependency_closure.assignment_id, dependency_link.depends_on_assignment_id
-          FROM dependency_closure
-          JOIN assignment_dependencies dependency_link
-            ON dependency_link.assignment_id = dependency_closure.prerequisite_id
-        )
+      // The eligible queue is the conjunction of the named predicates above — membership,
+      // targeting, dependencies and review gating — each of which whyNotClaimable can also evaluate
+      // on its own to say which one held an assignment back. The write lease is not part of it: it
+      // is no longer project-wide, so it is resolved per path in the loop below and non-overlapping
+      // writers run in parallel.
+      // The write lease and the runtime gate are resolved per candidate below rather than in SQL,
+      // so a fixed window would let work that *is* claimable hide behind a screenful of lease-blocked
+      // rows — the scan would hand out nothing while whyNotClaimable correctly reported the item as
+      // claimable. Page instead of truncating, so the two can only disagree on a board larger than
+      // any this server is meant to hold.
+      const readCandidatePage = (offset) => this.db.prepare(`
+        ${DEPENDENCY_CLOSURE_CTE}
         SELECT a.*, t.project_id, t.title AS task_title, t.description AS task_description,
           t.session_policy AS task_session_policy,
           t.version AS task_version, t.required_approvals, p.root AS project_root, p.name AS project_name
         FROM assignments a
         JOIN tasks t ON t.id = a.task_id
         JOIN projects p ON p.id = t.project_id
-        WHERE a.status = 'queued'
-          AND a.task_id IN (${claimPlaceholders})
-          AND t.status NOT IN ('accepted', 'blocked', 'cancelled')
-          -- Targeting routes work to a teammate by name; it must not outlive that teammate. A
-          -- target that is still connected keeps its exclusive hold (and its ORDER BY priority),
-          -- but once nobody by that name is present the item returns to the general queue instead
-          -- of sitting claimable-by-nobody and blocking every verifier behind it.
-          AND (
-            a.target_agent_name IS NULL
-            OR lower(a.target_agent_name) = lower(?)
-            OR NOT EXISTS (
-              SELECT 1 FROM agents present
-              WHERE lower(present.name) = lower(a.target_agent_name) AND present.status != 'disconnected'
-            )
-          )
-          AND ${memberScopeClause}
-          AND NOT EXISTS (
-            SELECT 1 FROM assignment_dependencies dependency_link
-            JOIN assignments dependency ON dependency.id = dependency_link.depends_on_assignment_id
-            WHERE dependency_link.assignment_id = a.id AND dependency.status != 'done'
-          )
-          AND (
-            lower(a.role) NOT IN ('reviewer', 'security-reviewer', 'tester') OR NOT EXISTS (
-              SELECT 1 FROM assignments pending_write
-              WHERE pending_write.task_id = a.task_id
-                -- An assignment can never be the writer it is waiting for. Without this, a
-                -- reviewer/tester that itself declares write access matches its own row here and
-                -- is excluded from every scan forever, with nothing reported as blocking it.
-                AND pending_write.id != a.id
-                AND pending_write.requires_write = 1
-                AND pending_write.status IN ('queued', 'claimed')
-                AND NOT EXISTS (
-                  SELECT 1 FROM dependency_closure
-                  WHERE dependency_closure.assignment_id = pending_write.id
-                    AND dependency_closure.prerequisite_id = a.id
-                )
-            )
-          )
+        WHERE ${predicates.map((predicate) => predicate.sql).join("\n          AND ")}
         ORDER BY CASE WHEN a.target_agent_name IS NOT NULL THEN 0 ELSE 1 END, a.created_at ASC
-        LIMIT 20
-      `).all(...claimRooms, agent.name, ...memberScopeParams);
+        LIMIT ? OFFSET ?
+      `).all(...predicates.flatMap((predicate) => predicate.params), CANDIDATE_PAGE_SIZE, offset);
+      const heldLeases = this.#heldWriteLeases();
+      const stamp = now();
+      let firstRuntimeGate = null;
+      const candidates = [];
+      for (let offset = 0; offset < CANDIDATE_SCAN_CEILING; offset += CANDIDATE_PAGE_SIZE) {
+        const page = readCandidatePage(offset);
+        if (!page.length) break;
+        candidates.push(...page);
+        if (page.length < CANDIDATE_PAGE_SIZE) break;
+      }
       if (!candidates.length) {
         this.db.prepare("UPDATE agents SET status = 'waiting', last_seen = ? WHERE id = ?").run(now(), agentId);
         return null;
       }
-      const heldLeases = this.#heldWriteLeases();
-      const stamp = now();
-      let firstRuntimeGate = null;
       for (const candidate of candidates) {
         // A write assignment is claimable only if its declared paths don't overlap a write
         // lease already held by another agent in the same project. Undeclared paths mean the
@@ -2601,11 +2816,369 @@ export class DevTeamStore extends EventEmitter {
     return assignment;
   }
 
+  // Every reason the scheduler will not hand this assignment to this agent, in the order the
+  // candidate scan applies them — the whole chain, not just the first. The scan used to skip a
+  // candidate and throw the reason away, which is how two hard deadlocks (a verifier whose own
+  // write access excluded it from every scan, and work aimed at a teammate who had left) both
+  // presented as an idle agent sitting next to claimable work with blockedBy: []. Pass no agentId
+  // for the agent-agnostic view the dashboard shows on a queued item; pass one to answer the
+  // question an idle agent actually has, which is "why can *I* not claim this?".
+  whyNotClaimable(assignmentId, agentId = null, { refreshLiveness = true } = {}) {
+    // claimNextAssignment reaps dead sessions and recovers their orphaned claims before it looks at
+    // the queue. Answering without doing the same made the explanation report work as "held by
+    // someone else" that the very next claim call handed straight over. Only when an agent is
+    // actually asking: the dashboard's agent-agnostic call is a read, and the server already runs a
+    // periodic reaper for it.
+    if (agentId && refreshLiveness) {
+      this.#reapStaleAgents();
+      this.#recoverOrphanedClaims();
+    }
+    const assignment = this.db.prepare(`
+      SELECT a.*, t.status AS task_status, t.project_id, p.root AS project_root
+      FROM assignments a
+      JOIN tasks t ON t.id = a.task_id
+      JOIN projects p ON p.id = t.project_id
+      WHERE a.id = ?
+    `).get(assignmentId);
+    if (!assignment) throw new Error("Assignment not found.");
+    const agent = agentId ? this.getAgent(agentId) : null;
+    const reasons = [];
+    // blocking:false marks a fact worth surfacing that does not itself stop a claim, so a caller
+    // never invents a stall out of an advisory note (an absent target *widens* who may claim).
+    const add = (code, detail, facts = {}, blocking = true) => { reasons.push({ code, detail, blocking, ...facts }); };
+
+    if (agent) {
+      if (agent.status === "disconnected") {
+        add("agent_disconnected", `“${agent.name}” is disconnected; connect to DevTeam again before claiming.`);
+      }
+      // One claim at a time, so a single busy agent cannot hoard write leases.
+      const held = this.db.prepare("SELECT id, title FROM assignments WHERE agent_id = ? AND status = 'claimed' LIMIT 1").get(agent.id);
+      if (held) {
+        add("agent_holds_claim", held.id === assignment.id
+          ? `“${agent.name}” already holds this claim.`
+          : `“${agent.name}” already holds the claim on “${held.title}”; an agent takes one assignment at a time.`,
+        { heldAssignmentId: held.id, heldTitle: held.title });
+      }
+    }
+
+    // Ask the candidate scan's own predicates, one at a time, which of them this assignment fails.
+    // These are not a second opinion about the queue: they are the scan's SQL, run singly, so the
+    // explanation can never call an item fine that the query would have skipped, or the reverse.
+    const failed = new Set(this.#failedClaimPredicates(assignment, agent));
+    const targetName = assignment.target_agent_name;
+
+    if (failed.has("assignment_not_queued")) {
+      const holder = assignment.agent_id
+        ? (this.db.prepare("SELECT name FROM agents WHERE id = ?").get(assignment.agent_id)?.name || null)
+        : null;
+      add("assignment_not_queued", holder
+        ? `This assignment is ${assignment.status}, held by “${holder}”, not waiting in the queue.`
+        : `This assignment is ${assignment.status}, not waiting in the queue.`,
+      { status: assignment.status, holder });
+    }
+    if (failed.has("room_not_claimable")) {
+      add("room_not_claimable", `“${agent.name}” is not a claiming member of this task room and holds no invitation into it; join as a contributor first.`, { taskId: assignment.task_id });
+    }
+    if (failed.has("task_closed")) {
+      add("task_closed", `Its task is ${assignment.task_status}; a closed task hands out no work.`, { taskStatus: assignment.task_status });
+    }
+    if (failed.has("targeted_elsewhere")) {
+      add("targeted_elsewhere", `Targeted at “${targetName}”, who is connected and holds it exclusively.`, { targetAgentName: targetName });
+    }
+    if (targetName && !this.db.prepare("SELECT 1 FROM agents WHERE lower(name) = lower(?) AND status != 'disconnected' LIMIT 1").get(targetName)) {
+      // Not a blocker: an absent target returns the item to the general queue rather than letting it
+      // sit claimable-by-nobody. Reported anyway, because "nobody named X is here" explains a lot.
+      add("target_absent", `Targeted at “${targetName}”, who is not connected; any member of the room may claim it.`, { targetAgentName: targetName }, false);
+    }
+    // An invitation authorizes exactly the item(s) addressed to this agent by name and nothing else
+    // in that room. Skipped for an agent that is not in the room at all: it already heard that, and
+    // hearing "your invitation does not stretch this far" on top of it would be untrue.
+    if (failed.has("room_invitation_only") && !failed.has("room_not_claimable")) {
+      add("room_invitation_only", `“${agent.name}” reached this room only by an invitation addressed to it by name, so it may claim the assignment(s) targeting it — not this one.`, { taskId: assignment.task_id });
+    }
+    if (failed.has("dependency_pending")) {
+      const pending = this.#pendingDependencies(assignment.id);
+      add("dependency_pending", `Waiting on ${pending.length} unfinished ${pending.length === 1 ? "dependency" : "dependencies"}: ${pending.map((dependency) => `“${dependency.title}” (${dependency.status})`).join(", ")}.`,
+        { dependsOn: pending.map((dependency) => ({ id: dependency.id, title: dependency.title, status: dependency.status })) });
+    }
+    if (failed.has("awaiting_writer")) {
+      const writers = this.#blockingWriters(assignment.id);
+      add("awaiting_writer", `Verification waits for the writer “${writers[0].title}” to finish${writers.length > 1 ? ` (and ${writers.length - 1} more)` : ""}.`, { writers });
+    }
+
+    if (assignment.requires_write) {
+      const wanted = this.#resolveScopesOnDisk(assignment.project_root, this.#writeScopeFor(assignment.id));
+      for (const lease of this.#heldWriteLeases()) {
+        if (lease.id === assignment.id || lease.projectId !== assignment.project_id) continue;
+        const overlaps = [];
+        for (const holdScope of lease.scopes) {
+          for (const wantScope of wanted) {
+            if (this.#scopesOverlap(holdScope, wantScope)) overlaps.push({ held: holdScope, wanted: wantScope });
+          }
+        }
+        if (!overlaps.length) continue;
+        // Write leases are project-wide, so the blocker may live in a task room the caller has no
+        // business seeing. The overlapping *paths* are what makes the stall legible and they are
+        // already visible in this room; the other room's assignment title, id and holder are not.
+        const sameRoom = lease.taskId === assignment.task_id;
+        const pathSummary = overlaps.map((pair) => `${scopeLabel(pair.wanted)} vs ${scopeLabel(pair.held)}`).join(", ");
+        add("write_lease_conflict", sameRoom
+          ? `Its write lease overlaps one “${lease.holder || "another agent"}” already holds for “${lease.title}”: ${pathSummary}.`
+          : `Its write lease overlaps one another agent already holds in a different task room in this project: ${pathSummary}.`,
+        sameRoom
+          ? { conflictingAssignmentId: lease.id, conflictingTitle: lease.title, holder: lease.holder, paths: overlaps, sameRoom }
+          : { conflictingAssignmentId: null, conflictingTitle: null, holder: null, paths: overlaps, sameRoom });
+      }
+    }
+
+    if (agent) {
+      const gate = this.#runtimeGate(agent, assignment);
+      if (gate.skip) {
+        add("runtime_decision_hold", `A standing runtime decision (${gate.decision.choice}) removes this assignment from “${agent.name}”'s queue until a human revisits it.`, { decision: gate.decision });
+      } else if (gate.runtimeActionRequired) {
+        const current = gate.resolution?.current;
+        const wanted = gate.resolution?.recommendation;
+        const runningLabel = current
+          ? `${current.modelLabel || current.modelId || current.modelClass}${current.effortLabel || current.effortId ? ` at ${current.effortLabel || current.effortId} effort` : ""}`
+          : "a runtime profile DevTeam cannot read";
+        const neededLabel = wanted
+          ? `${wanted.modelLabel || wanted.modelId || wanted.modelClass}${wanted.effortLabel || wanted.effortId ? ` at ${wanted.effortLabel || wanted.effortId} effort` : ""}`
+          : `the ${gate.assessment.requirements.modelClass} model class at ${gate.assessment.requirements.effortClass} effort, which this session advertises no way to reach`;
+        add("runtime_gate", `“${agent.name}” is running ${runningLabel}; this ${gate.assessment.level} assignment needs ${neededLabel}.`, {
+          level: gate.assessment.level,
+          assessmentId: gate.assessment.id,
+          requirements: gate.assessment.requirements,
+          current: current || null,
+          recommendation: wanted || null,
+          profileSource: gate.profileSource || null,
+          humanApprovalRequired: Boolean(gate.humanApprovalRequired),
+        });
+      }
+    }
+
+    return {
+      assignmentId: assignment.id,
+      taskId: assignment.task_id,
+      title: assignment.title,
+      role: assignment.role,
+      agentId: agent?.id || null,
+      agentName: agent?.name || null,
+      claimable: reasons.every((reason) => !reason.blocking),
+      reasons,
+    };
+  }
+
+  // "There is work on the board and I am doing nothing" — answered in one call. Every queued item
+  // in the rooms this agent can reach, each with its full chain, plus whatever it can claim right
+  // now. Membership is still the boundary: rooms the agent never joined and was never invited into
+  // stay invisible, exactly as they are to the scan.
+  whyNoClaimableWork(agentId, taskId = null) {
+    const agent = this.getAgent(agentId);
+    const invited = this.db.prepare(`
+      SELECT DISTINCT a.task_id FROM assignments a
+      JOIN tasks t ON t.id = a.task_id
+      WHERE a.status = 'queued' AND a.target_agent_name IS NOT NULL
+        AND lower(a.target_agent_name) = lower(?)
+        AND t.status NOT IN ('accepted', 'blocked', 'cancelled')
+    `).all(agent.name).map((row) => row.task_id);
+    // Observer rooms are included so an observer is told *why* it may not claim, rather than being
+    // shown an empty board it has no way to interpret.
+    const rooms = [...new Set([...this.#memberTaskIds(agentId), ...invited])]
+      .filter((room) => !taskId || room === taskId);
+    if (taskId && !rooms.includes(taskId)) this.assertMembership(agentId, taskId);
+    this.#reapStaleAgents();
+    this.#recoverOrphanedClaims();
+    const queued = rooms.flatMap((room) => this.db.prepare(`
+      SELECT a.id FROM assignments a WHERE a.task_id = ? AND a.status = 'queued' ORDER BY a.created_at ASC
+    `).all(room).map((row) => this.whyNotClaimable(row.id, agentId, { refreshLiveness: false })));
+    const held = this.db.prepare("SELECT id, title FROM assignments WHERE agent_id = ? AND status = 'claimed' LIMIT 1").get(agentId);
+    return {
+      agentId,
+      agentName: agent.name,
+      rooms,
+      holdingClaim: held ? { assignmentId: held.id, title: held.title } : null,
+      queuedCount: queued.length,
+      claimable: queued.filter((entry) => entry.claimable).map((entry) => entry.assignmentId),
+      assignments: queued,
+    };
+  }
+
+  // The room an assignment belongs to, without computing anything about it. Lets a caller authorize
+  // *before* doing the work, and answer "no such assignment" and "not your room" identically so the
+  // explainer is not an existence oracle.
+  assignmentRoom(assignmentId) {
+    return this.db.prepare("SELECT task_id FROM assignments WHERE id = ?").get(assignmentId)?.task_id || null;
+  }
+
+  // Membership check for the explanation surfaces: an agent may ask about an assignment in a room it
+  // belongs to, or one it was invited into by name. Anything else stays out of reach, so the
+  // explainer can never be used to enumerate another team's work.
+  assertExplainable(agentId, taskId) {
+    if (!agentId) return;
+    if (this.#memberTaskIds(agentId).includes(taskId)) return;
+    const agent = this.getAgent(agentId);
+    const invited = this.db.prepare(`
+      SELECT 1 FROM assignments a WHERE a.task_id = ? AND a.status = 'queued'
+        AND a.target_agent_name IS NOT NULL AND lower(a.target_agent_name) = lower(?) LIMIT 1
+    `).get(taskId, agent.name);
+    if (!invited) throw new Error("You are not a member of this task room. Call devteam_join first.");
+  }
+
+  // The commands DevTeam is allowed to run for this project. This is the whole authority: an empty
+  // list means nothing is ever executed and every reported check stays visibly agent-asserted.
+  // Whether this project confines its checks. Off by default: turning it on can break a suite that
+  // reaches outside the project root, so it is the human's decision like the allowlist itself.
+  projectCheckSandbox(projectId) {
+    return Boolean(this.db.prepare("SELECT check_sandbox FROM projects WHERE id = ?").get(projectId)?.check_sandbox);
+  }
+
+  projectCheckCommands(projectId) {
+    return this.db.prepare("SELECT name, argv FROM project_check_commands WHERE project_id = ? ORDER BY name ASC")
+      .all(projectId)
+      .map((row) => ({ name: row.name, argv: fromJson(row.argv, []) }))
+      .filter((entry) => Array.isArray(entry.argv) && entry.argv.length);
+  }
+
+  // What the project's package.json offers, so a human can see what enabling verification would
+  // allow *before* enabling it. Reading this executes nothing and authorizes nothing.
+  availableCheckCommands(projectId) {
+    const project = this.db.prepare("SELECT root FROM projects WHERE id = ?").get(projectId);
+    if (!project) throw new Error("Project not found.");
+    return packageScriptCommands(project.root);
+  }
+
+  // Turn verification on (or off) for a project. Passing no commands snapshots the project's own
+  // package.json scripts; passing an explicit list stores exactly that; passing an empty list turns
+  // verification back off. Snapshotting is what keeps this safe — an agent that later edits a script
+  // body changes nothing, because the argv DevTeam runs was pinned here by a human.
+  setProjectCheckCommands({ projectId, commands = null, sandbox = null }) {
+    const project = this.db.prepare("SELECT id, root FROM projects WHERE id = ?").get(projectId);
+    if (!project) throw new Error("Project not found.");
+    const requested = commands === null ? packageScriptCommands(project.root) : commands;
+    if (!Array.isArray(requested)) throw new Error("Check commands must be a list.");
+    const entries = [];
+    const seen = new Set();
+    for (const candidate of requested.slice(0, CHECK_ALLOWLIST_LIMIT)) {
+      const entry = normalizeCheckCommand(candidate);
+      if (!entry) throw new Error(`Unusable check command: ${JSON.stringify(candidate)?.slice(0, 120)}. A command is a name plus an argv list whose program is a bare executable name.`);
+      if (seen.has(entry.name)) continue;
+      seen.add(entry.name);
+      entries.push(entry);
+    }
+    const stamp = now();
+    this.#transaction(() => {
+      this.db.prepare("DELETE FROM project_check_commands WHERE project_id = ?").run(projectId);
+      for (const entry of entries) {
+        this.db.prepare("INSERT INTO project_check_commands (project_id, name, argv, created_at) VALUES (?, ?, ?, ?)")
+          .run(projectId, entry.name, json(entry.argv), stamp);
+      }
+      if (sandbox !== null) this.db.prepare("UPDATE projects SET check_sandbox = ? WHERE id = ?").run(sandbox ? 1 : 0, projectId);
+    });
+    this.#changed("project.check_commands");
+    return {
+      projectId, commands: entries, verificationEnabled: entries.length > 0,
+      sandbox: this.projectCheckSandbox(projectId),
+    };
+  }
+
+  // What a report claimed and what DevTeam found. Every record says whether it was verified, so an
+  // unverified assertion can never be displayed as if DevTeam had confirmed it.
+  #checksFor(assignmentId) {
+    return this.db.prepare(`
+      SELECT label, requested_command, command, verified, status, exit_code, duration_ms, output, created_at
+      FROM assignment_checks WHERE assignment_id = ? AND superseded_at IS NULL
+      ORDER BY created_at ASC, rowid ASC
+    `).all(assignmentId).map((row) => ({
+      label: row.label,
+      requestedCommand: row.requested_command,
+      command: fromJson(row.command, null),
+      verified: Boolean(row.verified),
+      status: row.status,
+      exitCode: row.exit_code,
+      durationMs: row.duration_ms,
+      output: row.output,
+      // The dashboard and the task detail payload both read this, so an unverified claim is labeled
+      // wherever it is shown rather than only where someone remembered to label it.
+      agentAsserted: !row.verified,
+      createdAt: row.created_at,
+    }));
+  }
+
+  // Normalize what an agent reported, then verify whatever it asked DevTeam to verify. A check is a
+  // plain string (an assertion, as before) or { label, command } where command *selects* an entry
+  // from the project's allowlist. The selected entry's argv is what runs; the agent's text never is.
+  #gradeReportedChecks(assignment, task, checks) {
+    const allowlist = task?.project_id ? this.projectCheckCommands(task.project_id) : [];
+    const sandbox = task?.project_id ? this.projectCheckSandbox(task.project_id) : false;
+    const records = [];
+    let executed = 0;
+    // spawnSync blocks the event loop, so the configured timeout is the budget for the *report*, not
+    // for each command in it. Without this, ten allowlisted checks at the default timeout could hold
+    // the whole server — MCP, dashboard, SSE, heartbeats — for twenty minutes on one tool call, and
+    // the refusal path deliberately leaves the claim intact, so it could be replayed forever.
+    const budgetStartedAt = Date.now();
+    const remainingBudget = () => this.checkTimeoutMs - (Date.now() - budgetStartedAt);
+    for (const item of Array.isArray(checks) ? checks.slice(0, 100) : []) {
+      const isObject = item && typeof item === "object" && !Array.isArray(item);
+      const requested = isObject ? String(item.command ?? "").trim() : "";
+      const label = String((isObject ? (item.label ?? item.command ?? "") : item) ?? "").trim();
+      if (!label) continue;
+      const record = { label: label.slice(0, 500), requestedCommand: requested ? requested.slice(0, 200) : null, command: null, verified: false, status: "asserted", exitCode: null, durationMs: null, output: null };
+      const entry = requested ? matchCheckCommand(allowlist, requested) : null;
+      if (requested && !entry) {
+        // The agent asked for something the human never allowlisted. Recorded plainly as
+        // unavailable: DevTeam refuses to run it *and* refuses to call it verified.
+        record.status = "unavailable";
+        record.output = allowlist.length
+          ? "No allowlisted command matches this name for the project."
+          : "Command verification is not enabled for this project.";
+      } else if (entry && executed >= VERIFIED_CHECKS_PER_REPORT) {
+        record.status = "unavailable";
+        record.output = `Only ${VERIFIED_CHECKS_PER_REPORT} commands are executed per report.`;
+      } else if (entry && remainingBudget() <= 1000) {
+        record.status = "unavailable";
+        record.output = `The ${this.checkTimeoutMs}ms verification budget for this report was already spent.`;
+      } else if (entry) {
+        executed += 1;
+        record.command = entry.argv;
+        Object.assign(record, runVerifiedCheck({
+          argv: entry.argv,
+          cwd: task.project_root,  // pinned to the project root; nothing selects a working directory
+          timeoutMs: remainingBudget(),
+          sandbox,
+        }));
+      }
+      records.push(record);
+    }
+    return records;
+  }
+
+  #storeReportedChecks(assignmentId, taskId, records, stamp) {
+    // A rejected report leaves the claim intact so the agent can fix the work and report again, so
+    // an assignment accumulates one batch per attempt. Only the latest attempt describes the work as
+    // it now stands: without this, an assignment that failed a check and then passed it would go on
+    // showing the failure forever, and "did a check fail here?" would answer yes about work that is
+    // green. Earlier attempts are kept, marked superseded, so the history is still on record.
+    this.db.prepare("UPDATE assignment_checks SET superseded_at = ? WHERE assignment_id = ? AND superseded_at IS NULL")
+      .run(stamp, assignmentId);
+    for (const record of records) {
+      this.db.prepare(`
+        INSERT INTO assignment_checks (
+          id, assignment_id, task_id, label, requested_command, command,
+          verified, status, exit_code, duration_ms, output, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        randomUUID(), assignmentId, taskId, record.label, record.requestedCommand, record.command ? json(record.command) : null,
+        record.verified ? 1 : 0, record.status, record.exitCode ?? null, record.durationMs ?? null, record.output ?? null, stamp,
+      );
+    }
+  }
+
   // Currently-held write leases (claimed write assignments owned by a live agent on a live task),
   // with their normalized path scopes, for per-path conflict resolution.
   #heldWriteLeases() {
     return this.db.prepare(`
-      SELECT a.id, t.project_id AS projectId, p.root AS root
+      SELECT a.id, a.title, a.task_id AS taskId, ag.name AS holder, t.project_id AS projectId, p.root AS root
       FROM assignments a
       JOIN tasks t ON t.id = a.task_id
       JOIN projects p ON p.id = t.project_id
@@ -2613,7 +3186,10 @@ export class DevTeamStore extends EventEmitter {
       WHERE a.status = 'claimed' AND a.requires_write = 1
         AND ag.status != 'disconnected'
         AND t.status NOT IN ('accepted', 'blocked', 'cancelled')
-    `).all().map((row) => ({ id: row.id, projectId: row.projectId, scopes: this.#resolveScopesOnDisk(row.root, this.#writeScopeFor(row.id)) }));
+    `).all().map((row) => ({
+      id: row.id, title: row.title, taskId: row.taskId, holder: row.holder, projectId: row.projectId,
+      scopes: this.#resolveScopesOnDisk(row.root, this.#writeScopeFor(row.id)),
+    }));
   }
 
   // Normalize a declared write path to a canonical, comparable prefix so path aliases can't
@@ -2773,8 +3349,42 @@ export class DevTeamStore extends EventEmitter {
     const tokenMatches = claimToken == null || (assignment.claim_token_hash && this.#hashToken(claimToken) === assignment.claim_token_hash);
     if (!ownedByCaller || !tokenMatches) return this.#claimConflict(assignment, agentId);
     const cleanChanged = [...new Set(changedFiles.map((item) => String(item).trim()).filter(Boolean))].slice(0, 200);
-    const cleanChecks = checks.map((item) => String(item).trim()).filter(Boolean).slice(0, 100);
     const task = this.getTask(assignment.task_id);
+    // Anything the agent asked DevTeam to verify is run *now*, before a single row is written, so a
+    // failure cannot become a permanently green record that approvals are then built on top of.
+    const checkRecords = this.#gradeReportedChecks(assignment, task, checks);
+    const cleanChecks = checkRecords.map((record) => record.label).slice(0, 100);
+    const failedChecks = checkRecords.filter((record) => record.status === "failed");
+    // A verified failure cannot be reported as done. The claim is deliberately left intact: the
+    // agent fixes the work and reports again rather than losing its lease over a caught overclaim.
+    // status=blocked is still allowed through — reporting a genuine failure is the honest path.
+    if (status !== "blocked" && failedChecks.length) {
+      const stamp = now();
+      this.#transaction(() => {
+        this.#storeReportedChecks(assignmentId, assignment.task_id, checkRecords, stamp);
+        this.#event(assignment.task_id, agentId, "assignment.check_failed",
+          `${agent.name} reported “${assignment.title}” as done, but ${failedChecks.length === 1 ? "a check" : `${failedChecks.length} checks`} DevTeam ran failed.`, {
+            assignmentId,
+            role: assignment.role,
+            checks: cleanChecks,
+            checkRecords,
+          });
+      });
+      this.#changed("assignment.check_failed", assignment.task_id);
+      return {
+        completed: false,
+        checksFailed: {
+          assignmentId,
+          taskId: assignment.task_id,
+          failed: failedChecks.map((record) => ({
+            label: record.label, command: record.command, exitCode: record.exitCode,
+            durationMs: record.durationMs, timedOut: Boolean(record.timedOut), output: record.output,
+          })),
+          reason: "DevTeam ran the commands you reported and they did not pass, so this cannot be recorded as done. Fix the work and report again, or report status=blocked with what you found.",
+        },
+        checks: checkRecords,
+      };
+    }
     const unverifiedFiles = this.#unverifiedChangedFiles(task?.project_root, cleanChanged);
     this.markMessagesSeen(agentId);
     let version;
@@ -2791,11 +3401,15 @@ export class DevTeamStore extends EventEmitter {
         this.db.prepare("UPDATE tasks SET updated_at = ? WHERE id = ?").run(stamp, assignment.task_id);
       }
       version = this.db.prepare("SELECT version FROM tasks WHERE id = ?").get(assignment.task_id).version;
+      this.#storeReportedChecks(assignmentId, assignment.task_id, checkRecords, stamp);
       this.#event(assignment.task_id, agentId, status === "blocked" ? "assignment.blocked" : "assignment.completed", message.trim(), {
         assignmentId,
         role: assignment.role,
         changedFiles: cleanChanged,
         checks: cleanChecks,
+        // The structured form says which of those lines DevTeam actually ran. Consumers that only
+        // understand the strings keep working; consumers that can tell the difference now can.
+        checkRecords,
         version,
         ...(unverifiedFiles.length ? { unverifiedFiles } : {}),
       });
@@ -2838,7 +3452,8 @@ export class DevTeamStore extends EventEmitter {
       status,
       version,
       changedFiles: cleanChanged,
-      checks: cleanChecks,
+      checks: checkRecords,
+      verifiedChecks: checkRecords.filter((record) => record.verified).length,
       agent: agent.name,
       ...(status === "blocked" ? { taskBlocked: false, followUpAssignmentId } : {}),
     };
@@ -3240,37 +3855,17 @@ export class DevTeamStore extends EventEmitter {
     }
   }
 
-  // Why is this queued item not being handed out? The scheduler already knows, but it used to throw
-  // the reason away, so an assignment held back by review-gating or by an absent target looked
-  // perfectly claimable while nobody could ever claim it. Surfaced so a stall is legible.
+  // The one-line version of whyNotClaimable, for a card with room for a single sentence. It
+  // delegates rather than re-deriving the cases, so the hold shown on the dashboard and the chain
+  // an agent reads over MCP can never disagree. Dependencies are left out here only because the
+  // same card already lists them as blockedBy.
   #schedulingHold(assignment) {
     if (assignment.status !== "queued") return null;
-    const role = String(assignment.role || "").toLowerCase();
-    if (["reviewer", "security-reviewer", "tester"].includes(role)) {
-      const writer = this.db.prepare(`
-        WITH RECURSIVE dependency_closure(assignment_id, prerequisite_id) AS (
-          SELECT assignment_id, depends_on_assignment_id FROM assignment_dependencies
-          UNION
-          SELECT dependency_closure.assignment_id, dependency_link.depends_on_assignment_id
-          FROM dependency_closure
-          JOIN assignment_dependencies dependency_link ON dependency_link.assignment_id = dependency_closure.prerequisite_id
-        )
-        SELECT pending_write.title FROM assignments pending_write
-        WHERE pending_write.task_id = ? AND pending_write.id != ?
-          AND pending_write.requires_write = 1 AND pending_write.status IN ('queued', 'claimed')
-          AND NOT EXISTS (
-            SELECT 1 FROM dependency_closure
-            WHERE dependency_closure.assignment_id = pending_write.id AND dependency_closure.prerequisite_id = ?
-          )
-        LIMIT 1
-      `).get(assignment.task_id, assignment.id, assignment.id);
-      if (writer) return { reason: "awaiting_writer", detail: `Verification waits for the writer “${writer.title}” to finish.` };
-    }
-    if (assignment.target_agent_name) {
-      const present = this.db.prepare(`
-        SELECT 1 FROM agents WHERE lower(name) = lower(?) AND status != 'disconnected' LIMIT 1
-      `).get(assignment.target_agent_name);
-      if (!present) return { reason: "target_absent", detail: `Targeted at “${assignment.target_agent_name}”, who is not connected; any member of the room may claim it.` };
+    const HOLD_PRECEDENCE = ["awaiting_writer", "write_lease_conflict", "target_absent"];
+    const { reasons } = this.whyNotClaimable(assignment.id);
+    for (const code of HOLD_PRECEDENCE) {
+      const hold = reasons.find((reason) => reason.code === code);
+      if (hold) return { reason: hold.code, detail: hold.detail };
     }
     return null;
   }
@@ -3297,6 +3892,7 @@ export class DevTeamStore extends EventEmitter {
         writeScope: assignment.requires_write ? this.#writeScopeFor(assignment.id) : [],
         dependsOn: dependencies.map((item) => item.id),
         blockedBy: dependencies.filter((item) => item.status !== "done"),
+        checks: this.#checksFor(assignment.id),
         schedulingHold: this.#schedulingHold(assignment),
         assessment,
         runtimeDecision,

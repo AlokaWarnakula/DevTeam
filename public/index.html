@@ -197,7 +197,15 @@
       <div class="dialog-head"><div><span class="eyebrow">WORKSPACE</span><h2>Edit project</h2></div><button type="button" class="close">×</button></div>
       <label>Project name<input name="name" maxlength="80" required></label>
       <label>Absolute folder path<input name="root" required></label>
-      <p class="hint">The folder must already exist. Changing it re-points where agents work and where the knowledge vault is written.</p>
+      <p class="hint">The folder must already exist. Changing it re-points where agents work and where the knowledge vault is written. Re-pointing it clears the verified-check allowlist below, since that was approved against the old folder.</p>
+      <fieldset class="check-verification">
+        <legend>Verified checks</legend>
+        <p class="hint">Off by default. When on, an agent reporting a check may name one of these commands and DevTeam runs it itself, grading it by exit code — a report claiming success for a command that actually fails is refused. Checks without a command stay labeled agent-asserted.</p>
+        <label class="inline"><input type="checkbox" name="verificationEnabled"> Let DevTeam run these commands to verify reported checks</label>
+        <div id="project-check-commands" class="check-command-list"></div>
+        <label class="inline"><input type="checkbox" name="checkSandbox"> Confine checks to this folder (node only)</label>
+        <p class="hint">Confining uses Node's own permission model, so a test file can no longer read outside this folder and the temp directory — it stops credential exfiltration, not code execution. Turn it off if a suite legitimately reaches elsewhere. <strong>Enabling verification at all lets any agent working in this project run this project's code on your machine, at a moment of its choosing.</strong></p>
+      </fieldset>
       <div class="dialog-actions"><button type="button" class="secondary close">Cancel</button><button class="primary" value="submit">Save changes</button></div>
     </form>
   </dialog>

@@ -241,6 +241,21 @@ function eventAuthorName(event) {
   return event.agent_name || event.author_name || "Agent";
 }
 
+// A check DevTeam ran and a check an agent merely claimed must never look alike. Reports written
+// before verification existed carry only strings, and stay labeled as the assertions they were.
+function checkLabel(record) {
+  if (record.status === "passed") return `check ✓ ${record.label} · verified (exit 0${record.durationMs != null ? `, ${Math.round(record.durationMs / 100) / 10}s` : ""})`;
+  if (record.status === "failed") return `check ✕ ${record.label} · verified failure${record.exitCode != null ? ` (exit ${record.exitCode})` : ""}`;
+  if (record.status === "unavailable") return `check ? ${record.label} · not run`;
+  return `check: ${record.label} · agent-asserted`;
+}
+
+function checkChips(metadata) {
+  const records = metadata.checkRecords;
+  if (Array.isArray(records) && records.length) return records.map(checkLabel);
+  return (metadata.checks || []).map((check) => `check: ${check} · agent-asserted`);
+}
+
 function renderEvent(event) {
   if (event.type === "proposal.vote") return "";
   if (SYSTEM_EVENTS.includes(event.type)) {
@@ -252,7 +267,7 @@ function renderEvent(event) {
   const kind = KIND_LABELS[event.type];
   const meta = [
     ...(event.metadata.changedFiles || []).map((file) => `changed: ${file}`),
-    ...(event.metadata.checks || []).map((check) => `check: ${check}`),
+    ...checkChips(event.metadata),
     event.metadata.role ? `role: ${event.metadata.role}` : null,
   ].filter(Boolean);
   const badge = kind ? `<span class="kind-badge ${kind}">${escapeHtml(kind)}</span>` : "";
@@ -381,6 +396,14 @@ function renderTask(task) {
     const blockedBy = item.blockedBy?.length
       ? `<div class="dependency-wait"><strong>Waiting for</strong>${item.blockedBy.map((dependency) => `<span>${escapeHtml(dependency.title)} · ${escapeHtml(dependency.status)}</span>`).join("")}</div>`
       : "";
+    // A queued item nobody is picking up used to look identical to one about to be claimed. The
+    // scheduler now says why, so a stall is visible on the card instead of only in a log.
+    const checks = item.checks?.length
+      ? `<div class="reported-checks">${item.checks.map((record) => `<span class="check-chip ${record.status}" title="${escapeHtml(record.output || "")}">${escapeHtml(checkLabel(record))}</span>`).join("")}</div>`
+      : "";
+    const hold = item.schedulingHold
+      ? `<div class="scheduling-hold"><strong>Held back</strong><span>${escapeHtml(item.schedulingHold.detail)}</span></div>`
+      : "";
     const assessment = item.assessment;
     const assessmentView = assessment
       ? `<div class="complexity"><strong>${escapeHtml(assessment.level)} · score ${Number(assessment.score)}</strong><span>${escapeHtml(assignmentRuntimeLabel(item))}</span><small>${assessment.reasons.slice(0, 2).map((reason) => escapeHtml(reason.detail)).join(" · ") || "Scoped baseline work."}</small></div>`
@@ -389,7 +412,7 @@ function renderTask(task) {
     const runtime = item.status === "queued" && assessment
       ? `<button class="mini runtime" data-runtime-assignment="${item.id}" title="Review the provider-neutral runtime recommendation">Runtime settings</button>`
       : "";
-    return `<div class="assignment"><div class="assignment-top"><strong>${escapeHtml(item.title)}</strong><span class="role">${escapeHtml(item.role)}</span></div><p>${escapeHtml(item.agent_name ? `${item.agent_name} · ${item.status}` : item.status)}${item.requires_write ? " · write lease" : ""}</p>${assessmentView}${runtimeDecision}${blockedBy}${scope}${checklist}<div class="assignment-actions">${runtime}${checkpoint}${release}</div></div>`;
+    return `<div class="assignment"><div class="assignment-top"><strong>${escapeHtml(item.title)}</strong><span class="role">${escapeHtml(item.role)}</span></div><p>${escapeHtml(item.agent_name ? `${item.agent_name} · ${item.status}` : item.status)}${item.requires_write ? " · write lease" : ""}</p>${assessmentView}${runtimeDecision}${hold}${blockedBy}${checks}${scope}${checklist}<div class="assignment-actions">${runtime}${checkpoint}${release}</div></div>`;
   }).join("") || `<p class="hint">Waiting for the plan</p>`;
   renderSessionCheckpoints(task);
   renderBlackboard(task);
@@ -813,6 +836,7 @@ document.addEventListener("click", async (event) => {
     form.dataset.projectId = project.id;
     form.elements.name.value = project.name;
     form.elements.root.value = project.root;
+    loadProjectCheckCommands(project.id, form);
     $("#project-edit-dialog").showModal();
     return;
   }
@@ -1244,6 +1268,32 @@ $("#task-edit-form").addEventListener("submit", async (event) => {
   } catch (error) { toast(error.message); }
 });
 
+// The check allowlist is a human decision and nothing else can make it: show what enabling would
+// permit *before* it is enabled, so "yes" is an informed answer rather than a shrug.
+async function loadProjectCheckCommands(projectId, form) {
+  const list = $("#project-check-commands");
+  list.innerHTML = `<p class="hint">Loading…</p>`;
+  form.elements.verificationEnabled.checked = false;
+  form.elements.checkSandbox.checked = false;
+  try {
+    const config = await api(`/api/projects/${projectId}/check-commands`);
+    form.elements.verificationEnabled.checked = config.verificationEnabled;
+    form.elements.checkSandbox.checked = Boolean(config.sandbox);
+    // Commands already approved, plus what this project's package.json would add. Scripts DevTeam
+    // cannot run without a shell are simply absent — it never guesses at what a script body meant.
+    const approved = new Map(config.commands.map((entry) => [entry.name, entry]));
+    const offered = config.available.filter((entry) => !approved.has(entry.name));
+    const row = (entry, live) => `<div class="check-command ${live ? "approved" : ""}"><code>${escapeHtml(entry.name)}</code><span>${escapeHtml(entry.argv.join(" "))}</span></div>`;
+    list.innerHTML = [
+      config.commands.length ? `<p class="hint">Currently allowed:</p>${config.commands.map((entry) => row(entry, true)).join("")}` : "",
+      offered.length ? `<p class="hint">${config.verificationEnabled ? "Also available in package.json (saving re-snapshots all of them):" : "Would be allowed from package.json:"}</p>${offered.map((entry) => row(entry, false)).join("")}` : "",
+      config.commands.length || offered.length ? "" : `<p class="hint">This project's package.json offers no script DevTeam can run without a shell.</p>`,
+    ].filter(Boolean).join("");
+  } catch (error) {
+    list.innerHTML = `<p class="hint">Could not read the allowlist: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
 $("#project-edit-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.target;
@@ -1252,6 +1302,15 @@ $("#project-edit-form").addEventListener("submit", async (event) => {
   const values = Object.fromEntries(new FormData(form));
   try {
     await api(`/api/projects/${projectId}`, { method: "PATCH", body: JSON.stringify({ name: values.name, root: values.root }) });
+    // Saved after the folder, because re-pointing the folder clears the allowlist by design: the
+    // commands were approved against the tree the human was looking at.
+    await api(`/api/projects/${projectId}/check-commands`, {
+      method: "PUT",
+      body: JSON.stringify({
+        ...(values.verificationEnabled ? {} : { commands: [] }),
+        sandbox: Boolean(values.checkSandbox),
+      }),
+    });
     form.closest("dialog").close(); await refresh(); toast("Project updated");
   } catch (error) { toast(error.message); }
 });

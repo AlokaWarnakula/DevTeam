@@ -626,3 +626,82 @@ test("the dashboard renders advertised model names and states plainly when gatin
   assert.match(script, /runtimeProfileSource/, "the dashboard distinguishes an agent profile from the task's standing one");
   assert.match(markup, /runtime-dialog/, "the runtime decision dialog still ships");
 });
+
+test("the scheduler explains a held assignment over REST and over MCP", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-explain-server-"));
+  const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd(), knowledge: { enabled: false } });
+  t.after(async () => { await instance.close(); await rm(dataDir, { recursive: true, force: true }); });
+
+  const project = instance.store.ensureProject("Explain REST", process.cwd());
+  const task = instance.store.createTask({ projectId: project.id, title: "Explain REST", description: "Exercise the explanation surface." });
+  const agent = instance.store.connectAgent({ name: "Explainer", provider: "fixture" });
+  const plan = instance.store.claimNextAssignment(agent.id);
+  instance.store.completeAssignment({ agentId: agent.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+  instance.store.createAssignment({
+    taskId: task.id, title: "Ship the feature", description: "Edit source.",
+    role: "implementer", requiresWrite: true, paths: ["src"],
+  });
+  const reviewer = instance.store.createAssignment({ taskId: task.id, title: "Review it", description: "Read the diff.", role: "reviewer" });
+
+  // The dashboard asks agent-agnostically, on any queued assignment.
+  const agnostic = await fetch(`${instance.url}/api/assignments/${reviewer.id}/why-not-claimable`).then((response) => response.json());
+  assert.equal(agnostic.claimable, false);
+  assert.equal(agnostic.reasons[0].code, "awaiting_writer");
+  assert.match(agnostic.reasons[0].detail, /Ship the feature/);
+
+  // Naming an agent sharpens it to "why can *that* teammate not take it".
+  const forAgent = await fetch(`${instance.url}/api/assignments/${reviewer.id}/why-not-claimable?agentId=${agent.id}`)
+    .then((response) => response.json());
+  assert.equal(forAgent.agentName, "Explainer");
+  assert.ok(forAgent.reasons.some((reason) => reason.code === "awaiting_writer"));
+
+  const transport = new StreamableHTTPClientTransport(new URL(instance.mcpUrl), {
+    requestInit: { headers: { Authorization: `Bearer ${instance.store.token}` } },
+  });
+  const client = new Client({ name: "explain-test", version: "1.0.0" });
+  await client.connect(transport);
+  t.after(async () => { await client.close(); });
+  const call = async (name, args) => JSON.parse((await client.callTool({ name, arguments: args })).content[0].text);
+
+  const connected = await call("devteam_connect", { name: "McpExplainer", provider: "fixture", taskId: task.id });
+  const board = await call("devteam_why_blocked", { agentId: connected.agent.id });
+  assert.equal(board.queuedCount, 2, "an idle agent gets the whole board it may see");
+  assert.equal(board.claimable.length, 1, "the writer is claimable, the reviewer is not");
+  const single = await call("devteam_why_blocked", { agentId: connected.agent.id, assignmentId: reviewer.id });
+  assert.equal(single.claimable, false);
+  assert.match(single.reasons.find((reason) => reason.code === "awaiting_writer").detail, /Ship the feature/);
+});
+
+test("the check-command allowlist is a credentialed human decision, not an agent-reachable one", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-checks-server-"));
+  const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd(), knowledge: { enabled: false } });
+  t.after(async () => { await instance.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const authed = { "content-type": "application/json", authorization: `Bearer ${instance.store.token}` };
+  const project = instance.store.ensureProject("Checks REST", process.cwd());
+
+  // Reading the allowlist discloses what this host is willing to run, so it needs the credential.
+  assert.equal((await fetch(`${instance.url}/api/projects/${project.id}/check-commands`)).status, 401);
+  const anonymousWrite = await fetch(`${instance.url}/api/projects/${project.id}/check-commands`, {
+    method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ commands: [{ name: "x", argv: ["node", "-v"] }] }),
+  });
+  assert.equal(anonymousWrite.status, 401, "nothing becomes executable without the dashboard session or bearer token");
+
+  const before = await fetch(`${instance.url}/api/projects/${project.id}/check-commands`, { headers: authed }).then((response) => response.json());
+  assert.equal(before.verificationEnabled, false, "a project verifies nothing until a human enables it");
+  assert.ok(before.available.some((entry) => entry.name === "test"), "the human is shown what enabling would allow");
+
+  // Omitting commands snapshots this project's own package.json scripts.
+  const enabled = await fetch(`${instance.url}/api/projects/${project.id}/check-commands`, {
+    method: "PUT", headers: authed, body: JSON.stringify({}),
+  }).then((response) => response.json());
+  assert.equal(enabled.verificationEnabled, true);
+  assert.deepEqual(enabled.commands.find((entry) => entry.name === "test").argv, ["node", "--test"]);
+
+  // An entry that would need a shell, or that points at a path, is refused where the human can see it.
+  const refused = await fetch(`${instance.url}/api/projects/${project.id}/check-commands`, {
+    method: "PUT", headers: authed, body: JSON.stringify({ commands: [{ name: "evil", argv: ["../../bin/sh", "-c", "echo"] }] }),
+  });
+  assert.equal(refused.status >= 400, true, "a path-qualified program is not accepted into the allowlist");
+  const still = await fetch(`${instance.url}/api/projects/${project.id}/check-commands`, { headers: authed }).then((response) => response.json());
+  assert.equal(still.commands.some((entry) => entry.name === "evil"), false, "and the refusal leaves the stored list untouched");
+});

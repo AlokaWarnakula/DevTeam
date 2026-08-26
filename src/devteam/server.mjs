@@ -292,6 +292,40 @@ export async function startDevTeamServer({
   app.get("/api/assignments/:assignmentId/assessment", requireControlAuth, (req, res) => {
     res.json(store.assignmentAssessment({ assignmentId: req.params.assignmentId }));
   });
+  // Reading the allowlist executes nothing, but it does disclose what a host is willing to run, so
+  // it stays behind the control credential like the other configuration surfaces.
+  app.get("/api/projects/:projectId/check-commands", requireControlAuth, (req, res) => {
+    const commands = store.projectCheckCommands(req.params.projectId);
+    res.json({
+      projectId: req.params.projectId,
+      verificationEnabled: commands.length > 0,
+      sandbox: store.projectCheckSandbox(req.params.projectId),
+      commands,
+      available: store.availableCheckCommands(req.params.projectId),
+    });
+  });
+  app.put("/api/projects/:projectId/check-commands", (req, res) => {
+    // Omitting commands snapshots the project's own package.json scripts; sending [] turns
+    // verification back off. Either way this is a human decision, never an agent's.
+    res.json(store.setProjectCheckCommands({
+      projectId: req.params.projectId,
+      commands: Array.isArray(req.body?.commands) ? req.body.commands : null,
+      sandbox: typeof req.body?.sandbox === "boolean" ? req.body.sandbox : null,
+    }));
+  });
+  app.get("/api/assignments/:assignmentId/why-not-claimable", (req, res) => {
+    // The dashboard asks agent-agnostically ("why is this queued item stuck?"); passing agentId
+    // answers the sharper question of why one particular teammate cannot take it. Naming an agent
+    // makes this the same question devteam_why_blocked answers, so it enforces the same membership
+    // boundary rather than being a way around it.
+    const agentId = typeof req.query.agentId === "string" && req.query.agentId ? req.query.agentId : null;
+    if (agentId) {
+      const room = store.assignmentRoom(req.params.assignmentId);
+      if (!room) return res.status(404).json({ error: "Assignment not found." });
+      store.assertExplainable(agentId, room);
+    }
+    return res.json(store.whyNotClaimable(req.params.assignmentId, agentId));
+  });
   app.patch("/api/assignments/:assignmentId/complexity", (req, res) => {
     res.json(store.setAssignmentComplexityOverride({ assignmentId: req.params.assignmentId, override: req.body?.override ?? req.body ?? null }));
   });
