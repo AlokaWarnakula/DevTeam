@@ -395,7 +395,8 @@ export class DevTeamStore extends EventEmitter {
         exit_code INTEGER NULL,
         duration_ms INTEGER NULL,
         output TEXT NULL,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        superseded_at TEXT NULL
       );
 
       CREATE INDEX IF NOT EXISTS idx_assignment_checks ON assignment_checks(assignment_id, created_at);
@@ -435,7 +436,8 @@ export class DevTeamStore extends EventEmitter {
       ["agents", "replaced_by_agent_id", "TEXT"],
       ["agents", "session_policy_ack_task_id", "TEXT"],
       ["events", "author_name", "TEXT"],                                   // who wrote it, kept even after the agent row is purged
-      ["events", "author_kind", "TEXT"],                                   // 'human' or 'agent', so authorship never depends on a nullable FK
+      ["events", "author_kind", "TEXT"],
+      ["assignment_checks", "superseded_at", "TEXT"],           // only the latest report attempt describes the work as it stands                                   // 'human' or 'agent', so authorship never depends on a nullable FK
     ]) {
       try { this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`); } catch { /* already present */ }
     }
@@ -3073,7 +3075,8 @@ export class DevTeamStore extends EventEmitter {
   #checksFor(assignmentId) {
     return this.db.prepare(`
       SELECT label, requested_command, command, verified, status, exit_code, duration_ms, output, created_at
-      FROM assignment_checks WHERE assignment_id = ? ORDER BY created_at ASC, rowid ASC
+      FROM assignment_checks WHERE assignment_id = ? AND superseded_at IS NULL
+      ORDER BY created_at ASC, rowid ASC
     `).all(assignmentId).map((row) => ({
       label: row.label,
       requestedCommand: row.requested_command,
@@ -3138,6 +3141,13 @@ export class DevTeamStore extends EventEmitter {
   }
 
   #storeReportedChecks(assignmentId, taskId, records, stamp) {
+    // A rejected report leaves the claim intact so the agent can fix the work and report again, so
+    // an assignment accumulates one batch per attempt. Only the latest attempt describes the work as
+    // it now stands: without this, an assignment that failed a check and then passed it would go on
+    // showing the failure forever, and "did a check fail here?" would answer yes about work that is
+    // green. Earlier attempts are kept, marked superseded, so the history is still on record.
+    this.db.prepare("UPDATE assignment_checks SET superseded_at = ? WHERE assignment_id = ? AND superseded_at IS NULL")
+      .run(stamp, assignmentId);
     for (const record of records) {
       this.db.prepare(`
         INSERT INTO assignment_checks (

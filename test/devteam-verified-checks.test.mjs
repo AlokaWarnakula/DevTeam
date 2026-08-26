@@ -368,3 +368,40 @@ test("the verification timeout bounds the whole report, not each command in it",
   assert.ok(result.checks.slice(1).every((record) => record.status === "unavailable"));
   assert.match(result.checks[9].output, /budget/);
 });
+
+test("only the latest report attempt describes the work as it now stands", async (t) => {
+  // A rejected report leaves the claim intact so the agent can fix and report again. Before this,
+  // every attempt appended, so an assignment that failed a check and then passed it went on showing
+  // the verified failure forever and grew assignment_checks without bound on a retry loop.
+  const { store, task, agent } = await checksFixture(t);
+  const claim = claimWork(store, agent, task);
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const refused = store.completeAssignment({
+      agentId: agent.id, assignmentId: claim.id, claimToken: claim.claimToken,
+      message: "Green, honest.", checks: [{ label: "unit tests", command: "lint" }],
+    });
+    assert.equal(refused.completed, false);
+  }
+  const midway = store.taskDetail(task.id).assignments.find((item) => item.id === claim.id);
+  assert.equal(midway.checks.length, 1, "two failed attempts show as one current verdict, not two");
+  assert.equal(midway.checks[0].status, "failed");
+
+  // The agent fixes the work and reports a check that really passes.
+  const fixed = store.completeAssignment({
+    agentId: agent.id, assignmentId: claim.id, claimToken: claim.claimToken,
+    message: "Fixed.", checks: [{ label: "unit tests", command: "test" }],
+  });
+  assert.equal(fixed.completed, true);
+
+  const card = store.taskDetail(task.id).assignments.find((item) => item.id === claim.id);
+  assert.equal(card.checks.length, 1, "the completed assignment shows only its final verdict");
+  assert.equal(card.checks[0].status, "passed");
+  assert.ok(!card.checks.some((record) => record.status === "failed"),
+    "a fixed assignment does not permanently display the failure it recovered from");
+
+  // The earlier attempts are still on record, marked superseded rather than deleted.
+  const history = store.db.prepare("SELECT status, superseded_at FROM assignment_checks WHERE assignment_id = ?").all(claim.id);
+  assert.equal(history.length, 3, "every attempt is kept");
+  assert.equal(history.filter((row) => row.superseded_at).length, 2);
+});
