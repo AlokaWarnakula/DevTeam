@@ -1756,3 +1756,424 @@ test("a queued assignment explains why the scheduler is holding it back", async 
   const absent = detail.assignments.find((item) => item.id === ghosted.id);
   assert.equal(absent.schedulingHold?.reason, "target_absent");
 });
+
+// --- T2.2: rework loops instead of blunt blocking -----------------------------------------------
+
+// One writer, one reviewer, one completed piece of work on the current version, and a reviewer that
+// has earned standing on it. This is the state every rework test starts from.
+async function reviewFixture(t, { requiredApprovals = 1 } = {}) {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-rework-"));
+  const store = new DevTeamStore(dataDir, { knowledge: { enabled: false }, codegraph: { enabled: false } });
+  t.after(async () => {
+    try { store.close(); } catch { /* some tests close early */ }
+    await rm(dataDir, { recursive: true, force: true });
+  });
+  const project = store.ensureProject("Rework project", process.cwd());
+  const task = store.createTask({ projectId: project.id, title: "Ship it well", description: "Write it, then review it.", requiredApprovals });
+  const author = store.connectAgent({ name: "Author", provider: "test", freshTaskId: task.id });
+  const reviewer = store.connectAgent({ name: "Reviewer", provider: "test", freshTaskId: task.id });
+
+  const plan = store.claimNextAssignment(author.id);
+  const work = store.createAssignment({
+    agentId: author.id, taskId: task.id, title: "Implement the feature", description: "Write it.",
+    role: "implementer", requiresWrite: true, paths: ["src/feature.mjs"],
+  });
+  const review = store.createAssignment({
+    agentId: author.id, taskId: task.id, title: "Review the feature", description: "Read the diff.", role: "reviewer",
+  });
+  await store.completeAssignment({ agentId: author.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+
+  const workClaim = store.claimNextAssignment(author.id);
+  assert.equal(workClaim.id, work.id);
+  await store.completeAssignment({
+    agentId: author.id, assignmentId: work.id, claimToken: workClaim.claimToken,
+    message: "Implemented the feature.", changedFiles: ["src/feature.mjs"],
+  });
+  const reviewClaim = store.claimNextAssignment(reviewer.id);
+  assert.equal(reviewClaim.id, review.id, "the reviewer picks up the review once the writer is done");
+  return { store, project, task, author, reviewer, work, review, reviewClaim };
+}
+
+test("a reviewer sends work back to its author instead of approving it or blocking the task", async (t) => {
+  const { store, task, author, reviewer, work, review, reviewClaim } = await reviewFixture(t);
+
+  const sentBack = store.requestChanges({
+    agentId: reviewer.id, taskId: task.id, assignmentId: work.id,
+    summary: "The error path is untested and swallows the cause.",
+    findings: [
+      { detail: "rethrow with the original cause attached", path: "src/feature.mjs" },
+      "add a test for the failure branch",
+    ],
+  });
+  assert.equal(sentBack.changesRequested, true);
+  assert.equal(sentBack.routedTo, "Author", "it goes back to whoever wrote it");
+  assert.equal(sentBack.reworkCount, 1);
+  assert.equal(sentBack.findings.length, 2);
+
+  // The task keeps running: nobody was disconnected and the reviewer still holds its own claim.
+  assert.notEqual(store.getTask(task.id).status, "blocked");
+  assert.equal(store.db.prepare("SELECT status FROM assignments WHERE id = ?").get(review.id).status, "claimed");
+  assert.equal(store.getAgent(reviewer.id).status, "busy");
+
+  // The original row is reopened rather than replaced, so its history stays with the work.
+  const row = store.db.prepare("SELECT * FROM assignments WHERE id = ?").get(work.id);
+  assert.equal(row.status, "queued");
+  assert.equal(row.agent_id, null);
+  assert.equal(row.completed_at, null);
+  assert.equal(row.target_agent_name, "Author");
+  assert.equal(row.rework_count, 1);
+  assert.ok(row.rework_requested_at);
+  assert.equal(
+    store.db.prepare("SELECT COUNT(*) AS count FROM assignments WHERE task_id = ?").get(task.id).count,
+    3, "no near-duplicate follow-up assignment is created");
+  const detail = store.taskDetail(task.id);
+  assert.ok(detail.events.some((event) => event.type === "assignment.completed" && event.metadata?.assignmentId === work.id),
+    "the original completion stays on the timeline");
+  assert.ok(detail.events.some((event) => event.type === "assignment.changes_requested"));
+
+  // The author re-claims it and is handed exactly what to fix.
+  const reclaim = store.claimNextAssignment(author.id);
+  assert.equal(reclaim.id, work.id);
+  assert.equal(reclaim.rework.count, 1);
+  assert.deepEqual(reclaim.rework.findings.map((finding) => finding.detail).sort(),
+    ["add a test for the failure branch", "rethrow with the original cause attached"]);
+  assert.equal(reclaim.rework.findings.find((finding) => finding.path)?.path, "src/feature.mjs");
+  assert.deepEqual(reclaim.writeScope, workClaimScope(store, work.id), "the reopened work keeps its write scope");
+
+  // Reporting again resolves the findings, and the next claim is clean.
+  await store.completeAssignment({
+    agentId: author.id, assignmentId: work.id, claimToken: reclaim.claimToken,
+    message: "Rethrew with the cause and covered the failure branch.", changedFiles: ["src/feature.mjs"],
+  });
+  assert.equal(store.taskDetail(task.id).assignments.find((item) => item.id === work.id).findings.length, 0,
+    "the findings stop being outstanding once the rework is reported");
+  assert.equal(store.taskDetail(task.id).assignments.find((item) => item.id === work.id).resolvedFindings.length, 2,
+    "but they stay on the record, so the next reviewer can see what this went back for");
+});
+
+function workClaimScope(store, assignmentId) {
+  return store.taskDetail(store.db.prepare("SELECT task_id FROM assignments WHERE id = ?").get(assignmentId).task_id)
+    .assignments.find((item) => item.id === assignmentId).writeScope;
+}
+
+test("sending work back clears approvals built on the version that was judged not good enough", async (t) => {
+  const { store, task, reviewer, work } = await reviewFixture(t, { requiredApprovals: 1 });
+  const version = store.getTask(task.id).version;
+  // A second reviewer had already approved this version.
+  const second = store.connectAgent({ name: "Second reviewer", provider: "test", freshTaskId: task.id });
+  store.createAssignment({ taskId: task.id, title: "Second look", description: "Read it too.", role: "reviewer", targetAgentName: "Second reviewer" });
+  const secondClaim = store.claimNextAssignment(second.id);
+  await store.completeAssignment({ agentId: second.id, assignmentId: secondClaim.id, claimToken: secondClaim.claimToken, message: "Looks fine to me." });
+  store.approveTask({ agentId: second.id, taskId: task.id, summary: "Approved." });
+  assert.equal(store.taskDetail(task.id).approvals.length, 1);
+
+  const sentBack = store.requestChanges({
+    agentId: reviewer.id, taskId: task.id, assignmentId: work.id, summary: "Not yet.",
+  });
+  assert.equal(sentBack.clearedApprovals, 1);
+  assert.equal(store.taskDetail(task.id).approvals.length, 0,
+    "an approval cannot survive a reviewer saying the same version needs changes");
+  assert.equal(store.getTask(task.id).version, version, "and sending back does not itself advance the version");
+});
+
+test("only a completed assignment can be sent back, and only by someone with review standing", async (t) => {
+  const { store, task, author, reviewer, work, review } = await reviewFixture(t);
+  const outsiderTask = store.createTask({ projectId: store.listProjects()[0].id, title: "Elsewhere", description: "Another room." });
+  const outsider = store.connectAgent({ name: "Outsider", provider: "test", freshTaskId: outsiderTask.id });
+
+  assert.throws(() => store.requestChanges({
+    agentId: outsider.id, taskId: task.id, assignmentId: work.id, summary: "Not mine to judge.",
+  }), /not a member/i, "a non-member cannot reach into the room to bounce its work");
+
+  assert.throws(() => store.requestChanges({
+    agentId: author.id, taskId: task.id, assignmentId: work.id, summary: "I have not reviewed anything.",
+  }), /reviewer or tester/i, "review standing is earned the same way the right to approve is");
+
+  assert.throws(() => store.requestChanges({
+    agentId: reviewer.id, taskId: task.id, assignmentId: review.id, summary: "Sending back the open review.",
+  }), /Only completed work/i, "work that is not finished has nothing to send back");
+
+  assert.throws(() => store.requestChanges({
+    agentId: reviewer.id, taskId: task.id, assignmentId: work.id, summary: "   ",
+  }), /what needs to change/i, "a reason is not optional");
+});
+
+test("rework survives its author leaving, and counts how many times it has gone back", async (t) => {
+  const { store, task, author, reviewer, work } = await reviewFixture(t);
+  store.requestChanges({ agentId: reviewer.id, taskId: task.id, assignmentId: work.id, summary: "First pass back." });
+
+  // Targeting is a preference, not a lock. Once nobody by that name is present, the existing
+  // absent-target rule returns the item to the room rather than leaving it claimable by nobody.
+  store.disconnectAgent(author.id, "Desktop closed.");
+  const standIn = store.connectAgent({ name: "Stand-in", provider: "test", freshTaskId: task.id });
+  const picked = store.claimNextAssignment(standIn.id);
+  assert.equal(picked.id, work.id, "rework does not become unclaimable because its author went home");
+  assert.equal(picked.rework.count, 1);
+  await store.completeAssignment({
+    agentId: standIn.id, assignmentId: work.id, claimToken: picked.claimToken,
+    message: "Picked up the rework.", changedFiles: ["src/feature.mjs"],
+  });
+
+  // A second pass back records that this is the second time, so a loop is visible rather than silent.
+  const again = store.requestChanges({ agentId: reviewer.id, taskId: task.id, assignmentId: work.id, summary: "Still not right." });
+  assert.equal(again.reworkCount, 2);
+  assert.equal(again.routedTo, "Stand-in", "it goes back to whoever wrote the version being reviewed");
+});
+
+test("a late report from the session that was sent back is fenced, not applied over the rework", async (t) => {
+  const { store, task, author, reviewer, work } = await reviewFixture(t);
+  const generationBefore = store.db.prepare("SELECT claim_generation FROM assignments WHERE id = ?").get(work.id).claim_generation;
+  store.requestChanges({ agentId: reviewer.id, taskId: task.id, assignmentId: work.id, summary: "Send it back." });
+  assert.equal(store.db.prepare("SELECT claim_token_hash FROM assignments WHERE id = ?").get(work.id).claim_token_hash, null,
+    "reopening drops the fencing token exactly as a force-release does");
+  const reclaim = store.claimNextAssignment(author.id);
+  assert.equal(reclaim.claimGeneration, generationBefore + 1, "and the re-claim is what advances the generation");
+  assert.equal(reclaim.rework.summary, "Send it back.", "the author is told why even with no itemised findings");
+  const stale = await store.completeAssignment({
+    agentId: author.id, assignmentId: work.id, claimToken: "the-previous-sessions-token",
+    message: "Reported from the old session.",
+  });
+  assert.equal(stale.completed, false);
+  assert.ok(stale.claimConflict);
+});
+
+test("the human can send work back from the dashboard without a review assignment of its own", async (t) => {
+  const { store, task, work } = await reviewFixture(t);
+  const sentBack = store.requestChanges({
+    taskId: task.id, assignmentId: work.id, summary: "I want this done differently.",
+    findings: ["use the existing helper instead of a new one"],
+  });
+  assert.equal(sentBack.changesRequested, true);
+  assert.equal(sentBack.findings.length, 1);
+  assert.equal(store.taskDetail(task.id).assignments.find((item) => item.id === work.id).findings[0].requested_by_name, "the human");
+});
+
+// --- T2.6: human steering mid-flight --------------------------------------------------------------
+
+test("a human can re-prioritise the queue without letting priority skip a real gate", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-priority-"));
+  const store = new DevTeamStore(dataDir);
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Priority project", process.cwd());
+  const task = store.createTask({ projectId: project.id, title: "Order the work", description: "Some of it matters more." });
+  const agent = store.connectAgent({ name: "Worker", provider: "test", freshTaskId: task.id });
+  const plan = store.claimNextAssignment(agent.id);
+  const first = store.createAssignment({ taskId: task.id, title: "Ordinary work", description: "Do it.", role: "implementer" });
+  const urgent = store.createAssignment({ taskId: task.id, title: "The urgent thing", description: "Do it first.", role: "implementer" });
+  const gated = store.createAssignment({ taskId: task.id, title: "Blocked on the first", description: "Later.", role: "implementer", dependsOn: [first.id] });
+  await store.completeAssignment({ agentId: agent.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+
+  // Without priority, creation order decides.
+  assert.equal(store.whyNotClaimable(urgent.id, agent.id).claimable, true);
+  store.prioritizeAssignment({ taskId: task.id, assignmentId: urgent.id, priority: 10 });
+  assert.equal(store.claimNextAssignment(agent.id).id, urgent.id, "the prioritised item is handed out first");
+
+  // Priority cannot make gated work claimable: a dependency is not a preference.
+  store.prioritizeAssignment({ taskId: task.id, assignmentId: gated.id, priority: 100 });
+  const held = store.whyNotClaimable(gated.id, agent.id);
+  assert.equal(held.claimable, false);
+  assert.ok(held.reasons.some((reason) => reason.code === "dependency_pending"),
+    "wanting something sooner is not a reason to skip its prerequisite");
+  assert.throws(() => store.prioritizeAssignment({ taskId: task.id, assignmentId: "missing", priority: 1 }), /not found/i);
+});
+
+test("a cancel request reaches a working agent and asks rather than kills", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-cancel-"));
+  const store = new DevTeamStore(dataDir);
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Cancel project", process.cwd());
+  const task = store.createTask({ projectId: project.id, title: "Stop it", description: "Changed my mind." });
+  const agent = store.connectAgent({ name: "Worker", provider: "test", freshTaskId: task.id });
+  const claim = store.claimNextAssignment(agent.id);
+  assert.equal(store.steeringFor(agent.id), null, "nothing to say while all is well");
+
+  const cancelled = store.requestCancel({ taskId: task.id, assignmentId: claim.id, reason: "We are shipping without this." });
+  assert.equal(cancelled.cancelRequested, true);
+
+  const steering = store.steeringFor(agent.id);
+  assert.equal(steering.cancelRequested, true);
+  assert.match(steering.reason, /shipping without this/);
+  assert.match(steering.next, /report what you have/i);
+
+  // The claim is untouched: a half-written tree is exactly what killing a writer produces.
+  const row = store.db.prepare("SELECT status, agent_id FROM assignments WHERE id = ?").get(claim.id);
+  assert.equal(row.status, "claimed");
+  assert.equal(row.agent_id, agent.id);
+  // The agent complies by reporting, which is the normal path and needs no special handling.
+  const reported = await store.completeAssignment({
+    agentId: agent.id, assignmentId: claim.id, claimToken: claim.claimToken,
+    status: "blocked", message: "Stopped as asked; the outline is half done.",
+  });
+  assert.equal(reported.completed, true);
+
+  assert.throws(() => store.requestCancel({ taskId: task.id, assignmentId: claim.id }), /actually doing/i,
+    "queued work is not cancelled, it is deleted or re-prioritised");
+});
+
+test("a task budget is surfaced to the room once it is spent, without hard-stopping a writer", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-budget-"));
+  const store = new DevTeamStore(dataDir);
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Budget project", process.cwd());
+  const task = store.createTask({ projectId: project.id, title: "Time-boxed", description: "One afternoon, no more." });
+  const agent = store.connectAgent({ name: "Worker", provider: "test", freshTaskId: task.id });
+  const claim = store.claimNextAssignment(agent.id);
+
+  assert.equal(store.taskBudgetState(task.id), null, "no budget set, nothing to say");
+  store.setTaskBudget({ taskId: task.id, wallClockMinutes: 60 });
+  const within = store.taskBudgetState(task.id);
+  assert.equal(within.budgetMinutes, 60);
+  assert.equal(within.exceeded, false);
+  assert.equal(store.steeringFor(agent.id), null, "a budget that is not spent is not a signal");
+
+  // Age the task past its budget.
+  store.db.prepare("UPDATE tasks SET created_at = ? WHERE id = ?")
+    .run(new Date(Date.now() - 90 * 60_000).toISOString(), task.id);
+  const spent = store.taskBudgetState(task.id);
+  assert.equal(spent.exceeded, true);
+  assert.equal(spent.remainingMinutes, 0);
+
+  const steering = store.steeringFor(agent.id);
+  assert.equal(steering.budget.exceeded, true);
+  assert.match(steering.budget.next, /do not start anything new/i);
+  // Advisory, not a kill: the claim survives, because a hard stop mid-write is the thing to avoid.
+  assert.equal(store.db.prepare("SELECT status FROM assignments WHERE id = ?").get(claim.id).status, "claimed");
+
+  store.setTaskBudget({ taskId: task.id, wallClockMinutes: null });
+  assert.equal(store.taskBudgetState(task.id), null, "a cleared budget stops being a signal");
+});
+
+// --- T2.1: work decomposition ---------------------------------------------------------------------
+
+async function splitFixture(t) {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-split-"));
+  const store = new DevTeamStore(dataDir);
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Split project", process.cwd());
+  const task = store.createTask({ projectId: project.id, title: "Big job", description: "Bigger than it looked." });
+  const agent = store.connectAgent({ name: "Splitter", provider: "test", freshTaskId: task.id });
+  const plan = store.claimNextAssignment(agent.id);
+  await store.completeAssignment({ agentId: agent.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+  const big = store.createAssignment({
+    taskId: task.id, title: "Rewrite the importer", description: "All of it.",
+    role: "implementer", requiresWrite: true, paths: ["src/import"],
+  });
+  const claim = store.claimNextAssignment(agent.id);
+  assert.equal(claim.id, big.id);
+  return { store, project, task, agent, big, claim };
+}
+
+test("an agent can divide work that turned out too big, without losing its lease", async (t) => {
+  const { store, task, agent, big, claim } = await splitFixture(t);
+  const before = store.db.prepare("SELECT claim_generation FROM assignments WHERE id = ?").get(big.id).claim_generation;
+
+  const result = store.splitAssignment({
+    agentId: agent.id, assignmentId: big.id, claimToken: claim.claimToken, keepParent: true,
+    parts: [
+      { title: "Rewrite the parser", description: "Just the parsing.", paths: ["src/import/parse.mjs"] },
+      { title: "Rewrite the writer", description: "Just the writing.", paths: ["src/import/write.mjs"] },
+      { title: "Review the rewrite", description: "Read it all.", role: "reviewer", requiresWrite: false },
+    ],
+  });
+  assert.equal(result.split, true);
+  assert.equal(result.parts.length, 3);
+  assert.equal(result.parentKept, true);
+
+  // The lease is untouched — an agent that had to give up its claim to reorganise would not do it.
+  const parent = store.db.prepare("SELECT status, agent_id, claim_generation FROM assignments WHERE id = ?").get(big.id);
+  assert.equal(parent.status, "claimed");
+  assert.equal(parent.agent_id, agent.id);
+  assert.equal(parent.claim_generation, before, "splitting does not bump the generation, so the claim token still works");
+
+  // Each piece has its own scope, and the read-only one takes no lease.
+  const detail = store.taskDetail(task.id);
+  const parse = detail.assignments.find((item) => item.title === "Rewrite the parser");
+  assert.deepEqual(parse.writeScope, ["src/import/parse.mjs"]);
+  const review = detail.assignments.find((item) => item.title === "Review the rewrite");
+  assert.equal(review.requires_write, 0);
+  assert.equal(review.verifies, 1, "a piece can change role, and its behaviour follows");
+
+  // Each is re-assessed on its own merits rather than inheriting the whole job's assessment.
+  assert.ok(result.parts.every((part) => part.assessment), "every piece is assessed in its own right");
+
+  // The split is on the timeline as one event that names the pieces.
+  const splitEvent = detail.events.find((event) => event.type === "assignment.split");
+  assert.ok(splitEvent);
+  assert.equal(splitEvent.metadata.parts.length, 3);
+
+  // The agent can still report the work it is holding.
+  const reported = await store.completeAssignment({
+    agentId: agent.id, assignmentId: big.id, claimToken: claim.claimToken,
+    message: "Did the groundwork; the pieces are queued.", changedFiles: ["src/import/shared.mjs"],
+  });
+  assert.equal(reported.completed, true);
+});
+
+test("pieces inherit scope, dependencies and targeting, and overlapping writers are ordered", async (t) => {
+  const { store, task, agent, big, claim } = await splitFixture(t);
+  // Give the parent a prerequisite and a target, so inheritance is observable.
+  const prerequisite = store.createAssignment({ taskId: task.id, title: "Groundwork", description: "First.", role: "implementer" });
+  store.db.prepare("INSERT INTO assignment_dependencies (assignment_id, depends_on_assignment_id) VALUES (?, ?)").run(big.id, prerequisite.id);
+  store.db.prepare("UPDATE assignments SET target_agent_name = 'Splitter' WHERE id = ?").run(big.id);
+
+  const result = store.splitAssignment({
+    agentId: agent.id, assignmentId: big.id, claimToken: claim.claimToken,
+    parts: [
+      { title: "First half", description: "Touches the shared file.", paths: ["src/import/shared.mjs"] },
+      { title: "Second half", description: "Also touches the shared file.", paths: ["src/import/shared.mjs"] },
+      { title: "Unscoped piece", description: "Declares nothing." },
+    ],
+  });
+
+  const detail = store.taskDetail(task.id);
+  const first = detail.assignments.find((item) => item.title === "First half");
+  const second = detail.assignments.find((item) => item.title === "Second half");
+  const unscoped = detail.assignments.find((item) => item.title === "Unscoped piece");
+
+  assert.equal(first.target_agent_name, "Splitter", "targeted work stays addressed to its teammate when subdivided");
+  assert.ok(first.dependsOn.includes(prerequisite.id), "a prerequisite of the whole is a prerequisite of each piece");
+  assert.deepEqual(unscoped.writeScope, ["src/import"], "a piece that declares no paths inherits the parent's, never a whole-project lease");
+
+  // Writers on overlapping paths would otherwise contend for a lease, one sitting blocked with no
+  // stated reason. The ordering is inferred and explicit instead — and note the unscoped piece
+  // inherited `src/import`, which contains both halves, so it overlaps them too: three edges across
+  // three writers, each pointing from the later part to the earlier one.
+  assert.equal(result.inferredOrder.length, 3);
+  assert.deepEqual(result.inferredOrder[0], { after: "Second half", before: "First half" });
+  assert.ok(result.inferredOrder.every((edge) => edge.after !== edge.before));
+  assert.ok(second.dependsOn.includes(first.id));
+  assert.ok(unscoped.dependsOn.includes(first.id), "a parent-scoped piece is ordered after the narrower ones it contains");
+  assert.equal(store.whyNotClaimable(second.id, agent.id).reasons.some((reason) => reason.code === "dependency_pending"), true);
+
+  // The parent closed by default, and its work now lives in the pieces.
+  assert.equal(store.db.prepare("SELECT status FROM assignments WHERE id = ?").get(big.id).status, "done");
+  assert.equal(result.parentKept, false);
+});
+
+test("only the live claim holder can reshape work, and a split needs real pieces", async (t) => {
+  const { store, task, agent, big, claim } = await splitFixture(t);
+  const other = store.connectAgent({ name: "Someone else", provider: "test", freshTaskId: task.id });
+
+  const stale = store.splitAssignment({
+    agentId: agent.id, assignmentId: big.id, claimToken: "not-the-right-token",
+    parts: [{ title: "A", description: "a" }, { title: "B", description: "b" }],
+  });
+  assert.equal(stale.split ?? undefined, undefined);
+  assert.ok(stale.claimConflict, "a stale session cannot reshape work whose lease has moved");
+
+  const notMine = store.splitAssignment({
+    agentId: other.id, assignmentId: big.id,
+    parts: [{ title: "A", description: "a" }, { title: "B", description: "b" }],
+  });
+  assert.ok(notMine.claimConflict, "nor can a teammate who does not hold it");
+
+  assert.throws(() => store.splitAssignment({
+    agentId: agent.id, assignmentId: big.id, claimToken: claim.claimToken,
+    parts: [{ title: "Only one", description: "Not a split." }],
+  }), /at least two parts/i, "a one-part split is a re-scope, and there is a better tool for that");
+
+  assert.throws(() => store.splitAssignment({
+    agentId: agent.id, assignmentId: big.id, claimToken: claim.claimToken,
+    parts: [{ title: "", description: "no title" }, { title: "B", description: "" }],
+  }), /at least two parts/i);
+});

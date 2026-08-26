@@ -667,6 +667,137 @@ async function doWork(store, agent, task, title, { changedFiles = [], checks = [
   }) };
 }
 
+test("a check that used to pass and now fails is named a regression, and routed to whoever broke it", async (t) => {
+  const { store, task, alice, bob, setSuite } = await regressionFixture(t);
+
+  // Alice delivers with the suite green. That establishes the baseline.
+  const first = await doWork(store, alice, task, "Add the feature", { changedFiles: ["src/feature.mjs"], checks: SUITE, paths: ["src/feature.mjs"] });
+  assert.equal(first.result.completed, true);
+  assert.equal(first.result.checks[0].status, "passed");
+  assert.equal(store.checkBaseline(task.id)[0].status, "passed");
+  assert.ok(store.checkBaseline(task.id)[0].lastPassedAt);
+  assert.equal(store.openRegressions(task.id).length, 0);
+
+  // Alice then lands a change that breaks it, without running the suite herself.
+  await setSuite(false);
+  const breaking = await doWork(store, alice, task, "Refactor the shared helper", { changedFiles: ["src/helper.mjs"], paths: ["src/helper.mjs"] });
+  assert.equal(breaking.result.completed, true, "nothing catches it yet — nobody ran the suite");
+  assert.equal(store.openRegressions(task.id).length, 0);
+
+  // Bob, doing unrelated work, runs the suite and trips over Alice's breakage.
+  const caught = await doWork(store, bob, task, "Do something else", { changedFiles: ["src/other.mjs"], checks: SUITE, paths: ["src/other.mjs"] });
+  assert.equal(caught.result.completed, false, "a failing check still refuses the report");
+  assert.equal(caught.result.regressions.length, 1, "and it is recognised as a regression, not just a failure");
+
+  const regression = caught.result.regressions[0];
+  assert.equal(regression.label, "suite");
+  assert.equal(regression.attribution, "single");
+  assert.equal(regression.suspects.length, 1);
+  assert.equal(regression.suspects[0].title, "Refactor the shared helper");
+  assert.equal(regression.suspects[0].author, "Alice", "the agent that changed files since it was last green");
+  assert.deepEqual(regression.suspects[0].changedFiles, ["src/helper.mjs"]);
+  assert.match(caught.result.regressionNote, /not yours/i, "Bob is told this is not his to chase");
+
+  // A fix assignment is queued and addressed to Alice.
+  assert.ok(regression.fixAssignmentId);
+  const fix = store.taskDetail(task.id).assignments.find((item) => item.id === regression.fixAssignmentId);
+  assert.equal(fix.status, "queued");
+  assert.equal(fix.target_agent_name, "Alice");
+  assert.equal(fix.requires_write, 1);
+  assert.match(fix.title, /regression/i);
+  assert.match(fix.description, /src\/helper\.mjs/);
+
+  // And it is on the timeline as its own event, not buried in a failed report.
+  assert.ok(store.taskDetail(task.id).events.some((event) => event.type === "check.regressed"));
+  assert.equal(store.taskDetail(task.id).regressions.length, 1);
+});
+
+test("a regression closes itself when the check goes green again", async (t) => {
+  const { store, task, alice, bob, setSuite } = await regressionFixture(t);
+  await doWork(store, alice, task, "Establish green", { changedFiles: ["src/a.mjs"], checks: SUITE, paths: ["src/a.mjs"] });
+  await setSuite(false);
+  await doWork(store, alice, task, "Break it", { changedFiles: ["src/b.mjs"], paths: ["src/b.mjs"] });
+  const caught = await doWork(store, bob, task, "Trip over it", { changedFiles: ["src/c.mjs"], checks: SUITE, paths: ["src/c.mjs"] });
+  const fixId = caught.result.regressions[0].fixAssignmentId;
+  assert.equal(store.openRegressions(task.id).length, 1);
+
+  // Alice claims the fix and repairs the suite.
+  await setSuite(true);
+  const fixClaim = store.claimNextAssignment(alice.id);
+  assert.equal(fixClaim.id, fixId, "the fix is addressed to Alice, so she gets it first");
+  const fixed = await store.completeAssignment({
+    agentId: alice.id, assignmentId: fixId, claimToken: fixClaim.claimToken,
+    message: "Repaired the helper.", changedFiles: ["src/helper.mjs"], checks: SUITE,
+  });
+  assert.equal(fixed.completed, true);
+  assert.equal(store.openRegressions(task.id).length, 0, "a check going green closes what it broke");
+  assert.equal(store.checkBaseline(task.id)[0].status, "passed");
+});
+
+test("one broken check queues one fix, however many agents trip over it", async (t) => {
+  const { store, task, alice, bob, setSuite } = await regressionFixture(t);
+  await doWork(store, alice, task, "Establish green", { changedFiles: ["src/a.mjs"], checks: SUITE, paths: ["src/a.mjs"] });
+  await setSuite(false);
+  await doWork(store, alice, task, "Break it", { changedFiles: ["src/b.mjs"], paths: ["src/b.mjs"] });
+
+  const firstCatch = await doWork(store, bob, task, "First to notice", { changedFiles: ["src/c.mjs"], checks: SUITE, paths: ["src/c.mjs"] });
+  assert.equal(firstCatch.result.regressions.length, 1);
+  const fixId = firstCatch.result.regressions[0].fixAssignmentId;
+  assert.ok(fixId);
+
+  // Bob's report was refused, so he still holds that claim. Report it again — the suite still fails,
+  // but the baseline already records the failure, so this is the same breakage rather than a new one.
+  const second = await store.completeAssignment({
+    agentId: bob.id, assignmentId: firstCatch.claim.id, claimToken: firstCatch.claim.claimToken,
+    message: "Trying again.", changedFiles: ["src/c.mjs"], checks: SUITE,
+  });
+  assert.equal(second.completed, false);
+  assert.equal(second.regressions ?? undefined, undefined, "a check that was already failing does not regress twice");
+  const fixAssignments = store.taskDetail(task.id).assignments.filter((item) => /regression/i.test(item.title));
+  assert.equal(fixAssignments.length, 1, "and the board never accumulates duplicate fix assignments");
+});
+
+test("ambiguous attribution says so instead of blaming the first name it finds", async (t) => {
+  const { store, task, alice, bob, setSuite } = await regressionFixture(t);
+  await doWork(store, alice, task, "Establish green", { changedFiles: ["src/a.mjs"], checks: SUITE, paths: ["src/a.mjs"] });
+  await setSuite(false);
+  // Two writers land between the last green run and the failure.
+  await doWork(store, alice, task, "Alice changes things", { changedFiles: ["src/one.mjs"], paths: ["src/one.mjs"] });
+  await doWork(store, bob, task, "Bob changes things", { changedFiles: ["src/two.mjs"], paths: ["src/two.mjs"] });
+
+  const caught = await doWork(store, alice, task, "Run the suite", { changedFiles: ["src/three.mjs"], checks: SUITE, paths: ["src/three.mjs"] });
+  const regression = caught.result.regressions[0];
+  assert.equal(regression.attribution, "ambiguous");
+  assert.equal(regression.suspects.length, 2);
+  const fix = store.taskDetail(task.id).assignments.find((item) => item.id === regression.fixAssignmentId);
+  assert.equal(fix.target_agent_name, null, "with two candidates it is not addressed to either of them");
+  assert.match(fix.description, /starting point, not a verdict/);
+});
+
+test("an asserted check can neither set a baseline nor manufacture a regression", async (t) => {
+  const { store, task, alice, bob, setSuite } = await regressionFixture(t);
+  // A plain string check is the agent's word, never executed.
+  await doWork(store, alice, task, "Claim it passes", { changedFiles: ["src/a.mjs"], checks: ["the suite passes, trust me"], paths: ["src/a.mjs"] });
+  assert.equal(store.checkBaseline(task.id).length, 0, "an assertion establishes nothing");
+
+  await setSuite(false);
+  const caught = await doWork(store, bob, task, "Actually run it", { changedFiles: ["src/b.mjs"], checks: SUITE, paths: ["src/b.mjs"] });
+  assert.equal(caught.result.completed, false);
+  assert.equal(caught.result.regressions ?? undefined, undefined,
+    "with no verified baseline there is nothing to have regressed from — it is a plain failure");
+  assert.equal(store.openRegressions(task.id).length, 0);
+
+  // Now establish a real baseline, and confirm an assertion cannot quietly repair it either.
+  await setSuite(true);
+  await doWork(store, alice, task, "Really green", { changedFiles: ["src/c.mjs"], checks: SUITE, paths: ["src/c.mjs"] });
+  assert.equal(store.checkBaseline(task.id)[0].status, "passed");
+  await setSuite(false);
+  await doWork(store, alice, task, "Break and assert", { changedFiles: ["src/d.mjs"], checks: ["still fine, honest"], paths: ["src/d.mjs"] });
+  assert.equal(store.checkBaseline(task.id)[0].status, "passed", "the assertion did not touch the baseline");
+});
+
+// --- T1.3: checks a project declares for itself ---------------------------------------------------
+
 test("a project with no package.json can still declare and run real checks", async (t) => {
   // A research project: Python tooling, no Node package anywhere. Before this it could report checks
   // but never have any of them verified, so every claim stayed agent-asserted forever.
@@ -760,3 +891,82 @@ test("a locally installed tool is resolved to its real entry point instead of an
 
 // --- T2.4 / T2.5: independence and reliability ----------------------------------------------------
 
+test("where verification is enabled, an approval must rest on something DevTeam actually ran", async (t) => {
+  const { store, task, agent } = await checksFixture(t);
+  const claim = claimWork(store, agent, task, "Do it");
+  // Reported with an assertion only: nothing was executed.
+  await store.completeAssignment({
+    agentId: agent.id, assignmentId: claim.id, claimToken: claim.claimToken,
+    message: "Done.", checks: ["I ran the tests myself, they pass"],
+  });
+  const review = store.createAssignment({ taskId: task.id, title: "Review it", description: "Read it.", role: "reviewer" });
+  const reviewClaim = store.claimNextAssignment(agent.id);
+  assert.equal(reviewClaim.id, review.id);
+  await store.completeAssignment({ agentId: agent.id, assignmentId: review.id, claimToken: reviewClaim.claimToken, message: "Reviewed." });
+
+  assert.throws(() => store.approveTask({ agentId: agent.id, taskId: task.id, summary: "Looks good." }),
+    /passed one/i, "an assertion cannot carry an approval in a project that runs real checks");
+
+  // Run a real check, and the approval becomes available.
+  const fix = store.createAssignment({ taskId: task.id, title: "Actually run it", description: "Run the suite.", role: "implementer" });
+  const fixClaim = store.claimNextAssignment(agent.id);
+  await store.completeAssignment({
+    agentId: agent.id, assignmentId: fix.id, claimToken: fixClaim.claimToken,
+    message: "Ran it.", changedFiles: ["src/thing.mjs"], checks: [{ label: "suite", command: "test" }],
+  });
+  const secondReview = store.createAssignment({ taskId: task.id, title: "Review again", description: "Read it.", role: "reviewer" });
+  const secondClaim = store.claimNextAssignment(agent.id);
+  await store.completeAssignment({ agentId: agent.id, assignmentId: secondReview.id, claimToken: secondClaim.claimToken, message: "Reviewed." });
+  const approved = store.approveTask({ agentId: agent.id, taskId: task.id, summary: "Verified and good." });
+  assert.equal(approved.selfReviewed, true, "a solo run still finishes, and is still labeled honestly");
+
+  const approvals = store.taskDetail(task.id).approvals;
+  assert.equal(approvals[0].independent, 0,
+    "the approver authored the current version, so the approval is recorded as not independent");
+  assert.equal(approvals[0].verified_evidence, 1);
+});
+
+test("the team keeps an honest record of who overclaims, who reworks, and who catches breakage", async (t) => {
+  const { store, task, alice, bob, setSuite } = await regressionFixture(t);
+
+  // Alice establishes green, then breaks it without running anything.
+  await doWork(store, alice, task, "Establish green", { changedFiles: ["src/a.mjs"], checks: SUITE, paths: ["src/a.mjs"] });
+  await setSuite(false);
+  await doWork(store, alice, task, "Break it", { changedFiles: ["src/b.mjs"], paths: ["src/b.mjs"] });
+  // Bob runs the suite and trips over it.
+  await doWork(store, bob, task, "Trip over it", { changedFiles: ["src/c.mjs"], checks: SUITE, paths: ["src/c.mjs"] });
+
+  const aliceRecord = store.agentReliability("Alice");
+  const bobRecord = store.agentReliability("Bob");
+
+  assert.equal(aliceRecord.completed, 3, "the planner report plus two pieces of work");
+  assert.equal(aliceRecord.regressionsCaused, 1, "and she is the sole suspect for the breakage");
+  assert.equal(aliceRecord.refusedByChecks, 0);
+
+  assert.equal(bobRecord.refusedByChecks, 1, "Bob's report was refused because a check failed");
+  assert.equal(bobRecord.regressionsCaused, 0, "but he did not cause it");
+  assert.equal(bobRecord.regressionsCaught, 1, "he found it, and that counts for him rather than against");
+  assert.ok(bobRecord.cleanReportRate < 1);
+
+  // A name nobody has heard of is treated as trustworthy rather than punished for being new.
+  const newcomer = store.agentReliability("Someone New");
+  assert.equal(newcomer.sample, 0);
+  assert.equal(newcomer.cleanReportRate, 1);
+
+  assert.ok(store.teamReliability().some((entry) => entry.agentName === "Alice"));
+  assert.equal(store.agentReliability("  "), null);
+});
+
+test("an ambiguous regression is not charged to anyone's record", async (t) => {
+  const { store, task, alice, bob, setSuite } = await regressionFixture(t);
+  await doWork(store, alice, task, "Establish green", { changedFiles: ["src/a.mjs"], checks: SUITE, paths: ["src/a.mjs"] });
+  await setSuite(false);
+  await doWork(store, alice, task, "Alice changes things", { changedFiles: ["src/one.mjs"], paths: ["src/one.mjs"] });
+  await doWork(store, bob, task, "Bob changes things", { changedFiles: ["src/two.mjs"], paths: ["src/two.mjs"] });
+  await doWork(store, alice, task, "Run the suite", { changedFiles: ["src/three.mjs"], checks: SUITE, paths: ["src/three.mjs"] });
+
+  assert.equal(store.openRegressions(task.id).length, 1);
+  assert.equal(store.agentReliability("Alice").regressionsCaused, 0,
+    "a shared window is a guess, and a guess must not follow someone around as a number");
+  assert.equal(store.agentReliability("Bob").regressionsCaused, 0);
+});

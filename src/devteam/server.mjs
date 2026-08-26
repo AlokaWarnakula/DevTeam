@@ -454,6 +454,33 @@ export async function startDevTeamServer({
       if (error && !res.headersSent) res.status(error.statusCode || 404).json({ error: "Attachment not found." });
     });
   });
+  // The human can send work back for changes too, from the dashboard, without needing a review
+  // assignment of its own — the control plane is trusted, exactly as it is for block and accept.
+  app.post("/api/tasks/:taskId/assignments/:assignmentId/request-changes", (req, res) => {
+    requireFields(req.body, ["summary"]);
+    res.json(store.requestChanges({
+      taskId: req.params.taskId,
+      assignmentId: req.params.assignmentId,
+      summary: req.body.summary,
+      findings: Array.isArray(req.body.findings) ? req.body.findings : [],
+    }));
+  });
+  // T2.6 — mid-flight steering. All three are control-plane only: an agent re-prioritising its own
+  // queue, cancelling a teammate, or lifting a budget would defeat the point of the human having them.
+  app.post("/api/tasks/:taskId/assignments/:assignmentId/priority", (req, res) => {
+    requireFields(req.body, ["priority"]);
+    res.json(store.prioritizeAssignment({ taskId: req.params.taskId, assignmentId: req.params.assignmentId, priority: req.body.priority }));
+  });
+  app.post("/api/tasks/:taskId/assignments/:assignmentId/cancel", (req, res) => {
+    res.json(store.requestCancel({ taskId: req.params.taskId, assignmentId: req.params.assignmentId, reason: req.body?.reason }));
+  });
+  app.post("/api/tasks/:taskId/budget", (req, res) => {
+    res.json(store.setTaskBudget({
+      taskId: req.params.taskId,
+      wallClockMinutes: req.body?.wallClockMinutes ?? null,
+      spendUsd: req.body?.spendUsd ?? null,
+    }));
+  });
   app.post("/api/tasks/:taskId/block", (req, res) => {
     requireFields(req.body, ["reason"]);
     res.json(store.blockTask({ taskId: req.params.taskId, reason: req.body.reason }));

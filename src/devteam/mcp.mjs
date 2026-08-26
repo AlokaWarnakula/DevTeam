@@ -50,11 +50,17 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
   };
   const withInbox = (agentId, result) => {
     const { pendingMessages, pendingProposals } = takeInbox(agentId);
-    if (!pendingMessages.length && !pendingProposals.length) return result;
+    // Human steering rides along on whatever call the agent just made, for the same reason messages
+    // do: an agent deep in a long edit is not sitting in devteam_wait, and "stop, this is no longer
+    // worth doing" is worthless if it only arrives when the agent next goes idle.
+    let steering = null;
+    try { steering = store.steeringFor(agentId); } catch { steering = null; }
+    if (!pendingMessages.length && !pendingProposals.length && !steering) return result;
     return {
       ...result,
       ...(pendingMessages.length ? { pendingMessages } : {}),
       ...(pendingProposals.length ? { pendingProposals } : {}),
+      ...(steering ? { steering } : {}),
     };
   };
 
@@ -122,6 +128,12 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
   }, safe(async ({ agentId, timeoutSeconds }) => {
     requireIdentity(agentId);
     store.heartbeat(agentId, "waiting");
+    // A stop request or a blown budget outranks waiting for more work: an agent should not sit in a
+    // long poll for 45 seconds after the human has asked it to stop.
+    const steering = store.steeringFor(agentId);
+    if (steering) {
+      return { status: "steering", keepWaiting: false, steering, next: steering.next || "Act on this before waiting again." };
+    }
     const initialRoomStatus = store.roomStatusForAgent(agentId);
     if (initialRoomStatus.joinedTaskIds.length === 0 && initialRoomStatus.activeTasks.length > 0) {
       return {
@@ -522,6 +534,28 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
     return withInbox(agentId, store.whyNotClaimable(assignmentId, agentId));
   }));
 
+  server.registerTool("devteam_split", {
+    title: "Divide work that turned out too big",
+    description: "Claimed something and found it is three days of work, or two unrelated jobs wearing one title? Split it into pieces instead of grinding through it or reporting blocked. You keep your claim and your write lease throughout — splitting never costs you the work you are holding. Each piece inherits the parent's write scope (unless it declares its own), its dependencies and its targeting, and is re-assessed on its own merits so a runtime gate does not treat a small piece as if it were the whole. Where two pieces declare overlapping write paths, DevTeam orders them for you rather than letting them contend for a lease. Use this when the shape of the work is wrong, not when it is merely hard.",
+    inputSchema: {
+      agentId: z.string().uuid(),
+      assignmentId: z.string().uuid().describe("The assignment you currently hold"),
+      claimToken: z.string().max(200).optional().describe("Your claimToken, so a stale session cannot reshape work whose lease has moved"),
+      keepParent: z.boolean().default(false).describe("Keep holding the original — use when you are part-way through one piece and want to hand off the rest. Default closes it, since its work now lives in the pieces."),
+      parts: z.array(z.object({
+        title: z.string().min(1).max(160),
+        description: z.string().min(1).max(12000),
+        role: z.string().min(1).max(40).optional().describe("Defaults to the parent's role; see devteam_roles"),
+        requiresWrite: z.boolean().optional().describe("Defaults to the parent's setting"),
+        paths: z.array(z.string().max(500)).max(50).optional().describe("This piece's own write scope. Omit to inherit the parent's — never omit it expecting a narrower lease, you will get the parent's."),
+        dependsOnPart: z.number().int().min(0).max(11).optional().describe("Index of an earlier part in this list that must finish first"),
+      })).min(2).max(12).describe("At least two pieces. If the work is simply mis-scoped rather than too big, report it blocked instead."),
+    },
+  }, safe(async (args) => {
+    requireIdentity(args.agentId);
+    return withInbox(args.agentId, store.splitAssignment(args));
+  }));
+
   server.registerTool("devteam_approve", {
     title: "Approve current task version",
     description: "Approve only after completing an independent read-only reviewer or tester assignment on the current version. Consensus accepts the task and keeps its agents assembled briefly for a same-conversation follow-up instead of disconnecting them.",
@@ -533,6 +567,39 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
   }, safe(async (args) => {
     requireIdentity(args.agentId);
     return withInbox(args.agentId, store.approveTask(args));
+  }));
+
+  server.registerTool("devteam_reliability", {
+    title: "What the team has learned about its members",
+    description: "Rolling per-agent record: work completed, reports refused because a check DevTeam ran failed, work sent back for changes and how many rounds, regressions caused (only where a single agent is the sole suspect) and regressions caught. Use it to decide who to route work to, or to check your own record before claiming something critical. It is not a blame ledger — catching a regression counts for you, and an agent with little history is treated as trustworthy rather than punished for being new.",
+    inputSchema: {
+      agentId: z.string().uuid(),
+      taskId: z.string().uuid(),
+      agentName: z.string().max(80).optional().describe("One teammate by name; omit for the whole room"),
+      windowDays: z.number().int().min(1).max(365).default(30),
+    },
+  }, safe(async ({ agentId, taskId, agentName, windowDays }) => {
+    requireIdentity(agentId);
+    store.assertMembership(agentId, taskId);
+    return withInbox(agentId, agentName
+      ? { agent: store.agentReliability(agentName, { windowDays }) }
+      : { team: store.teamReliability({ windowDays }) });
+  }));
+
+  server.registerTool("devteam_regressions", {
+    title: "What is currently broken in this task",
+    description: "Checks that used to pass and now fail, with the work that landed since each was last green. Read this before assuming a failing check is your own fault: if a fix assignment is already queued for someone else, chasing it duplicates their work. Regressions close themselves when the check goes green again.",
+    inputSchema: {
+      agentId: z.string().uuid(),
+      taskId: z.string().uuid(),
+    },
+  }, safe(async ({ agentId, taskId }) => {
+    requireIdentity(agentId);
+    store.assertMembership(agentId, taskId);
+    return withInbox(agentId, {
+      regressions: store.openRegressions(taskId),
+      baseline: store.checkBaseline(taskId),
+    });
   }));
 
   server.registerTool("devteam_roles", {
@@ -548,6 +615,27 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
     const task = store.getTask(taskId);
     if (!task) throw new Error("Task not found.");
     return withInbox(agentId, store.roleCatalogue(task.project_id));
+  }));
+
+  server.registerTool("devteam_request_changes", {
+    title: "Send work back to its author for changes",
+    description: "Found problems in work you reviewed? Send that assignment back to whoever wrote it, with your findings attached, instead of approving it anyway or blocking the task. The original assignment is reopened and addressed to its author, keeping its title, checklist, write scope and history; the author is handed your findings when it re-claims. Approvals on the current version are cleared, because the version you were reviewing is no longer settled. This does not stop the task and does not touch anyone else's claim. Requires the same standing as approving: a completed or in-progress read-only reviewer or tester assignment on the current version.",
+    inputSchema: {
+      agentId: z.string().uuid(),
+      taskId: z.string().uuid(),
+      assignmentId: z.string().uuid().describe("The completed assignment that needs changes — the author's work, not your own review assignment"),
+      summary: z.string().min(1).max(4000).describe("One line on why this is going back"),
+      findings: z.array(z.union([
+        z.string().max(2000).describe("One thing that must change"),
+        z.object({
+          detail: z.string().min(1).max(2000).describe("What must change and why"),
+          path: z.string().max(500).optional().describe("The project-relative file it concerns, when it concerns one"),
+        }),
+      ])).max(50).default([]).describe("The specific changes required. The author is handed this list on re-claim, so be concrete."),
+    },
+  }, safe(async (args) => {
+    requireIdentity(args.agentId);
+    return withInbox(args.agentId, store.requestChanges(args));
   }));
 
   server.registerTool("devteam_block", {

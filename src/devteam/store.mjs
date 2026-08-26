@@ -126,6 +126,9 @@ const fromJson = (value, fallback = null) => {
 export class DevTeamStore extends EventEmitter {
   // Per-project role config, cached by the file's mtime (see projectRoles).
   #roleCache = new Map();
+  // Carries the transactional part of splitAssignment out to its caller (see T2.1).
+  #splitOutcome = { inferred: [], keep: false };
+
   constructor(dataDir, { liveness = {}, knowledge = {}, codegraph = {}, checkpoint = {}, checks = {} } = {}) {
     super();
     this.dataDir = path.resolve(dataDir);
@@ -416,6 +419,64 @@ export class DevTeamStore extends EventEmitter {
       );
 
       CREATE INDEX IF NOT EXISTS idx_assignment_checks ON assignment_checks(assignment_id, created_at);
+
+      -- What a reviewer wants changed, attached to the assignment it wants changed. Kept as rows
+      -- rather than prose in an event so the author is handed the list when it re-claims the work,
+      -- the card can show what is outstanding, and a later pass can tell resolved from outstanding.
+      CREATE TABLE IF NOT EXISTS assignment_findings (
+        id TEXT PRIMARY KEY,
+        assignment_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        requested_by_agent_id TEXT NULL,
+        requested_by_name TEXT NOT NULL,
+        task_version INTEGER NOT NULL,
+        detail TEXT NOT NULL,
+        path TEXT NULL,
+        created_at TEXT NOT NULL,
+        resolved_at TEXT NULL,
+        resolved_by_assignment_id TEXT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_assignment_findings ON assignment_findings(assignment_id, created_at);
+
+      -- What each verified check last did, per task. Keyed by the *command* rather than the label,
+      -- because a label is agent-written prose and the argv is the pinned allowlist entry — two
+      -- agents describing the same suite differently must still compare against the same baseline.
+      -- Only verified results are ever recorded here: an agent's assertion proves nothing and must
+      -- not be able to establish, or quietly repair, a baseline.
+      CREATE TABLE IF NOT EXISTS check_baselines (
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        command_key TEXT NOT NULL,
+        status TEXT NOT NULL,
+        label TEXT,
+        assignment_id TEXT,
+        task_version INTEGER NOT NULL DEFAULT 1,
+        last_passed_at TEXT,
+        last_passed_assignment_id TEXT,
+        -- The event id the timeline had reached when this check was last green. Attribution walks
+        -- forward from here by *id* rather than by timestamp: several events routinely share a
+        -- millisecond, and an ISO comparison then silently drops a suspect, turning an ambiguous
+        -- attribution into a confident and wrong one.
+        last_passed_event_id INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (task_id, command_key)
+      );
+
+      -- A check that used to pass and now does not, with who is suspected and what was done about it.
+      CREATE TABLE IF NOT EXISTS check_regressions (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        command_key TEXT NOT NULL,
+        label TEXT,
+        detected_by_assignment_id TEXT,
+        last_passed_assignment_id TEXT,
+        suspects TEXT NOT NULL,
+        fix_assignment_id TEXT,
+        created_at TEXT NOT NULL,
+        resolved_at TEXT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_check_regressions_task ON check_regressions(task_id, created_at DESC);
+
       CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project_id, status);
       CREATE INDEX IF NOT EXISTS idx_assignments_queue ON assignments(status, target_agent_name, created_at);
       CREATE INDEX IF NOT EXISTS idx_assignments_task_status ON assignments(task_id, status);
@@ -456,11 +517,24 @@ export class DevTeamStore extends EventEmitter {
       ["projects", "check_sandbox", "INTEGER NOT NULL DEFAULT 0"],       // confine node checks to the project root
       ["assignment_checks", "superseded_at", "TEXT"],           // only the latest report attempt describes the work as it stands                                   // 'human' or 'agent', so authorship never depends on a nullable FK
       ["assignments", "verifying_at", "TEXT"],                  // set while DevTeam is running this report's checks off the event loop
+      ["assignments", "rework_count", "INTEGER NOT NULL DEFAULT 0"], // how many times a reviewer has sent this work back
+      ["assignments", "rework_requested_at", "TEXT"],           // set while it is queued *as rework*; cleared when reported again
+      ["assignments", "rework_summary", "TEXT"],                // why it went back, handed to the author on re-claim
       // Role behaviour, resolved from the project's role config when the assignment is created. The
       // scheduler keys off these rather than off role *names*, so a project can call its reviewing
       // role `fact-checker` without a single name reaching any SQL. See roles.mjs.
       ["assignments", "verifies", "INTEGER NOT NULL DEFAULT 0"],
       ["assignments", "plans", "INTEGER NOT NULL DEFAULT 0"],
+      // T2.4: whether this approval came from someone other than the version's author, recorded on
+      // the row rather than recomputed, so the record cannot drift as agents come and go.
+      ["approvals", "independent", "INTEGER NOT NULL DEFAULT 1"],
+      ["approvals", "verified_evidence", "INTEGER NOT NULL DEFAULT 0"],
+      // T2.6: human steering. Priority orders the queue; the cancel flag is read cooperatively by
+      // the holder; the budget is a wall-clock cap surfaced to the room.
+      ["assignments", "priority", "INTEGER NOT NULL DEFAULT 0"],
+      ["assignments", "cancel_requested_at", "TEXT"],
+      ["assignments", "cancel_reason", "TEXT"],
+      ["tasks", "budget_minutes", "INTEGER"],
     ]) {
       try { this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`); } catch { /* already present */ }
     }
@@ -2880,7 +2954,12 @@ export class DevTeamStore extends EventEmitter {
         JOIN tasks t ON t.id = a.task_id
         JOIN projects p ON p.id = t.project_id
         WHERE ${predicates.map((predicate) => predicate.sql).join("\n          AND ")}
-        ORDER BY CASE WHEN a.target_agent_name IS NOT NULL THEN 0 ELSE 1 END, a.created_at ASC
+        -- Targeting still wins: work addressed to this agent by name is meant for it. Priority then
+        -- orders the rest, and creation time breaks the remaining ties exactly as before. Priority
+        -- deliberately sits *inside* the candidate ordering rather than around the predicates, so it
+        -- reorders what is claimable and can never make unclaimable work claimable — a human wanting
+        -- something sooner is not a reason to skip a dependency, a lease or the review gate.
+        ORDER BY CASE WHEN a.target_agent_name IS NOT NULL THEN 0 ELSE 1 END, a.priority DESC, a.created_at ASC
         LIMIT ? OFFSET ?
       `).all(...predicates.flatMap((predicate) => predicate.params), CANDIDATE_PAGE_SIZE, offset);
       const heldLeases = this.#heldWriteLeases();
@@ -2947,7 +3026,26 @@ export class DevTeamStore extends EventEmitter {
           claimGeneration,
         });
         const dependencies = this.#dependenciesFor(candidate.id);
-        return { ...candidate, agent_id: agentId, status: "claimed", claimed_at: stamp, checklist: this.#checklistFor(candidate.id), writeScope, dependsOn: dependencies.map((item) => item.id), blockedBy: [], claimToken, claimGeneration };
+        // Work that was sent back arrives saying so, with the reviewer's reason and findings
+        // attached. Without this the author would re-claim an assignment whose title and description
+        // describe the *original* task and have to go hunting through the timeline for what was
+        // actually wrong with it — which is most of what made blunt blocking feel like a dead end.
+        return {
+          ...candidate,
+          agent_id: agentId, status: "claimed", claimed_at: stamp,
+          checklist: this.#checklistFor(candidate.id), writeScope,
+          dependsOn: dependencies.map((item) => item.id), blockedBy: [],
+          claimToken, claimGeneration,
+          ...(candidate.rework_requested_at ? {
+            rework: {
+              count: Number(candidate.rework_count || 0),
+              requestedAt: candidate.rework_requested_at,
+              summary: candidate.rework_summary || null,
+              findings: this.#findingsFor(candidate.id),
+              next: "This work was sent back for changes. Address the summary and every finding below, then report again — reporting without addressing them will simply be sent back.",
+            },
+          } : {}),
+        };
       }
       if (firstRuntimeGate) return firstRuntimeGate;
       this.db.prepare("UPDATE agents SET status = 'waiting', last_seen = ? WHERE id = ?").run(now(), agentId);
@@ -3352,6 +3450,423 @@ export class DevTeamStore extends EventEmitter {
     return records;
   }
 
+  // T2.3 — regression awareness.
+  //
+  // Verified checks always produced the raw material (exit codes over time) but nothing compared two
+  // runs, so nothing in DevTeam ever noticed that agent B broke what agent A delivered. A team that
+  // cannot see that cannot cover for each other; it is just several agents in one room.
+  //
+  // The comparison is per task, per *command*, and only over verified results. A label is prose an
+  // agent chose; the argv is the allowlist entry DevTeam actually ran, so two agents describing the
+  // same suite differently still compare against the same baseline, and an assertion can neither
+  // establish a baseline nor quietly repair one.
+  #checkCommandKey(record) {
+    return Array.isArray(record.command) ? json(record.command) : null;
+  }
+
+  // Who plausibly broke it. Not "the agent that reported the failure" — that agent is usually the one
+  // who *found* it — but whoever changed files between the last time this check passed and now.
+  // Deliberately a list: with more than one writer in that window, naming one would be a guess
+  // dressed up as a finding, so the honest answer is the set and its size.
+  #regressionSuspects(taskId, sinceEventId, excludeAssignmentIds) {
+    const excluded = new Set([excludeAssignmentIds].flat().filter(Boolean));
+    const rows = this.db.prepare(`
+      SELECT e.metadata, e.agent_id, e.author_name, e.created_at
+      FROM events e
+      WHERE e.task_id = ? AND e.type = 'assignment.completed' AND e.id > ?
+      ORDER BY e.id ASC
+    `).all(taskId, Number(sinceEventId) || 0);
+    const suspects = new Map();
+    for (const row of rows) {
+      const metadata = fromJson(row.metadata, {});
+      const changed = Array.isArray(metadata.changedFiles) ? metadata.changedFiles : [];
+      if (!changed.length) continue;                          // a read-only report changed nothing
+      // Neither the report that surfaced the failure nor the one that last made this check green.
+      // The mark is taken before a passing report writes its own completion event, so without the
+      // second exclusion the assignment that fixed a check becomes a suspect for breaking it.
+      if (excluded.has(metadata.assignmentId)) continue;
+      const assignment = this.db.prepare("SELECT title FROM assignments WHERE id = ?").get(metadata.assignmentId);
+      if (!assignment) continue;
+      suspects.set(metadata.assignmentId, {
+        assignmentId: metadata.assignmentId,
+        title: assignment.title,
+        author: row.author_name || null,
+        authorAgentId: row.agent_id || null,
+        changedFiles: changed.slice(0, 20),
+        completedAt: row.created_at,
+      });
+    }
+    return [...suspects.values()];
+  }
+
+  // Compare this report's verified checks against the task's baseline, record the new baseline, and
+  // return whatever regressed. Called on both report paths — a refused report is still evidence, and
+  // is in fact the path on which a regression is most often first seen.
+  #recordCheckBaselines({ taskId, assignmentId, records, version, stamp }) {
+    const regressions = [];
+    for (const record of records) {
+      if (!record.verified) continue;                          // assertions never touch a baseline
+      if (!["passed", "failed"].includes(record.status)) continue; // 'unavailable' is not a result
+      const commandKey = this.#checkCommandKey(record);
+      if (!commandKey) continue;
+      const previous = this.db.prepare("SELECT * FROM check_baselines WHERE task_id = ? AND command_key = ?").get(taskId, commandKey);
+      const regressed = previous?.status === "passed" && record.status === "failed";
+      if (regressed) {
+        const suspects = this.#regressionSuspects(taskId, previous.last_passed_event_id,
+          [assignmentId, previous.last_passed_assignment_id]);
+        regressions.push({
+          id: randomUUID(),
+          commandKey,
+          label: record.label,
+          command: record.command,
+          lastPassedAt: previous.last_passed_at || previous.updated_at,
+          lastPassedAssignmentId: previous.last_passed_assignment_id || previous.assignment_id || null,
+          suspects,
+        });
+      }
+      // Where the timeline stands right now. Captured before this report writes its own completion
+      // event, so the mark never includes the report that set it.
+      const timelineMark = Number(this.db.prepare("SELECT COALESCE(MAX(id), 0) AS id FROM events WHERE task_id = ?").get(taskId).id) || 0;
+      this.db.prepare(`
+        INSERT INTO check_baselines (task_id, command_key, status, label, assignment_id, task_version, last_passed_at, last_passed_assignment_id, last_passed_event_id, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(task_id, command_key) DO UPDATE SET
+          status = excluded.status, label = excluded.label, assignment_id = excluded.assignment_id,
+          task_version = excluded.task_version, updated_at = excluded.updated_at,
+          -- Only a pass moves the "last green" mark. Keeping it pinned is what lets the *next*
+          -- failure still name the whole window of changes since things actually worked.
+          last_passed_at = CASE WHEN excluded.status = 'passed' THEN excluded.updated_at ELSE check_baselines.last_passed_at END,
+          last_passed_assignment_id = CASE WHEN excluded.status = 'passed' THEN excluded.assignment_id ELSE check_baselines.last_passed_assignment_id END,
+          last_passed_event_id = CASE WHEN excluded.status = 'passed' THEN excluded.last_passed_event_id ELSE check_baselines.last_passed_event_id END
+      `).run(taskId, commandKey, record.status, record.label, assignmentId, Number(version) || 1,
+        record.status === "passed" ? stamp : (previous?.last_passed_at || null),
+        record.status === "passed" ? assignmentId : (previous?.last_passed_assignment_id || null),
+        record.status === "passed" ? timelineMark : (previous?.last_passed_event_id || 0),
+        stamp);
+      // A check going green again closes whatever it broke, so the board does not accumulate
+      // regressions that were quietly fixed by ordinary work.
+      if (record.status === "passed") {
+        this.db.prepare("UPDATE check_regressions SET resolved_at = ? WHERE task_id = ? AND command_key = ? AND resolved_at IS NULL")
+          .run(stamp, taskId, commandKey);
+      }
+    }
+    return regressions;
+  }
+
+  // Record the regressions and, where the breakage is attributable to work *other* than the report
+  // that surfaced it, route a fix back to whoever did it. This is the mechanism that turns a group of
+  // agents into a team that covers for each other: the agent that tripped over the breakage is told
+  // it is not theirs to chase, and the agent that caused it is handed the work.
+  #openRegressions({ taskId, assignmentId, regressions, stamp, projectId }) {
+    const opened = [];
+    for (const regression of regressions) {
+      // One open fix per broken check. Without this, every subsequent report that runs the same
+      // failing suite would queue another near-identical assignment.
+      const existing = this.db.prepare(`
+        SELECT fix_assignment_id FROM check_regressions
+        WHERE task_id = ? AND command_key = ? AND resolved_at IS NULL AND fix_assignment_id IS NOT NULL LIMIT 1
+      `).get(taskId, regression.commandKey);
+      let fixAssignmentId = null;
+      const soleSuspect = regression.suspects.length === 1 ? regression.suspects[0] : null;
+      if (!existing && regression.suspects.length) {
+        fixAssignmentId = randomUUID();
+        const behaviour = this.roleBehaviour(projectId, "implementer");
+        const suspectSummary = soleSuspect
+          ? `“${soleSuspect.title}”${soleSuspect.author ? ` (${soleSuspect.author})` : ""}`
+          : `${regression.suspects.length} pieces of work`;
+        this.db.prepare(`
+          INSERT INTO assignments (id, task_id, title, description, role, requires_write, target_agent_name, status, created_at, verifies, plans)
+          VALUES (?, ?, ?, ?, ?, 1, ?, 'queued', ?, ?, ?)
+        `).run(
+          fixAssignmentId, taskId,
+          `Fix the regression in “${regression.label}”`,
+          [
+            `The check “${regression.label}” passed before and now fails.`,
+            `It was last green before ${suspectSummary} landed.`,
+            regression.suspects.length === 1
+              ? `Changed files: ${soleSuspect.changedFiles.join(", ")}.`
+              : `Changed files across that window: ${[...new Set(regression.suspects.flatMap((suspect) => suspect.changedFiles))].slice(0, 20).join(", ")}.`,
+            regression.suspects.length > 1
+              ? "More than one piece of work landed in that window, so this attribution is a starting point, not a verdict — check before assuming."
+              : "",
+            "Restore the check to passing without reverting unrelated work.",
+          ].filter(Boolean).join(" "),
+          "implementer", soleSuspect?.author || null, stamp,
+          behaviour.verifies ? 1 : 0, behaviour.plans ? 1 : 0,
+        );
+        // Scope the fix to the files the suspects actually touched. Left unscoped it would take a
+        // whole-project lease and block every unrelated writer in the room — a regression fix that
+        // stops the rest of the team is a worse outcome than the regression.
+        const scope = [...new Set(regression.suspects.flatMap((suspect) => suspect.changedFiles))].slice(0, 50);
+        if (scope.length) {
+          this.db.prepare("INSERT OR REPLACE INTO assignment_write_scopes (assignment_id, paths) VALUES (?, ?)")
+            .run(fixAssignmentId, json(scope));
+        }
+        this.#event(taskId, null, "assignment.created", `Fix the regression in “${regression.label}”`, {
+          assignmentId: fixAssignmentId, role: "implementer", requiresWrite: true,
+          targetAgentName: soleSuspect?.author || null, regressionOf: regression.commandKey, writePaths: scope,
+        });
+      }
+      this.db.prepare(`
+        INSERT INTO check_regressions (id, task_id, command_key, label, detected_by_assignment_id, last_passed_assignment_id, suspects, fix_assignment_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(regression.id, taskId, regression.commandKey, regression.label, assignmentId,
+        regression.lastPassedAssignmentId, json(regression.suspects), fixAssignmentId, stamp);
+      this.#event(taskId, null, "check.regressed",
+        `“${regression.label}” passed before and now fails${soleSuspect ? `, first failing after “${soleSuspect.title}”` : ""}.`, {
+          label: regression.label,
+          command: regression.command,
+          suspects: regression.suspects.map((suspect) => ({ assignmentId: suspect.assignmentId, title: suspect.title, author: suspect.author })),
+          fixAssignmentId,
+          detectedByAssignmentId: assignmentId,
+        });
+      opened.push({
+        id: regression.id,
+        label: regression.label,
+        command: regression.command,
+        lastPassedAt: regression.lastPassedAt,
+        suspects: regression.suspects.map((suspect) => ({ assignmentId: suspect.assignmentId, title: suspect.title, author: suspect.author, changedFiles: suspect.changedFiles })),
+        fixAssignmentId,
+        attribution: regression.suspects.length === 1 ? "single" : (regression.suspects.length ? "ambiguous" : "unattributed"),
+      });
+    }
+    return opened;
+  }
+
+  // T4.3 — replay a task as a narrative.
+  //
+  // The events were always there and always rich, but reading them meant reading a table. When a task
+  // has gone wrong, the question is "where did this turn", and answering it needs the story in order:
+  // what was assigned, who took it, what they reported, what DevTeam actually ran, who reviewed it,
+  // what went back, what regressed.
+  //
+  // Read-only and derived entirely from the record — it invents nothing and, in particular, does not
+  // re-grade anything. A check that was agent-asserted at the time still reads as asserted here.
+  prioritizeAssignment({ taskId, assignmentId, priority }) {
+    const assignment = this.db.prepare("SELECT * FROM assignments WHERE id = ? AND task_id = ?").get(assignmentId, taskId);
+    if (!assignment) throw new Error("Assignment not found in this task.");
+    const value = Math.max(-100, Math.min(100, Math.trunc(Number(priority) || 0)));
+    this.db.prepare("UPDATE assignments SET priority = ? WHERE id = ?").run(value, assignmentId);
+    this.#event(taskId, null, "assignment.prioritized",
+      `Priority for “${assignment.title}” set to ${value}.`, { assignmentId, priority: value });
+    this.#changed("assignment.prioritized", taskId);
+    return { assignmentId, taskId, priority: value };
+  }
+
+  // Ask a running agent to stop. Cooperative on purpose: killing a writer mid-edit is how a working
+  // tree gets left half-written, and DevTeam has no way to know where in its work an agent is. The
+  // flag is returned on the agent's next heartbeat or tool call, and the agent reports what it has.
+  // If it never comes back, the ordinary liveness machinery handles it exactly as before.
+  requestCancel({ taskId, assignmentId, reason = "" }) {
+    const assignment = this.db.prepare("SELECT * FROM assignments WHERE id = ? AND task_id = ?").get(assignmentId, taskId);
+    if (!assignment) throw new Error("Assignment not found in this task.");
+    if (assignment.status !== "claimed") throw new Error("Only work someone is actually doing can be cancelled; queued work can be deleted or re-prioritised instead.");
+    const stamp = now();
+    const cleanReason = String(reason || "").trim().slice(0, 1000) || "The human asked for this work to stop.";
+    this.db.prepare("UPDATE assignments SET cancel_requested_at = ?, cancel_reason = ? WHERE id = ?").run(stamp, cleanReason, assignmentId);
+    this.#event(taskId, assignment.agent_id, "assignment.cancel_requested",
+      `Stop requested for “${assignment.title}”: ${cleanReason}`, { assignmentId, reason: cleanReason });
+    this.#changed("assignment.cancel_requested", taskId);
+    return { assignmentId, taskId, cancelRequested: true, reason: cleanReason };
+  }
+
+  // What a claimed assignment's holder should be told on its next call: whether it has been asked to
+  // stop, and whether the task has run past its budget. Returned by heartbeat and by devteam_wait.
+  steeringFor(agentId) {
+    const held = this.db.prepare(`
+      SELECT a.id, a.title, a.task_id, a.cancel_requested_at, a.cancel_reason
+      FROM assignments a WHERE a.agent_id = ? AND a.status = 'claimed' LIMIT 1
+    `).get(agentId);
+    if (!held) return null;
+    const budget = this.taskBudgetState(held.task_id);
+    if (!held.cancel_requested_at && !budget?.exceeded) return null;
+    return {
+      assignmentId: held.id,
+      title: held.title,
+      taskId: held.task_id,
+      ...(held.cancel_requested_at ? {
+        cancelRequested: true,
+        reason: held.cancel_reason,
+        next: "Stop as soon as you can do so safely. Report what you have with devteam_report — status=blocked if it is incomplete — rather than abandoning the claim.",
+      } : {}),
+      ...(budget?.exceeded ? { budget } : {}),
+    };
+  }
+
+  // A wall-clock cap on a task, so "this has had enough of my afternoon" is something the room can
+  // enforce rather than something the human has to keep watching. Advisory by design: it surfaces to
+  // agents and on the board and does not itself stop work, because a hard stop mid-write is the same
+  // half-written tree that cooperative cancel exists to avoid.
+  setTaskBudget({ taskId, wallClockMinutes = null, spendUsd = null }) {
+    const task = this.getTask(taskId);
+    if (!task) throw new Error("Task not found.");
+    const minutes = wallClockMinutes == null ? null : Math.max(1, Math.min(10_080, Math.trunc(Number(wallClockMinutes) || 0)));
+    const cents = spendUsd == null ? null : Math.max(1, Math.min(10_000_000, Math.round(Number(spendUsd) * 100)));
+    this.db.prepare("UPDATE tasks SET budget_minutes = ?, budget_usd_cents = ? WHERE id = ?").run(minutes, cents, taskId);
+    const described = [
+      minutes == null ? null : `${minutes} minutes of wall clock`,
+      cents == null ? null : `${(cents / 100).toFixed(2)} of reported spend`,
+    ].filter(Boolean).join(" and ");
+    this.#event(taskId, null, described ? "task.budget_set" : "task.budget_cleared",
+      described ? `Task budget set to ${described}.` : "Task budget cleared.",
+      { budgetMinutes: minutes, budgetUsd: cents == null ? null : cents / 100 });
+    this.#changed("task.budget_set", taskId);
+    return { taskId, budgetMinutes: minutes, budgetUsd: cents == null ? null : cents / 100 };
+  }
+
+  taskBudgetState(taskId) {
+    const task = this.db.prepare("SELECT budget_minutes, budget_usd_cents, created_at, status FROM tasks WHERE id = ?").get(taskId);
+    if (!task?.budget_minutes && !task?.budget_usd_cents) return null;
+    const state = { exceeded: false };
+    if (task.budget_minutes) {
+      const minutes = Number(task.budget_minutes);
+      const usedMinutes = Math.max(0, Math.round((Date.now() - Date.parse(task.created_at)) / 60_000));
+      state.budgetMinutes = minutes;
+      state.usedMinutes = usedMinutes;
+      state.remainingMinutes = Math.max(0, minutes - usedMinutes);
+      if (usedMinutes > minutes) state.exceeded = true;
+    }
+    if (task.budget_usd_cents) {
+      // The spend side is agent-reported by nature, so a task with a spend cap and no agent
+      // reporting usage simply never trips it. Said out loud rather than left to be discovered.
+      const spent = Number(this.db.prepare("SELECT COALESCE(SUM(cost_cents), 0) AS cents FROM assignment_usage WHERE task_id = ?").get(taskId).cents);
+      state.budgetUsd = Number(task.budget_usd_cents) / 100;
+      state.spentUsd = spent / 100;
+      state.remainingUsd = Math.max(0, (Number(task.budget_usd_cents) - spent) / 100);
+      state.spendIsAgentReported = true;
+      if (spent > Number(task.budget_usd_cents)) state.exceeded = true;
+    }
+    if (state.exceeded) {
+      state.next = "This task is past the budget the human set. Finish what you are doing, report it, and do not start anything new without asking.";
+    }
+    return state;
+  }
+
+  // T2.5 — what the team has learned about each of its members.
+  //
+  // Nothing tracked whose work got sent back, who reported checks that failed verification, or whose
+  // changes caused regressions. A team learns who to trust with what; a queue cannot.
+  //
+  // Derived on read from the event log and the tables the earlier items already fill, rather than
+  // maintained as counters. That is the important design call: a counter can drift from the timeline
+  // and then quietly libel an agent, and there is no way to notice. Deriving is slower and always
+  // agrees with the record. Scoped by agent *name*, not session id, because a reliability record
+  // that resets every time a desktop chat reconnects is worthless.
+  agentReliability(agentName, { windowDays = 30 } = {}) {
+    const name = String(agentName || "").trim();
+    if (!name) return null;
+    const since = new Date(Date.now() - Math.max(1, Number(windowDays) || 30) * 86_400_000).toISOString();
+
+    const completed = Number(this.db.prepare(`
+      SELECT COUNT(*) AS count FROM events
+      WHERE type = 'assignment.completed' AND lower(author_name) = lower(?) AND created_at >= ?
+    `).get(name, since).count);
+
+    // Reports DevTeam refused because a command it ran did not pass. This is the honest-overclaim
+    // signal: the agent said done, and the evidence said otherwise.
+    const refusedByChecks = Number(this.db.prepare(`
+      SELECT COUNT(*) AS count FROM events
+      WHERE type = 'assignment.check_failed' AND lower(author_name) = lower(?) AND created_at >= ?
+    `).get(name, since).count);
+
+    // Work of this agent's that a reviewer sent back, and how many rounds it took.
+    const reworked = this.db.prepare(`
+      SELECT a.rework_count AS rounds FROM assignments a
+      WHERE a.rework_count > 0 AND a.id IN (
+        SELECT json_extract(e.metadata, '$.assignmentId') FROM events e
+        WHERE e.type = 'assignment.completed' AND lower(e.author_name) = lower(?) AND e.created_at >= ?
+      )
+    `).all(name, since).map((row) => Number(row.rounds) || 0);
+    const reworkRounds = reworked.reduce((total, rounds) => total + rounds, 0);
+
+    // Regressions this agent's work is the sole suspect for. Ambiguous ones are deliberately not
+    // counted against anyone: attributing a shared window to one name would be a guess, and a guess
+    // that follows someone around as a reliability number is worse than no number.
+    const regressionsCaused = this.db.prepare(`
+      SELECT suspects FROM check_regressions WHERE created_at >= ?
+    `).all(since).filter((row) => {
+      const suspects = fromJson(row.suspects, []);
+      return suspects.length === 1 && String(suspects[0]?.author || "").toLowerCase() === name.toLowerCase();
+    }).length;
+
+    // Regressions this agent found by running the checks. The counterpart signal, and the reason
+    // this is not a blame ledger: noticing breakage is a contribution, and a record that only ever
+    // counts faults teaches agents not to run checks.
+    const regressionsCaught = Number(this.db.prepare(`
+      SELECT COUNT(*) AS count FROM check_regressions r
+      JOIN events e ON e.type = 'assignment.check_failed'
+        AND json_extract(e.metadata, '$.assignmentId') = r.detected_by_assignment_id
+      WHERE r.created_at >= ? AND lower(e.author_name) = lower(?)
+    `).get(since, name).count);
+
+    const approvals = this.db.prepare(`
+      SELECT independent FROM approvals ap
+      JOIN agents ag ON ag.id = ap.agent_id
+      WHERE lower(ag.name) = lower(?) AND ap.created_at >= ?
+    `).all(name, since);
+
+    const attempts = completed + refusedByChecks;
+    return {
+      agentName: name,
+      windowDays: Math.max(1, Number(windowDays) || 30),
+      completed,
+      refusedByChecks,
+      reworkedAssignments: reworked.length,
+      reworkRounds,
+      averageReworkRounds: completed ? Number((reworkRounds / completed).toFixed(2)) : 0,
+      regressionsCaused,
+      regressionsCaught,
+      approvals: approvals.length,
+      independentApprovals: approvals.filter((approval) => approval.independent).length,
+      // A single number for ordering and for the gate. Deliberately conservative: an agent with very
+      // little history sits near the top rather than being punished for being new, because a
+      // reliability score that suppresses newcomers starves the very work that would give it data.
+      cleanReportRate: attempts ? Number((completed / attempts).toFixed(2)) : 1,
+      sample: attempts,
+    };
+  }
+
+  // Every agent the room has an opinion about, for the dashboard.
+  teamReliability({ windowDays = 30 } = {}) {
+    const names = this.db.prepare(`
+      SELECT DISTINCT author_name AS name FROM events
+      WHERE author_kind = 'agent' AND author_name IS NOT NULL
+      ORDER BY author_name ASC LIMIT 50
+    `).all().map((row) => row.name);
+    return names.map((name) => this.agentReliability(name, { windowDays })).filter(Boolean);
+  }
+
+  // Open regressions for a task, for the dashboard and for an agent asking what is currently broken.
+  openRegressions(taskId) {
+    return this.db.prepare(`
+      SELECT id, command_key, label, detected_by_assignment_id, suspects, fix_assignment_id, created_at
+      FROM check_regressions WHERE task_id = ? AND resolved_at IS NULL ORDER BY created_at DESC LIMIT 20
+    `).all(taskId).map((row) => ({
+      id: row.id,
+      label: row.label,
+      command: fromJson(row.command_key, null),
+      detectedByAssignmentId: row.detected_by_assignment_id,
+      suspects: fromJson(row.suspects, []),
+      fixAssignmentId: row.fix_assignment_id,
+      createdAt: row.created_at,
+    }));
+  }
+
+  // The check baseline for a task: what each verified command last did, and when it was last green.
+  checkBaseline(taskId) {
+    return this.db.prepare(`
+      SELECT command_key, status, label, task_version, last_passed_at, updated_at
+      FROM check_baselines WHERE task_id = ? ORDER BY label ASC
+    `).all(taskId).map((row) => ({
+      label: row.label,
+      command: fromJson(row.command_key, null),
+      status: row.status,
+      taskVersion: row.task_version,
+      lastPassedAt: row.last_passed_at,
+      updatedAt: row.updated_at,
+    }));
+  }
+
   #storeReportedChecks(assignmentId, taskId, records, stamp) {
     // A rejected report leaves the claim intact so the agent can fix the work and report again, so
     // an assignment accumulates one batch per attempt. Only the latest attempt describes the work as
@@ -3563,6 +4078,137 @@ export class DevTeamStore extends EventEmitter {
   // lease**. An agent that has to release its claim to reorganise the work will not do it — it will
   // grind on instead — and in the gap another agent can take the paths it was midway through
   // editing. So the parent stays claimed by the same agent, at the same generation, throughout.
+  splitAssignment({ agentId, assignmentId, claimToken = null, parts, keepParent = null }) {
+    const agent = this.getAgent(agentId);
+    const parent = this.db.prepare("SELECT * FROM assignments WHERE id = ?").get(assignmentId);
+    if (!parent) throw new Error("Assignment not found.");
+    // Same fence as reporting: only the live claim holder may reshape the work.
+    const ownedByCaller = parent.agent_id === agentId && parent.status === "claimed";
+    const tokenMatches = claimToken == null || (parent.claim_token_hash && this.#hashToken(claimToken) === parent.claim_token_hash);
+    if (!ownedByCaller || !tokenMatches) return this.#claimConflict(parent, agentId);
+    if (parent.verifying_at) throw new Error("This assignment's checks are still running. Wait for that report to settle before splitting it.");
+
+    const requested = (Array.isArray(parts) ? parts : []).slice(0, 12).map((part) => ({
+      title: String(part?.title ?? "").trim().slice(0, 160),
+      description: String(part?.description ?? "").trim().slice(0, 12_000),
+      role: String(part?.role ?? parent.role).trim().slice(0, 40) || parent.role,
+      requiresWrite: part?.requiresWrite === undefined ? Boolean(parent.requires_write) : Boolean(part.requiresWrite),
+      paths: Array.isArray(part?.paths) ? [...new Set(part.paths.map((item) => String(item).trim()).filter(Boolean))].slice(0, 50) : null,
+      dependsOnPart: Number.isInteger(part?.dependsOnPart) ? part.dependsOnPart : null,
+    })).filter((part) => part.title && part.description);
+    if (requested.length < 2) throw new Error("A split needs at least two parts, each with a title and a description. If the work is simply mis-scoped, report it blocked instead.");
+
+    const task = this.getTask(parent.task_id);
+    const parentScope = this.#writeScopeFor(assignmentId);
+    // A child that declares no paths inherits the parent's scope. Inheriting is the safe default:
+    // silently giving a child *no* scope would hand it a whole-project lease, which is the opposite
+    // of what splitting is for.
+    const inheritedScope = parentScope.length ? parentScope : [];
+    const parentDependencies = this.#dependenciesFor(assignmentId).map((item) => item.id);
+    const stamp = now();
+    const created = [];
+
+    this.#transaction(() => {
+      const ids = requested.map(() => randomUUID());
+      requested.forEach((part, index) => {
+        const behaviour = this.roleBehaviour(task.project_id, part.role);
+        const id = ids[index];
+        this.db.prepare(`
+          INSERT INTO assignments (id, task_id, title, description, role, requires_write, target_agent_name, status, created_at, verifies, plans, priority)
+          VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)
+        `).run(id, parent.task_id, part.title, part.description, part.role, part.requiresWrite ? 1 : 0,
+          // Children inherit the parent's targeting: work addressed to a teammate by name stays
+          // addressed to them when it is subdivided, rather than quietly returning to the pool.
+          parent.target_agent_name, stamp, behaviour.verifies ? 1 : 0, behaviour.plans ? 1 : 0, parent.priority || 0);
+        const scope = part.requiresWrite ? (part.paths?.length ? part.paths : inheritedScope) : [];
+        if (scope.length) {
+          this.db.prepare("INSERT OR REPLACE INTO assignment_write_scopes (assignment_id, paths) VALUES (?, ?)")
+            .run(id, json(scope));
+        }
+        // Children inherit whatever the parent was waiting on: a prerequisite of the whole is a
+        // prerequisite of every piece of it.
+        for (const dependencyId of parentDependencies) {
+          this.db.prepare("INSERT OR IGNORE INTO assignment_dependencies (assignment_id, depends_on_assignment_id) VALUES (?, ?)")
+            .run(id, dependencyId);
+        }
+        // Explicit ordering between siblings, by index, so a planner can say "part 2 after part 1".
+        if (part.dependsOnPart !== null && ids[part.dependsOnPart] && part.dependsOnPart !== index) {
+          this.db.prepare("INSERT OR IGNORE INTO assignment_dependencies (assignment_id, depends_on_assignment_id) VALUES (?, ?)")
+            .run(id, ids[part.dependsOnPart]);
+        }
+        created.push({ id, title: part.title, role: part.role, requiresWrite: part.requiresWrite, paths: scope });
+      });
+
+      // Dependency inference between the new siblings (the roadmap's third bullet): two writers whose
+      // declared scopes overlap cannot run at once, and would otherwise discover that by contending
+      // for a lease — one of them sitting blocked with no stated reason. An inferred edge makes the
+      // ordering explicit and deterministic (earlier part first) rather than a race.
+      const writers = created.map((child, index) => ({ ...child, index })).filter((child) => child.requiresWrite && child.paths.length);
+      const inferred = [];
+      for (let left = 0; left < writers.length; left += 1) {
+        for (let right = left + 1; right < writers.length; right += 1) {
+          const overlaps = writers[left].paths.some((first) => writers[right].paths.some((second) => this.#scopesOverlap(first, second)));
+          if (!overlaps) continue;
+          const changed = this.db.prepare("INSERT OR IGNORE INTO assignment_dependencies (assignment_id, depends_on_assignment_id) VALUES (?, ?)")
+            .run(writers[right].id, writers[left].id).changes;
+          if (changed) inferred.push({ after: writers[right].title, before: writers[left].title });
+        }
+      }
+
+      // The parent. Closing it is the default: its work now lives in the children, and leaving it
+      // open would double-count. Keeping it is offered because an agent part-way through real work
+      // often wants to finish the piece it is holding and hand off the rest.
+      const keep = keepParent === null ? false : Boolean(keepParent);
+      if (!keep) {
+        this.db.prepare(`
+          UPDATE assignments SET status = 'done', completed_at = ?, claim_token_hash = NULL, agent_id = ?
+          WHERE id = ?
+        `).run(stamp, agentId, assignmentId);
+        this.db.prepare("UPDATE agents SET status = 'waiting', current_task_id = NULL, last_seen = ? WHERE id = ?").run(stamp, agentId);
+      }
+
+      this.#event(parent.task_id, agentId, "assignment.split",
+        `${agent.name} split “${parent.title}” into ${created.length} pieces.`, {
+          assignmentId,
+          parts: created.map((child) => ({ assignmentId: child.id, title: child.title, role: child.role })),
+          inferredOrder: inferred,
+          parentKept: keep,
+        });
+      for (const child of created) {
+        this.#event(parent.task_id, agentId, "assignment.created", child.title, {
+          assignmentId: child.id, role: child.role, requiresWrite: child.requiresWrite,
+          targetAgentName: parent.target_agent_name, writePaths: child.paths, splitFrom: assignmentId,
+        });
+      }
+      this.#syncTaskStatus(parent.task_id, stamp);
+      this.#splitOutcome = { inferred, keep };
+    });
+
+    // Each child is re-assessed on its own merits — the whole point of splitting is that the pieces
+    // are smaller than the whole, and a runtime gate gating every child as if it were the original
+    // would defeat it. assignmentAssessment is evidence-hashed, so this is not a second opinion.
+    for (const child of created) this.assignmentAssessment({ assignmentId: child.id });
+    const { inferred, keep } = this.#splitOutcome;
+    this.#changed("assignment.split", parent.task_id);
+    return {
+      split: true,
+      taskId: parent.task_id,
+      assignmentId,
+      parentKept: keep,
+      parts: created.map((child) => ({
+        ...child,
+        assessment: this.#assessmentRecord(this.db.prepare(`
+          SELECT * FROM complexity_assessments WHERE assignment_id = ? AND invalidated_at IS NULL
+          ORDER BY created_at DESC LIMIT 1
+        `).get(child.id)),
+      })),
+      inferredOrder: inferred,
+      next: keep
+        ? "The pieces are queued and you still hold the original. Finish what you are holding, then report it."
+        : "The original is closed and its pieces are queued. Call devteam_wait to pick one up, or leave them for teammates.",
+    };
+  }
+
   async completeAssignment({ agentId, assignmentId, message, status = "done", changedFiles = [], checks = [], nextStatus = "waiting", claimToken = null, usage = null }) {
     const agent = this.getAgent(agentId);
     const assignment = this.db.prepare("SELECT * FROM assignments WHERE id = ?").get(assignmentId);
@@ -3623,7 +4269,16 @@ export class DevTeamStore extends EventEmitter {
     // status=blocked is still allowed through — reporting a genuine failure is the honest path.
     if (status !== "blocked" && failedChecks.length) {
       const stamp = now();
+      let regressions = [];
       this.#transaction(() => {
+        // A refused report is still evidence, and is in fact where a regression is usually first
+        // seen: the agent that trips over someone else's breakage is the one running the suite.
+        const detected = this.#recordCheckBaselines({
+          taskId: assignment.task_id, assignmentId, records: checkRecords, version: task?.version, stamp,
+        });
+        regressions = this.#openRegressions({
+          taskId: assignment.task_id, assignmentId, regressions: detected, stamp, projectId: task?.project_id,
+        });
         this.#storeReportedChecks(assignmentId, assignment.task_id, checkRecords, stamp);
         this.#event(assignment.task_id, agentId, "assignment.check_failed",
           `${agent.name} reported “${assignment.title}” as done, but ${failedChecks.length === 1 ? "a check" : `${failedChecks.length} checks`} DevTeam ran failed.`, {
@@ -3631,9 +4286,14 @@ export class DevTeamStore extends EventEmitter {
             role: assignment.role,
             checks: cleanChecks,
             checkRecords,
+            ...(regressions.length ? { regressions: regressions.map((item) => item.label) } : {}),
           });
       });
       this.#changed("assignment.check_failed", assignment.task_id);
+      // Distinguish "you broke this" from "you found this broken". Every failing check being the
+      // reporter's fault was never true, and telling an agent to fix a regression it did not cause
+      // is how a team wastes an afternoon.
+      const notYourFault = regressions.filter((regression) => regression.fixAssignmentId);
       return {
         completed: false,
         checksFailed: {
@@ -3645,6 +4305,12 @@ export class DevTeamStore extends EventEmitter {
           })),
           reason: "DevTeam ran the commands you reported and they did not pass, so this cannot be recorded as done. Fix the work and report again, or report status=blocked with what you found.",
         },
+        ...(regressions.length ? {
+          regressions,
+          regressionNote: notYourFault.length
+            ? `${notYourFault.length === 1 ? "A check" : `${notYourFault.length} checks`} that used to pass now fails, and the change that broke it was not yours. A fix assignment has been queued for whoever made it. Do not chase it — fix only what your own work needs and report again.`
+            : "A check that used to pass now fails. Nothing in this task changed files since it was last green, so it is most likely your own work in progress.",
+        } : {}),
         checks: checkRecords,
       };
     }
@@ -3652,6 +4318,7 @@ export class DevTeamStore extends EventEmitter {
     this.markMessagesSeen(agentId);
     let version;
     let followUpAssignmentId = null;
+    let regressions = [];
     this.#transaction(() => {
       const stamp = now();
       this.#cancelReadyCheckpointsForAssignment(assignmentId);
@@ -3664,6 +4331,25 @@ export class DevTeamStore extends EventEmitter {
         this.db.prepare("UPDATE tasks SET updated_at = ? WHERE id = ?").run(stamp, assignment.task_id);
       }
       version = this.db.prepare("SELECT version FROM tasks WHERE id = ?").get(assignment.task_id).version;
+      // Work that was sent back has now been reported again, so the findings that sent it back stop
+      // being outstanding. They are marked resolved rather than deleted: "this was reworked twice
+      // and here is what for" is exactly the history a reviewer wants on the next pass. Whether the
+      // rework is *good* is the reviewer's call — it can send it back again, which is the point.
+      if (status !== "blocked") {
+        this.db.prepare("UPDATE assignment_findings SET resolved_at = ?, resolved_by_assignment_id = ? WHERE assignment_id = ? AND resolved_at IS NULL")
+          .run(stamp, assignmentId, assignmentId);
+        // It is no longer queued *as* rework. rework_count is deliberately left standing: how many
+        // times this went back is a fact about the work, and the next reviewer should see it.
+        this.db.prepare("UPDATE assignments SET rework_requested_at = NULL, rework_summary = NULL WHERE id = ?").run(assignmentId);
+      }
+      // A passing run repairs the baseline and closes any regression it was breaking, so ordinary
+      // work quietly resolving a breakage does not leave it open on the board forever.
+      regressions = this.#openRegressions({
+        taskId: assignment.task_id, assignmentId, projectId: task?.project_id, stamp,
+        regressions: this.#recordCheckBaselines({
+          taskId: assignment.task_id, assignmentId, records: checkRecords, version, stamp,
+        }),
+      });
       this.#storeReportedChecks(assignmentId, assignment.task_id, checkRecords, stamp);
       this.#event(assignment.task_id, agentId, status === "blocked" ? "assignment.blocked" : "assignment.completed", message.trim(), {
         assignmentId,
@@ -3718,6 +4404,7 @@ export class DevTeamStore extends EventEmitter {
       changedFiles: cleanChanged,
       checks: checkRecords,
       verifiedChecks: checkRecords.filter((record) => record.verified).length,
+      ...(regressions.length ? { regressions } : {}),
       agent: agent.name,
       ...(status === "blocked" ? { taskBlocked: false, followUpAssignmentId } : {}),
     };
@@ -3798,6 +4485,19 @@ export class DevTeamStore extends EventEmitter {
         && (!Array.isArray(metadata.changedFiles) || metadata.changedFiles.length === 0);
     });
     if (!reviewEvidence) throw new Error("Approval requires a completed, read-only reviewer or tester assignment on the current task version.");
+    // T2.4: where a project has verification enabled, an approval must rest on something DevTeam
+    // actually ran. Without this, "verified checks" and "an agent said so" carry identical weight at
+    // the one moment that decides whether work ships — which is where the distinction matters most.
+    // Projects with no allowlist are unaffected: nothing to verify means nothing to require.
+    const verificationEnabled = this.projectCheckCommands(task.project_id).length > 0;
+    const verifiedEvidence = Number(this.db.prepare(`
+      SELECT COUNT(*) AS count FROM assignment_checks c
+      JOIN assignments a ON a.id = c.assignment_id
+      WHERE a.task_id = ? AND c.superseded_at IS NULL AND c.verified = 1 AND c.status = 'passed'
+    `).get(taskId).count) > 0;
+    if (verificationEnabled && !verifiedEvidence) {
+      throw new Error("This project runs verified checks, and nothing on this task version has passed one. Run an allowlisted check and report it before approving.");
+    }
     // Reviewer ≠ author: when the team is more than one agent, the author of the current version
     // cannot approve it — an independent teammate must. A genuine solo run is still allowed to
     // finish (no dead-ends), but its acceptance is labeled selfReviewed so it is never mistaken
@@ -3811,12 +4511,19 @@ export class DevTeamStore extends EventEmitter {
     let outcome;
     this.#transaction(() => {
       const stamp = now();
+      // Independence is recorded on the approval, not recomputed later. Whether the approver was the
+      // author is a fact about the moment of approving; recomputing it lets the record change as
+      // agents connect and disconnect, which is exactly when it must not.
+      const independent = !authorLineages.has(approverLineage);
       this.db.prepare(`
-        INSERT INTO approvals (task_id, agent_id, version, summary, created_at)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(task_id, agent_id, version) DO UPDATE SET summary = excluded.summary, created_at = excluded.created_at
-      `).run(taskId, agentId, task.version, summary.trim(), stamp);
-      this.#event(taskId, agentId, "task.approved", `${agent.name} approved version ${task.version}.`, { summary: summary.trim(), version: task.version });
+        INSERT INTO approvals (task_id, agent_id, version, summary, created_at, independent, verified_evidence)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(task_id, agent_id, version) DO UPDATE SET summary = excluded.summary, created_at = excluded.created_at,
+          independent = excluded.independent, verified_evidence = excluded.verified_evidence
+      `).run(taskId, agentId, task.version, summary.trim(), stamp, independent ? 1 : 0, verifiedEvidence ? 1 : 0);
+      this.#event(taskId, agentId, "task.approved",
+        `${agent.name} approved version ${task.version}${independent ? "" : " (self-review: no independent teammate was available)"}.`,
+        { summary: summary.trim(), version: task.version, independent, verifiedEvidence });
       const approvalLineages = this.#approvalLineages(taskId, task.version);
       const approvalCount = approvalLineages.size;
       const openAssignments = Number(this.db.prepare("SELECT COUNT(*) AS count FROM assignments WHERE task_id = ? AND status IN ('queued', 'claimed')").get(taskId).count);
@@ -3843,6 +4550,139 @@ export class DevTeamStore extends EventEmitter {
     });
     this.#changed(outcome.accepted ? "task.accepted" : "task.approved", taskId);
     return outcome;
+  }
+
+  // A reviewer that finds problems used to have two moves, and both were wrong. Approving anyway is
+  // dishonest; `status=blocked` closes the *reviewer's own* assignment and queues a coarse planner
+  // item, so the fix routes through a human-shaped triage step instead of back to the person who
+  // wrote the code. This is the third move: send the work itself back to its author, with the
+  // findings attached, without stopping the task or disturbing anyone else's claim.
+  //
+  // What it deliberately does NOT do: create a new assignment. The original row is reopened, so its
+  // title, description, checklist, write scope, dependencies and whole event history stay attached
+  // to the work rather than being scattered across a chain of near-duplicate follow-ups. Reopening
+  // clears the claim and its fencing token exactly as a force-release does, so a late report from
+  // the author's previous session is refused instead of landing on top of the rework.
+  requestChanges({ agentId = null, taskId, assignmentId, summary, findings = [] }) {
+    const task = this.getTask(taskId);
+    if (!task) throw new Error("Task not found.");
+    this.assertMembership(agentId, taskId);
+    if (["blocked", "cancelled", "accepted"].includes(task.status)) {
+      throw new Error(`Cannot request changes on a ${task.status} task.`);
+    }
+    const agent = agentId ? this.getAgent(agentId) : null;
+    const assignment = this.db.prepare("SELECT * FROM assignments WHERE id = ? AND task_id = ?").get(assignmentId, taskId);
+    if (!assignment) throw new Error("Assignment not found in this task room.");
+    if (assignment.status !== "done") {
+      throw new Error(`Only completed work can be sent back for changes; this assignment is ${assignment.status}.`);
+    }
+    const cleanSummary = String(summary || "").trim();
+    if (!cleanSummary) throw new Error("Say what needs to change.");
+    // Earning the right to send work back is the same act as earning the right to approve it: an
+    // independent read-only verifier assignment on the current version. The alternative is holding
+    // that verifier claim right now — the reviewer that finds the problem mid-review should not have
+    // to finish and file its own report before it can say so.
+    if (agentId && !this.#hasReviewStanding(agentId, taskId, task.version)) {
+      throw new Error("Requesting changes needs a completed or in-progress read-only reviewer or tester assignment on the current task version.");
+    }
+    const cleanFindings = (Array.isArray(findings) ? findings : []).slice(0, 50).map((item) => {
+      const isObject = item && typeof item === "object" && !Array.isArray(item);
+      return {
+        detail: String((isObject ? item.detail : item) ?? "").trim().slice(0, 2000),
+        path: isObject && item.path ? String(item.path).trim().slice(0, 500) : null,
+      };
+    }).filter((item) => item.detail);
+    const authorName = assignment.agent_id
+      ? (this.db.prepare("SELECT name FROM agents WHERE id = ?").get(assignment.agent_id)?.name || null)
+      : null;
+    let outcome;
+    this.#transaction(() => {
+      const stamp = now();
+      const reworkCount = Number(assignment.rework_count || 0) + 1;
+      // Back to queued, addressed to whoever wrote it. Targeting is a preference, not a lock: the
+      // existing scheduler rule returns a targeted item to the general queue once nobody by that
+      // name is connected, so rework never becomes unclaimable because its author went home.
+      this.db.prepare(`
+        UPDATE assignments
+        SET status = 'queued', agent_id = NULL, completed_at = NULL, claim_token_hash = NULL,
+            target_agent_name = COALESCE(?, target_agent_name),
+            rework_count = ?, rework_requested_at = ?, rework_summary = ?
+        WHERE id = ?
+      `).run(authorName, reworkCount, stamp, cleanSummary, assignmentId);
+      for (const finding of cleanFindings) {
+        this.db.prepare(`
+          INSERT INTO assignment_findings (id, assignment_id, task_id, requested_by_agent_id, requested_by_name, task_version, detail, path, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(randomUUID(), assignmentId, taskId, agentId, agent?.name || "the human", Number(task.version), finding.detail, finding.path, stamp);
+      }
+      // The version under review was just judged not good enough, so approvals built on it no longer
+      // describe a settled state. Clearing them is the same principle as version-invalidates-
+      // approvals: if the rework changes files the version bumps and they would have gone anyway,
+      // and if it changes none they would otherwise have survived a reviewer saying "not yet".
+      const clearedApprovals = this.db.prepare("DELETE FROM approvals WHERE task_id = ? AND version = ?").run(taskId, task.version).changes;
+      this.#cancelReadyCheckpointsForAssignment(assignmentId);
+      this.#event(taskId, agentId, "assignment.changes_requested",
+        `${agent?.name || "The human"} sent “${assignment.title}” back for changes: ${cleanSummary}`, {
+          assignmentId,
+          role: assignment.role,
+          author: authorName,
+          version: Number(task.version),
+          reworkCount,
+          clearedApprovals,
+          findings: cleanFindings,
+        });
+      this.#syncTaskStatus(taskId, stamp);
+      outcome = {
+        changesRequested: true,
+        taskId,
+        assignmentId,
+        title: assignment.title,
+        routedTo: authorName,
+        reworkCount,
+        clearedApprovals,
+        findings: cleanFindings,
+        version: Number(task.version),
+      };
+    });
+    this.#changed("assignment.changes_requested", taskId);
+    return {
+      ...outcome,
+      next: outcome.routedTo
+        ? `“${outcome.title}” is queued again and addressed to ${outcome.routedTo}. It stays claimable by the rest of the room if they are not connected.`
+        : `“${outcome.title}” is queued again for whoever picks it up.`,
+    };
+  }
+
+  // Whether this agent has earned a say on the current version: it either completed a read-only
+  // verifier assignment on it (the same evidence approveTask requires) or is holding one right now.
+  #hasReviewStanding(agentId, taskId, version) {
+    const holding = this.db.prepare(`
+      SELECT 1 FROM assignments
+      WHERE task_id = ? AND agent_id = ? AND status = 'claimed' AND requires_write = 0
+        AND ${VERIFIES} LIMIT 1
+    `).get(taskId, agentId);
+    if (holding) return true;
+    return this.db.prepare(`
+      SELECT metadata FROM events
+      WHERE task_id = ? AND agent_id = ? AND type = 'assignment.completed'
+      ORDER BY id DESC
+    `).all(taskId, agentId).some((event) => {
+      const metadata = fromJson(event.metadata, {});
+      return metadata.version === version
+        && this.#assignmentVerifies(metadata.assignmentId)
+        && (!Array.isArray(metadata.changedFiles) || metadata.changedFiles.length === 0);
+    });
+  }
+
+  // Outstanding findings for an assignment: what the author is being asked to fix. Resolved rows are
+  // kept so the history of a reworked piece of work stays legible.
+  #findingsFor(assignmentId, { includeResolved = false } = {}) {
+    return this.db.prepare(`
+      SELECT id, requested_by_name, task_version, detail, path, created_at, resolved_at
+      FROM assignment_findings
+      WHERE assignment_id = ?${includeResolved ? "" : " AND resolved_at IS NULL"}
+      ORDER BY created_at ASC, rowid ASC
+    `).all(assignmentId);
   }
 
   // When a task stops (blocked, or an agent reports a blocker), release its co-workers cleanly:
@@ -4159,6 +4999,8 @@ export class DevTeamStore extends EventEmitter {
         dependsOn: dependencies.map((item) => item.id),
         blockedBy: dependencies.filter((item) => item.status !== "done"),
         checks: this.#checksFor(assignment.id),
+        findings: this.#findingsFor(assignment.id),
+        resolvedFindings: this.#findingsFor(assignment.id, { includeResolved: true }).filter((finding) => finding.resolved_at),
         schedulingHold: this.#schedulingHold(assignment),
         assessment,
         runtimeDecision,
@@ -4216,6 +5058,7 @@ export class DevTeamStore extends EventEmitter {
     const sessionCheckpoints = this.sessionCheckpointsForTask(taskId);
     return {
       ...task, assignments, approvals, events, proposals, blackboard, projectBlackboard, knowledge, members, sessionCheckpoints, roleCatalogue,
+      regressions: this.openRegressions(taskId), checkBaseline: this.checkBaseline(taskId),
       knowledgeVault: {
         automated: this.knowledge.enabled,
         path: path.join(task.project_root, "knowledge"),
