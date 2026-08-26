@@ -33,6 +33,33 @@ import {
 const CLOSED_TASK_STATUSES = ["accepted", "blocked", "cancelled"];
 // Roles that read the tree rather than change it, and therefore wait for pending writers.
 const VERIFIER_ROLES = ["reviewer", "security-reviewer", "tester"];
+// Which assignments depend, directly or transitively, on which. Written once so the candidate scan
+// and the scheduler's explanation walk the same edges.
+const DEPENDENCY_CLOSURE_CTE = `
+        WITH RECURSIVE dependency_closure(assignment_id, prerequisite_id) AS (
+          SELECT assignment_id, depends_on_assignment_id FROM assignment_dependencies
+          UNION
+          SELECT dependency_closure.assignment_id, dependency_link.depends_on_assignment_id
+          FROM dependency_closure
+          JOIN assignment_dependencies dependency_link
+            ON dependency_link.assignment_id = dependency_closure.prerequisite_id
+        )`;
+
+// The pending writers a verifier is waiting on. Used both by the scan's review-gating predicate
+// (which asks only whether any exist) and by the explanation (which names them).
+const BLOCKING_WRITER_CONDITIONS = `pending_write.task_id = a.task_id
+                -- An assignment can never be the writer it is waiting for. Without this, a
+                -- reviewer/tester that itself declares write access matches its own row here and
+                -- is excluded from every scan forever, with nothing reported as blocking it.
+                AND pending_write.id != a.id
+                AND pending_write.requires_write = 1
+                AND pending_write.status IN ('queued', 'claimed')
+                AND NOT EXISTS (
+                  SELECT 1 FROM dependency_closure
+                  WHERE dependency_closure.assignment_id = pending_write.id
+                    AND dependency_closure.prerequisite_id = a.id
+                )`;
+
 // A path scope of "" is the whole-project lease; spell that out wherever a scope reaches a human.
 const scopeLabel = (scope) => (scope === "" ? "the whole project" : scope);
 
@@ -2469,6 +2496,149 @@ export class DevTeamStore extends EventEmitter {
     return { ...this.db.prepare("SELECT * FROM assignments WHERE id = ?").get(assignment.id), checklist: resolvedChecklist || [], writePaths, dependsOn: dependencyIds };
   }
 
+  // The candidate scan used to be one 55-line SELECT carrying membership, targeting, dependencies
+  // and review-gating at once, and both of the deadlocks this work exists to fix hid inside it. It
+  // is now this list: each entry is one named, individually evaluable predicate paired with the
+  // reason code that explains its failure. claimNextAssignment ANDs them together; whyNotClaimable
+  // runs them one at a time against a single assignment. Because both read this list, the query and
+  // the explanation cannot drift apart — tightening a predicate moves its explanation with it.
+  //
+  // Order matters and is the order a reader should think in: is it even open, may this agent work in
+  // that room, is the room open, is it addressed to someone else, is this agent's reach into the room
+  // wide enough, is its own work ready, and is it waiting on a writer.
+  #claimPredicates({ agentName, memberRooms, claimRooms }) {
+    const list = (values) => (values.length ? values.map(() => "?").join(", ") : null);
+    const claimRoomList = list(claimRooms);
+    // In a room the agent already belongs to it may take targeted-or-untargeted work; in a room it
+    // only reached by invitation, it may take *only* the assignment(s) addressed to it by name.
+    const memberRoomList = list(memberRooms);
+    return [
+      {
+        code: "assignment_not_queued",
+        sql: "a.status = 'queued'",
+        params: [],
+      },
+      {
+        // An agent only claims work inside task rooms it belongs to *as a contributor* (observers
+        // never claim), plus any room a queued assignment invited it into by name.
+        code: "room_not_claimable",
+        sql: claimRoomList ? `a.task_id IN (${claimRoomList})` : "0",
+        params: claimRooms,
+      },
+      {
+        code: "task_closed",
+        sql: `t.status NOT IN (${CLOSED_TASK_STATUSES.map(() => "?").join(", ")})`,
+        params: CLOSED_TASK_STATUSES,
+      },
+      {
+        // Targeting routes work to a teammate by name; it must not outlive that teammate. A target
+        // that is still connected keeps its exclusive hold (and its ORDER BY priority), but once
+        // nobody by that name is present the item returns to the general queue instead of sitting
+        // claimable-by-nobody and blocking every verifier behind it.
+        code: "targeted_elsewhere",
+        sql: `(
+            a.target_agent_name IS NULL
+            OR lower(a.target_agent_name) = lower(?)
+            OR NOT EXISTS (
+              SELECT 1 FROM agents present
+              WHERE lower(present.name) = lower(a.target_agent_name) AND present.status != 'disconnected'
+            )
+          )`,
+        params: [agentName],
+      },
+      {
+        code: "room_invitation_only",
+        sql: memberRoomList
+          ? `(a.task_id IN (${memberRoomList}) OR lower(a.target_agent_name) = lower(?))`
+          : "lower(a.target_agent_name) = lower(?)",
+        params: memberRoomList ? [...memberRooms, agentName] : [agentName],
+      },
+      {
+        code: "dependency_pending",
+        sql: `NOT EXISTS (
+            SELECT 1 FROM assignment_dependencies dependency_link
+            JOIN assignments dependency ON dependency.id = dependency_link.depends_on_assignment_id
+            WHERE dependency_link.assignment_id = a.id AND dependency.status != 'done'
+          )`,
+        params: [],
+      },
+      {
+        code: "awaiting_writer",
+        sql: `(
+            lower(a.role) NOT IN (${VERIFIER_ROLES.map(() => "?").join(", ")}) OR NOT EXISTS (
+              SELECT 1 FROM assignments pending_write WHERE ${BLOCKING_WRITER_CONDITIONS}
+            )
+          )`,
+        params: VERIFIER_ROLES,
+      },
+    ];
+  }
+
+  // Who the review-gating predicate matched. Same condition, asked for names instead of existence.
+  #blockingWriters(assignmentId) {
+    return this.db.prepare(`
+      ${DEPENDENCY_CLOSURE_CTE}
+      SELECT pending_write.id, pending_write.title, pending_write.status
+      FROM assignments a, assignments pending_write
+      WHERE a.id = ? AND ${BLOCKING_WRITER_CONDITIONS}
+      ORDER BY pending_write.created_at ASC
+    `).all(assignmentId);
+  }
+
+  // The dependency predicate's own inner SELECT, asked for rows instead of existence.
+  #pendingDependencies(assignmentId) {
+    return this.db.prepare(`
+      SELECT dependency.id, dependency.title, dependency.status
+      FROM assignment_dependencies dependency_link
+      JOIN assignments dependency ON dependency.id = dependency_link.depends_on_assignment_id
+      WHERE dependency_link.assignment_id = ? AND dependency.status != 'done'
+      ORDER BY dependency.created_at ASC
+    `).all(assignmentId);
+  }
+
+  // Which of the scan's predicates this one assignment fails, evaluated with the very SQL the scan
+  // composes. Agent-scoped predicates are skipped when there is no agent to scope them to.
+  #failedClaimPredicates(assignment, agent) {
+    const AGENT_SCOPED = ["room_not_claimable", "room_invitation_only", "targeted_elsewhere"];
+    const predicates = this.#claimPredicates(agent
+      ? {
+        agentName: agent.name,
+        memberRooms: this.#claimableTaskIds(agent.id),
+        claimRooms: this.#claimRoomsFor(agent),
+      }
+      : { agentName: "", memberRooms: [], claimRooms: [] });
+    const failed = [];
+    for (const predicate of predicates) {
+      if (!agent && AGENT_SCOPED.includes(predicate.code)) continue;
+      const passes = this.db.prepare(`
+        ${DEPENDENCY_CLOSURE_CTE}
+        SELECT 1 FROM assignments a
+        JOIN tasks t ON t.id = a.task_id
+        WHERE a.id = ? AND ${predicate.sql}
+        LIMIT 1
+      `).get(assignment.id, ...predicate.params);
+      if (!passes) failed.push(predicate.code);
+    }
+    return failed;
+  }
+
+  // The rooms this agent may be handed work in: its own contributor rooms, plus any active task
+  // where a queued assignment names it. A targeted assignment is an *invitation* — it lets the
+  // planner (or human) pull a specific agent into a new task's room without the agent having to
+  // devteam_join first, which is what makes a second task get picked up promptly instead of stalling
+  // until every other task is deleted. Untargeted work stays strictly room-scoped, so an agent
+  // invoked for one task is never silently conscripted into another it was not invited to.
+  #claimRoomsFor(agent) {
+    const invitedRooms = this.db.prepare(`
+      SELECT DISTINCT a.task_id FROM assignments a
+      JOIN tasks t ON t.id = a.task_id
+      WHERE a.status = 'queued' AND a.target_agent_name IS NOT NULL
+        AND lower(a.target_agent_name) = lower(?)
+        AND t.status NOT IN ('accepted', 'blocked', 'cancelled')
+    `).all(agent.name).map((row) => row.task_id);
+    return [...new Set([...this.#claimableTaskIds(agent.id), ...invitedRooms])];
+  }
+
   claimNextAssignment(agentId) {
     this.#reapStaleAgents();
     this.#recoverOrphanedClaims();
@@ -2478,96 +2648,33 @@ export class DevTeamStore extends EventEmitter {
     // it before taking another. Prevents a single busy agent from hoarding multiple write leases.
     const existingClaim = this.db.prepare("SELECT id FROM assignments WHERE agent_id = ? AND status = 'claimed' LIMIT 1").get(agentId);
     if (existingClaim) return null;
-    // An agent only claims work inside task rooms it belongs to *as a contributor* (observers
-    // never claim). This prevents an agent invoked for one project/task from silently claiming
-    // another's work, and stops an observer from taking on execution it only joined to watch.
-    // Rooms this agent may claim in: its own contributor rooms, plus any active task where a queued
-    // assignment explicitly names it. A targeted assignment is an *invitation* — it lets the planner
-    // (or human) pull a specific agent into a new task's room without the agent having to devteam_join
-    // first, which is what makes a second task get picked up promptly instead of stalling until every
-    // other task is deleted. Untargeted work stays strictly room-scoped, so an agent invoked for one
-    // task is never silently conscripted into another it was not invited to.
+    // This prevents an agent invoked for one project/task from silently claiming another's work,
+    // and stops an observer from taking on execution it only joined to watch.
     const memberRooms = this.#claimableTaskIds(agentId);
-    const invitedRooms = this.db.prepare(`
-      SELECT DISTINCT a.task_id FROM assignments a
-      JOIN tasks t ON t.id = a.task_id
-      WHERE a.status = 'queued' AND a.target_agent_name IS NOT NULL
-        AND lower(a.target_agent_name) = lower(?)
-        AND t.status NOT IN ('accepted', 'blocked', 'cancelled')
-    `).all(agent.name).map((row) => row.task_id);
-    const claimRooms = [...new Set([...memberRooms, ...invitedRooms])];
+    const claimRooms = this.#claimRoomsFor(agent);
     if (!claimRooms.length) {
       this.db.prepare("UPDATE agents SET status = CASE WHEN status = 'busy' THEN status ELSE 'waiting' END, last_seen = ? WHERE id = ?").run(now(), agentId);
       return null;
     }
-    const claimPlaceholders = claimRooms.map(() => "?").join(", ");
-    // In a room the agent already belongs to it may take targeted-or-untargeted work; in a room it
-    // only reached by invitation, it may take *only* the assignment(s) addressed to it by name.
-    const memberScopeClause = memberRooms.length
-      ? `(a.task_id IN (${memberRooms.map(() => "?").join(", ")}) OR lower(a.target_agent_name) = lower(?))`
-      : "lower(a.target_agent_name) = lower(?)";
-    const memberScopeParams = memberRooms.length ? [...memberRooms, agent.name] : [agent.name];
+    const predicates = this.#claimPredicates({ agentName: agent.name, memberRooms, claimRooms });
     const assignment = this.#transaction(() => {
-      // Fetch the eligible queue (membership + targeting + review gating). The write lease is
-      // no longer project-wide: we resolve it per path below so non-overlapping writers run
-      // in parallel.
+      // The eligible queue is the conjunction of the named predicates above — membership,
+      // targeting, dependencies and review gating — each of which whyNotClaimable can also evaluate
+      // on its own to say which one held an assignment back. The write lease is not part of it: it
+      // is no longer project-wide, so it is resolved per path in the loop below and non-overlapping
+      // writers run in parallel.
       const candidates = this.db.prepare(`
-        WITH RECURSIVE dependency_closure(assignment_id, prerequisite_id) AS (
-          SELECT assignment_id, depends_on_assignment_id
-          FROM assignment_dependencies
-          UNION
-          SELECT dependency_closure.assignment_id, dependency_link.depends_on_assignment_id
-          FROM dependency_closure
-          JOIN assignment_dependencies dependency_link
-            ON dependency_link.assignment_id = dependency_closure.prerequisite_id
-        )
+        ${DEPENDENCY_CLOSURE_CTE}
         SELECT a.*, t.project_id, t.title AS task_title, t.description AS task_description,
           t.session_policy AS task_session_policy,
           t.version AS task_version, t.required_approvals, p.root AS project_root, p.name AS project_name
         FROM assignments a
         JOIN tasks t ON t.id = a.task_id
         JOIN projects p ON p.id = t.project_id
-        WHERE a.status = 'queued'
-          AND a.task_id IN (${claimPlaceholders})
-          AND t.status NOT IN ('accepted', 'blocked', 'cancelled')
-          -- Targeting routes work to a teammate by name; it must not outlive that teammate. A
-          -- target that is still connected keeps its exclusive hold (and its ORDER BY priority),
-          -- but once nobody by that name is present the item returns to the general queue instead
-          -- of sitting claimable-by-nobody and blocking every verifier behind it.
-          AND (
-            a.target_agent_name IS NULL
-            OR lower(a.target_agent_name) = lower(?)
-            OR NOT EXISTS (
-              SELECT 1 FROM agents present
-              WHERE lower(present.name) = lower(a.target_agent_name) AND present.status != 'disconnected'
-            )
-          )
-          AND ${memberScopeClause}
-          AND NOT EXISTS (
-            SELECT 1 FROM assignment_dependencies dependency_link
-            JOIN assignments dependency ON dependency.id = dependency_link.depends_on_assignment_id
-            WHERE dependency_link.assignment_id = a.id AND dependency.status != 'done'
-          )
-          AND (
-            lower(a.role) NOT IN ('reviewer', 'security-reviewer', 'tester') OR NOT EXISTS (
-              SELECT 1 FROM assignments pending_write
-              WHERE pending_write.task_id = a.task_id
-                -- An assignment can never be the writer it is waiting for. Without this, a
-                -- reviewer/tester that itself declares write access matches its own row here and
-                -- is excluded from every scan forever, with nothing reported as blocking it.
-                AND pending_write.id != a.id
-                AND pending_write.requires_write = 1
-                AND pending_write.status IN ('queued', 'claimed')
-                AND NOT EXISTS (
-                  SELECT 1 FROM dependency_closure
-                  WHERE dependency_closure.assignment_id = pending_write.id
-                    AND dependency_closure.prerequisite_id = a.id
-                )
-            )
-          )
+        WHERE ${predicates.map((predicate) => predicate.sql).join("\n          AND ")}
         ORDER BY CASE WHEN a.target_agent_name IS NOT NULL THEN 0 ELSE 1 END, a.created_at ASC
         LIMIT 20
-      `).all(...claimRooms, agent.name, ...memberScopeParams);
+      `).all(...predicates.flatMap((predicate) => predicate.params));
       if (!candidates.length) {
         this.db.prepare("UPDATE agents SET status = 'waiting', last_seen = ? WHERE id = ?").run(now(), agentId);
         return null;
@@ -2685,7 +2792,13 @@ export class DevTeamStore extends EventEmitter {
       }
     }
 
-    if (assignment.status !== "queued") {
+    // Ask the candidate scan's own predicates, one at a time, which of them this assignment fails.
+    // These are not a second opinion about the queue: they are the scan's SQL, run singly, so the
+    // explanation can never call an item fine that the query would have skipped, or the reverse.
+    const failed = new Set(this.#failedClaimPredicates(assignment, agent));
+    const targetName = assignment.target_agent_name;
+
+    if (failed.has("assignment_not_queued")) {
       const holder = assignment.agent_id
         ? (this.db.prepare("SELECT name FROM agents WHERE id = ?").get(assignment.agent_id)?.name || null)
         : null;
@@ -2694,71 +2807,34 @@ export class DevTeamStore extends EventEmitter {
         : `This assignment is ${assignment.status}, not waiting in the queue.`,
       { status: assignment.status, holder });
     }
-    if (CLOSED_TASK_STATUSES.includes(assignment.task_status)) {
+    if (failed.has("room_not_claimable")) {
+      add("room_not_claimable", `“${agent.name}” is not a claiming member of this task room and holds no invitation into it; join as a contributor first.`, { taskId: assignment.task_id });
+    }
+    if (failed.has("task_closed")) {
       add("task_closed", `Its task is ${assignment.task_status}; a closed task hands out no work.`, { taskStatus: assignment.task_status });
     }
-
-    const targetName = assignment.target_agent_name;
-    const targetPresent = targetName
-      ? this.db.prepare("SELECT name FROM agents WHERE lower(name) = lower(?) AND status != 'disconnected' LIMIT 1").get(targetName)
-      : null;
-    const targetedAtAgent = Boolean(agent && targetName && targetName.toLowerCase() === agent.name.toLowerCase());
-
-    if (agent) {
-      const memberRooms = this.#claimableTaskIds(agent.id);
-      // A targeted assignment is an invitation: it pulls an agent into a room it never joined, but
-      // it authorizes exactly the item(s) addressed to it by name and nothing else in that room.
-      const invited = this.db.prepare(`
-        SELECT 1 FROM assignments a JOIN tasks t ON t.id = a.task_id
-        WHERE a.task_id = ? AND a.status = 'queued' AND a.target_agent_name IS NOT NULL
-          AND lower(a.target_agent_name) = lower(?)
-          AND t.status NOT IN ('accepted', 'blocked', 'cancelled')
-        LIMIT 1
-      `).get(assignment.task_id, agent.name);
-      if (!memberRooms.includes(assignment.task_id)) {
-        if (!invited) {
-          add("room_not_claimable", `“${agent.name}” is not a claiming member of this task room and holds no invitation into it; join as a contributor first.`, { taskId: assignment.task_id });
-        } else if (!targetedAtAgent) {
-          add("room_invitation_only", `“${agent.name}” reached this room only by an invitation addressed to it by name, so it may claim the assignment(s) targeting it — not this one.`, { taskId: assignment.task_id });
-        }
-      }
-      if (targetName && !targetedAtAgent && targetPresent) {
-        add("targeted_elsewhere", `Targeted at “${targetName}”, who is connected and holds it exclusively.`, { targetAgentName: targetName });
-      }
+    if (failed.has("targeted_elsewhere")) {
+      add("targeted_elsewhere", `Targeted at “${targetName}”, who is connected and holds it exclusively.`, { targetAgentName: targetName });
     }
-    if (targetName && !targetPresent) {
+    if (targetName && !this.db.prepare("SELECT 1 FROM agents WHERE lower(name) = lower(?) AND status != 'disconnected' LIMIT 1").get(targetName)) {
       // Not a blocker: an absent target returns the item to the general queue rather than letting it
       // sit claimable-by-nobody. Reported anyway, because "nobody named X is here" explains a lot.
       add("target_absent", `Targeted at “${targetName}”, who is not connected; any member of the room may claim it.`, { targetAgentName: targetName }, false);
     }
-
-    const pending = this.#dependenciesFor(assignment.id).filter((dependency) => dependency.status !== "done");
-    if (pending.length) {
+    // An invitation authorizes exactly the item(s) addressed to this agent by name and nothing else
+    // in that room. Skipped for an agent that is not in the room at all: it already heard that, and
+    // hearing "your invitation does not stretch this far" on top of it would be untrue.
+    if (failed.has("room_invitation_only") && !failed.has("room_not_claimable")) {
+      add("room_invitation_only", `“${agent.name}” reached this room only by an invitation addressed to it by name, so it may claim the assignment(s) targeting it — not this one.`, { taskId: assignment.task_id });
+    }
+    if (failed.has("dependency_pending")) {
+      const pending = this.#pendingDependencies(assignment.id);
       add("dependency_pending", `Waiting on ${pending.length} unfinished ${pending.length === 1 ? "dependency" : "dependencies"}: ${pending.map((dependency) => `“${dependency.title}” (${dependency.status})`).join(", ")}.`,
         { dependsOn: pending.map((dependency) => ({ id: dependency.id, title: dependency.title, status: dependency.status })) });
     }
-
-    if (VERIFIER_ROLES.includes(String(assignment.role || "").toLowerCase())) {
-      const writers = this.db.prepare(`
-        WITH RECURSIVE dependency_closure(assignment_id, prerequisite_id) AS (
-          SELECT assignment_id, depends_on_assignment_id FROM assignment_dependencies
-          UNION
-          SELECT dependency_closure.assignment_id, dependency_link.depends_on_assignment_id
-          FROM dependency_closure
-          JOIN assignment_dependencies dependency_link ON dependency_link.assignment_id = dependency_closure.prerequisite_id
-        )
-        SELECT pending_write.id, pending_write.title, pending_write.status FROM assignments pending_write
-        WHERE pending_write.task_id = ? AND pending_write.id != ?
-          AND pending_write.requires_write = 1 AND pending_write.status IN ('queued', 'claimed')
-          AND NOT EXISTS (
-            SELECT 1 FROM dependency_closure
-            WHERE dependency_closure.assignment_id = pending_write.id AND dependency_closure.prerequisite_id = ?
-          )
-        ORDER BY pending_write.created_at ASC
-      `).all(assignment.task_id, assignment.id, assignment.id);
-      if (writers.length) {
-        add("awaiting_writer", `Verification waits for the writer “${writers[0].title}” to finish${writers.length > 1 ? ` (and ${writers.length - 1} more)` : ""}.`, { writers });
-      }
+    if (failed.has("awaiting_writer")) {
+      const writers = this.#blockingWriters(assignment.id);
+      add("awaiting_writer", `Verification waits for the writer “${writers[0].title}” to finish${writers.length > 1 ? ` (and ${writers.length - 1} more)` : ""}.`, { writers });
     }
 
     if (assignment.requires_write) {
