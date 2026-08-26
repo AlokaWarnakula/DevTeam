@@ -602,6 +602,102 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
     });
   }));
 
+  server.registerTool("devteam_knowledge_write", {
+    title: "Record something you learned",
+    description: "Write a durable note into the project's knowledge vault. Use this the moment you learn a fact the *next* session would otherwise have to rediscover — an API rate limit, why an obvious approach does not work here, a convention the code follows but does not state, a pitfall that cost you an hour. This is not a progress update (use devteam_message) and not a decision the team voted on (use devteam_propose): it is a fact about the project. Link related notes inline with [[category/slug]] and they become navigable both ways. Notes you write are recorded as 'inferred', never 'verified' — verified means DevTeam observed it, not that you were confident.",
+    inputSchema: {
+      agentId: z.string().uuid(),
+      taskId: z.string().uuid(),
+      category: z.enum(["architecture", "decisions", "components", "conventions", "pitfalls", "workflows"])
+        .describe("architecture: how the system fits together. decisions: a choice and its reason. components: what one part does. conventions: a rule the project follows. pitfalls: something that will bite the next person. workflows: how a recurring job is done."),
+      title: z.string().min(1).max(200).describe("The fact as a short statement, not a topic — 'The billing API rate-limits at 30 requests/minute', not 'Billing API'"),
+      body: z.string().min(1).max(4000).describe("The fact itself, with enough context to act on. Use [[category/slug]] to link related notes."),
+      confidence: z.enum(["low", "medium", "high"]).default("medium").describe("How sure you are. Be honest: a low-confidence note is still worth recording and is ranked accordingly."),
+      relatedFiles: z.array(z.string().max(500)).max(20).default([]).describe("Project-relative files this fact concerns, so it goes stale when they change"),
+    },
+  }, safe(async (args) => {
+    requireIdentity(args.agentId);
+    return withInbox(args.agentId, store.knowledgeWrite(args));
+  }));
+
+  server.registerTool("devteam_knowledge_maintain", {
+    title: "Knowledge that needs attention",
+    description: "Notes nobody has confirmed in a long time, and notes flagged as contradicting each other. A fact does not become false by getting old, but an unconfirmed one is a weaker basis for acting — and DevTeam ranks it lower until someone checks it. Work this queue when the room is quiet: confirm what still holds with devteam_knowledge_confirm, write over what does not.",
+    inputSchema: {
+      agentId: z.string().uuid(),
+      taskId: z.string().uuid(),
+      olderThanDays: z.number().int().min(1).max(3650).default(90),
+      limit: z.number().int().min(1).max(100).default(20),
+    },
+  }, safe(async (args) => {
+    requireIdentity(args.agentId);
+    return withInbox(args.agentId, store.knowledgeMaintenance(args));
+  }));
+
+  server.registerTool("devteam_knowledge_confirm", {
+    title: "Confirm a knowledge note still holds",
+    description: "Say that a note is still true of the project as it stands now. This is the only thing that resets a note's age, so use it only after actually checking — re-reading a note is not confirmation.",
+    inputSchema: { agentId: z.string().uuid(), taskId: z.string().uuid(), noteId: z.string().min(1).max(64) },
+  }, safe(async (args) => {
+    requireIdentity(args.agentId);
+    return withInbox(args.agentId, store.knowledgeConfirm(args));
+  }));
+
+  server.registerTool("devteam_knowledge_dispute", {
+    title: "Flag two knowledge notes as contradicting each other",
+    description: "When two notes about the same subject cannot both be true, say so. Both drop to 'disputed' and stop being served in briefings until resolved — better a gap than confidently serving one of two contradictory facts. devteam_knowledge_write tells you about likely conflicts when you write a note; this is how you act on that.",
+    inputSchema: {
+      agentId: z.string().uuid(),
+      taskId: z.string().uuid(),
+      noteIds: z.array(z.string().min(1).max(64)).min(2).max(10),
+      reason: z.string().min(1).max(1000).describe("What the disagreement is"),
+    },
+  }, safe(async (args) => {
+    requireIdentity(args.agentId);
+    return withInbox(args.agentId, store.knowledgeDispute(args));
+  }));
+
+  server.registerTool("devteam_knowledge_share", {
+    title: "Offer a lesson to other projects",
+    description: "Mark a convention or pitfall as worth carrying to other projects on this server, or withdraw it. Only conventions and pitfalls can be shared: an architecture note or a decision is about this system in particular and cannot be true elsewhere. A note containing anything credential-shaped is refused. Read what others have shared with devteam_knowledge_borrowed.",
+    inputSchema: {
+      agentId: z.string().uuid(),
+      taskId: z.string().uuid(),
+      noteId: z.string().min(1).max(64),
+      shared: z.boolean().default(true),
+    },
+  }, safe(async (args) => {
+    requireIdentity(args.agentId);
+    return withInbox(args.agentId, store.knowledgeShare(args));
+  }));
+
+  server.registerTool("devteam_knowledge_borrowed", {
+    title: "Lessons other projects have shared",
+    description: "Conventions and pitfalls other projects on this server chose to share. Each says which project it came from. Confirm a borrowed lesson applies here before acting on it — it was learned somewhere else.",
+    inputSchema: {
+      agentId: z.string().uuid(),
+      taskId: z.string().uuid(),
+      query: z.string().max(200).default(""),
+      limit: z.number().int().min(1).max(50).default(10),
+    },
+  }, safe(async (args) => {
+    requireIdentity(args.agentId);
+    return withInbox(args.agentId, store.knowledgeShared(args));
+  }));
+
+  server.registerTool("devteam_knowledge_links", {
+    title: "See what references a knowledge note",
+    description: "What points at this note, and what it points at. Use it to judge whether a note is load-bearing before acting against it: a decision with six things referencing it is not one to quietly reverse. Note IDs come from devteam_knowledge results.",
+    inputSchema: {
+      agentId: z.string().uuid(),
+      taskId: z.string().uuid(),
+      noteId: z.string().min(1).max(64),
+    },
+  }, safe(async (args) => {
+    requireIdentity(args.agentId);
+    return withInbox(args.agentId, store.knowledgeLinks(args));
+  }));
+
   server.registerTool("devteam_roles", {
     title: "List the roles this project uses",
     description: "The roles this project defines, and what each one means to the scheduler. A project sets these in .devteam/roles.json and may use its own vocabulary — `analyst`, `fact-checker`, `domain-expert`, `copy-editor` — rather than software job titles. Two behaviours matter: a role that `verifies` reads the work rather than changing it, so its assignments wait for pending writers and completing one earns the right to approve or request changes; a role that `plans` decides what the team does next. Read this before devteam_assign if you are creating work in a project you have not seen.",

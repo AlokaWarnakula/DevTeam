@@ -182,8 +182,19 @@ export function rankKnowledgeNotes(notes, context = {}, limit = 12) {
       score += 15;
       why.push("recently validated");
     }
+    // T3.5: age-weight what is left. A fact does not become false by getting old, but a note nobody
+    // has confirmed in half a year is a weaker basis for acting than one confirmed last week, and
+    // before this they scored identically. The weight decays from the last *confirmation*, not from
+    // creation — so re-confirming an old note makes it current again, which is the honest rule.
+    const lastConfirmed = note.verified_at || note.last_validated_at || note.updated_at;
+    const ageWeight = KnowledgeVault.ageWeight(lastConfirmed, anchor || Date.now());
+    // Applied as a bounded penalty rather than a multiplier: scaling the whole score would let age
+    // erase a direct path match, and "old but exactly about this file" is still the right note.
+    const agePenalty = Math.round((1 - ageWeight) * 40);
+    if (agePenalty >= 20) why.push("unconfirmed for a long time");
+    score -= agePenalty;
     const sourceAssignmentId = parseJson(note.source_metadata, {})?.assignmentId || null;
-    return { ...note, relevanceScore: score, whyIncluded: why.slice(0, 5).join(", "), sourceAssignmentId };
+    return { ...note, relevanceScore: score, ageWeight, lastConfirmedAt: lastConfirmed, whyIncluded: why.slice(0, 5).join(", "), sourceAssignmentId };
   }).sort((left, right) => right.relevanceScore - left.relevanceScore
     || Number(right.source_task_id === context.taskId) - Number(left.source_task_id === context.taskId)
     || String(right.updated_at).localeCompare(String(left.updated_at))
@@ -247,6 +258,7 @@ export class KnowledgeVault {
     this.db = db;
     this.enabled = Boolean(enabled);
     this.#migrate();
+    this.#initFts();
   }
 
   #migrate() {
@@ -289,13 +301,143 @@ export class KnowledgeVault {
       ["status_changed_at", "TEXT"],
       ["last_validated_at", "TEXT"],
       ["last_validated_version", "INTEGER"],
+      // T3.6: a lesson worth carrying to other projects. Opt-in per note and never the default —
+      // this is the one place in DevTeam where one client's details could end up in another's
+      // context, so it has to be a deliberate act rather than something that happens by inheritance.
+      ["shared_scope", "INTEGER NOT NULL DEFAULT 0"],
     ]) {
       if (!columns.has(column)) this.db.exec(`ALTER TABLE knowledge_notes ADD COLUMN ${column} ${ddl}`);
     }
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_knowledge_project_status
         ON knowledge_notes(project_id, status, updated_at DESC);
+
+      -- The vault has always emitted [[wikilinks]] but kept no index of them, so "what references
+      -- this decision?" could only be answered by scanning every note's body. Maintained on write.
+      --
+      -- to_note_id is computed from the link target rather than looked up, because a note's id is a
+      -- pure function of (project, category, slug). A link written before its target exists already
+      -- points at the right id and simply starts resolving the moment that note is created — so a
+      -- forward reference is an ordinary link rather than a dangling one that needs repairing.
+      CREATE TABLE IF NOT EXISTS knowledge_links (
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        from_note_id TEXT NOT NULL,
+        target TEXT NOT NULL,
+        to_note_id TEXT,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (from_note_id, target)
+      );
+      CREATE INDEX IF NOT EXISTS idx_knowledge_links_to ON knowledge_links(to_note_id);
+      CREATE INDEX IF NOT EXISTS idx_knowledge_links_project ON knowledge_links(project_id);
     `);
+  }
+
+  // T3.3 — retrieval was substring matching plus recency, which is the mechanism that decides what an
+  // agent knows, so its quality caps the whole system's. BM25 over FTS5 is a large improvement for no
+  // new dependency: SQLite ships it, and the project's standing decision to avoid a vector store
+  // stays intact. (`Don't add a vector store yet` — ROADMAP. FTS5 is what buys that time.)
+  //
+  // Built defensively: a SQLite build without FTS5 leaves `ftsEnabled` false and search falls back to
+  // exactly the previous LIKE behaviour, rather than the vault becoming unsearchable.
+  #initFts() {
+    try {
+      this.db.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(
+          note_id UNINDEXED, title, body, related, tokenize='porter unicode61'
+        );
+      `);
+      this.ftsEnabled = true;
+    } catch {
+      this.ftsEnabled = false;
+      return;
+    }
+    // Backfill once for a vault that predates the index. Guarded on emptiness rather than a flag:
+    // the FTS table is derived data, so rebuilding it is always safe and never loses anything.
+    try {
+      const indexed = Number(this.db.prepare("SELECT COUNT(*) AS count FROM knowledge_fts").get().count);
+      if (indexed === 0) {
+        for (const note of this.db.prepare("SELECT id, title, body, related_files FROM knowledge_notes").all()) {
+          this.#indexFts(note.id, note.title, note.body, note.related_files);
+        }
+      }
+    } catch { /* a backfill failure must never stop the server starting */ }
+  }
+
+  #indexFts(noteId, title, body, relatedFiles) {
+    if (!this.ftsEnabled) return;
+    try {
+      this.db.prepare("DELETE FROM knowledge_fts WHERE note_id = ?").run(noteId);
+      this.db.prepare("INSERT INTO knowledge_fts (note_id, title, body, related) VALUES (?, ?, ?, ?)")
+        .run(noteId, String(title || ""), String(body || ""),
+          (Array.isArray(parseJson(relatedFiles, [])) ? parseJson(relatedFiles, []) : []).join(" "));
+    } catch { /* indexing is best-effort; the note itself is already stored */ }
+  }
+
+  // Agent- and human-written queries are prose, and FTS5 MATCH is a small language with operators
+  // (AND, OR, NOT, NEAR, *, ", ^, -). Passing prose straight in is both a syntax error waiting to
+  // happen and a way for a stray `-` to silently invert a search. Every term is therefore quoted as a
+  // literal phrase and joined with OR, so nothing in the text can be read as an operator, and bm25
+  // does the ranking: a note matching four terms outranks one matching one.
+  #ftsQuery(query) {
+    const terms = String(query || "")
+      .split(/[^\p{L}\p{N}_]+/u)
+      .map((term) => term.trim())
+      .filter((term) => term.length >= 2)
+      .slice(0, 12);
+    if (!terms.length) return null;
+    return terms.map((term) => `"${term.replace(/"/g, "")}"*`).join(" OR ");
+  }
+
+  // The id a note has, or would have. Pure function of where it lives, which is what lets a link be
+  // resolved without the target existing yet.
+  static noteId(projectId, category, slug) {
+    return createHash("sha256").update(`${projectId}:${category}:${slug}`).digest("hex").slice(0, 24);
+  }
+
+  // Rewrite one note's outgoing links. Targets are taken as written: `[[category/slug]]`, with an
+  // optional `|label` that is display only. A bare `[[architecture]]` names a category index rather
+  // than a note, so it is recorded with a null target id — it is a real link, just not to a note.
+  #indexLinks(projectId, noteId, body, stamp) {
+    this.db.prepare("DELETE FROM knowledge_links WHERE from_note_id = ?").run(noteId);
+    const seen = new Set();
+    for (const match of String(body || "").matchAll(/\[\[([^\]|]{1,200})(?:\|[^\]]{0,200})?\]\]/g)) {
+      const target = match[1].trim();
+      if (!target || seen.has(target)) continue;
+      seen.add(target);
+      const parts = target.split("/");
+      const toNoteId = parts.length === 2 && parts[0] && parts[1]
+        ? KnowledgeVault.noteId(projectId, parts[0], parts[1])
+        : null;
+      if (toNoteId === noteId) continue; // a note linking to itself is noise, not a backlink
+      this.db.prepare(`
+        INSERT INTO knowledge_links (project_id, from_note_id, target, to_note_id, created_at)
+        VALUES (?, ?, ?, ?, ?) ON CONFLICT(from_note_id, target) DO NOTHING
+      `).run(projectId, noteId, target, toNoteId, stamp);
+    }
+  }
+
+  // What references this note. The whole point of T3.4: a decision can now be read together with
+  // everything that depended on it, instead of looking equally isolated however load-bearing it is.
+  backlinks(noteId, { limit = 20 } = {}) {
+    return this.db.prepare(`
+      SELECT source.id, source.category, source.slug, source.title, source.status, source.confidence, source.updated_at
+      FROM knowledge_links link
+      JOIN knowledge_notes source ON source.id = link.from_note_id
+      WHERE link.to_note_id = ?
+      ORDER BY source.updated_at DESC LIMIT ?
+    `).all(noteId, Math.max(1, Math.min(100, Number(limit) || 20)))
+      .map((note) => ({ ...note, link: `[[${note.category}/${note.slug}]]` }));
+  }
+
+  // Where this note points, with whether each target exists yet.
+  outboundLinks(noteId, { limit = 40 } = {}) {
+    return this.db.prepare(`
+      SELECT link.target, link.to_note_id, target_note.title, target_note.status
+      FROM knowledge_links link
+      LEFT JOIN knowledge_notes target_note ON target_note.id = link.to_note_id
+      WHERE link.from_note_id = ? ORDER BY link.target ASC LIMIT ?
+    `).all(noteId, Math.max(1, Math.min(200, Number(limit) || 40)))
+      .map((row) => ({ target: row.target, noteId: row.to_note_id, title: row.title || null, status: row.status || null, resolved: Boolean(row.title) }));
   }
 
   initializeProject(projectId) {
@@ -476,7 +618,7 @@ export class KnowledgeVault {
   }
 
   #upsert(note) {
-    const id = createHash("sha256").update(`${note.projectId}:${note.category}:${note.slug}`).digest("hex").slice(0, 24);
+    const id = KnowledgeVault.noteId(note.projectId, note.category, note.slug);
     const existing = this.db.prepare("SELECT * FROM knowledge_notes WHERE id = ?").get(id);
     const provenance = [...parseJson(existing?.provenance, []), note.provenance]
       .filter((item, index, all) => all.findIndex((other) => other.eventId === item.eventId && other.type === item.type) === index)
@@ -505,6 +647,9 @@ export class KnowledgeVault {
       JSON.stringify(relatedFiles), JSON.stringify(provenance), existing?.created_at || note.createdAt,
       note.createdAt, note.verifiedAt || null, note.supersededBy || null, note.staleReason || null,
       note.statusChangedAt || note.createdAt, note.verifiedAt || null, note.validatedVersion || null);
+    this.#indexLinks(note.projectId, id, note.body, note.createdAt);
+    const stored = this.db.prepare("SELECT title, body, related_files FROM knowledge_notes WHERE id = ?").get(id);
+    this.#indexFts(id, stored?.title, stored?.body, stored?.related_files);
     return id;
   }
 
@@ -614,6 +759,233 @@ export class KnowledgeVault {
     return generated;
   }
 
+  // T3.6 — cross-project memory.
+  //
+  // Knowledge is project-scoped, so a lesson learned in one project could not inform another: the
+  // same pitfall got rediscovered per repository. Sharing is opt-in per note and deliberately not
+  // inherited from anything, because this is the one place where one client's details could reach
+  // another's context.
+  //
+  // Only `conventions` and `pitfalls` may be shared. An architecture note, a component description
+  // or a decision is *about* a particular system and cannot be true elsewhere — offering it to
+  // another project would be shipping a claim that does not apply. A convention ("we pin exact
+  // versions") and a pitfall ("this vendor's API silently truncates at 1000") travel.
+  static SHAREABLE_CATEGORIES = ["conventions", "pitfalls"];
+
+  shareNote(projectId, noteId, { shared = true } = {}) {
+    const note = this.db.prepare("SELECT id, category, title, body FROM knowledge_notes WHERE project_id = ? AND id = ?").get(projectId, noteId);
+    if (!note) throw new Error("Note not found in this project.");
+    if (shared && !KnowledgeVault.SHAREABLE_CATEGORIES.includes(note.category)) {
+      throw new Error(`Only ${KnowledgeVault.SHAREABLE_CATEGORIES.join(" and ")} notes can be shared across projects — anything else is about this system in particular and cannot be true elsewhere.`);
+    }
+    // Re-redact on the way out. The note was already redacted when written, but sharing changes who
+    // can read it, and a rule that only ran at write time would carry whatever it missed then.
+    if (shared) {
+      const carried = `${note.title}\n${note.body}`;
+      if (redact(carried) !== carried) {
+        throw new Error("This note contains something that looks like a credential or secret. It cannot be shared across projects.");
+      }
+    }
+    this.db.prepare("UPDATE knowledge_notes SET shared_scope = ? WHERE id = ?").run(shared ? 1 : 0, noteId);
+    return { noteId, shared: Boolean(shared), category: note.category };
+  }
+
+  // Shared notes from *other* projects. Never mixed into a project's own list silently: the caller
+  // asks for them, and each one says where it came from, so an agent can weigh a borrowed lesson
+  // differently from something learned here.
+  sharedFromOtherProjects(projectId, { limit = 10, query = "" } = {}) {
+    const clean = String(query || "").trim();
+    const rows = this.db.prepare(`
+      SELECT k.id, k.category, k.slug, k.title, k.body, k.confidence, k.updated_at, k.verified_at, p.name AS project_name
+      FROM knowledge_notes k JOIN projects p ON p.id = k.project_id
+      WHERE k.shared_scope = 1 AND k.project_id != ? AND k.status IN ('verified', 'inferred')
+      ORDER BY COALESCE(k.verified_at, k.updated_at) DESC LIMIT 200
+    `).all(projectId);
+    const wanted = clean.toLowerCase();
+    return rows
+      .filter((row) => !wanted || `${row.title} ${row.body}`.toLowerCase().includes(wanted))
+      .slice(0, Math.max(1, Math.min(50, Number(limit) || 10)))
+      .map((row) => ({
+        id: row.id, category: row.category, title: short(row.title, 200), body: clip(row.body, 1_200),
+        confidence: row.confidence, fromProject: row.project_name,
+        ageWeight: KnowledgeVault.ageWeight(row.verified_at || row.updated_at),
+        note: "Learned in another project. Confirm it applies here before acting on it.",
+      }));
+  }
+
+  // T3.2 — contradiction detection.
+  //
+  // Notes carry status verified/disputed/superseded, but nothing ever *detected* that a new note
+  // disagreed with an old one — superseding was triggered by files changing, not by meaning. So two
+  // agents could hold opposing "verified" facts indefinitely, and whichever the ranker happened to
+  // surface became what the next session believed.
+  //
+  // This does not try to understand the claims. It finds notes that are *about the same thing* — same
+  // category and overlapping subject terms, or the same related files — and says "these two are
+  // about one subject and say different things, someone should decide". Detection is cheap and
+  // conservative; resolution is the team's job, which is what the proposal mechanism is already for.
+  #conflictCandidates(projectId, note, noteId, limit = 5) {
+    const subject = new Set(String(note.title || "").toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((word) => word.length >= 4));
+    if (!subject.size) return [];
+    const files = new Set((note.relatedFiles || []).map((file) => String(file)));
+    const rows = this.db.prepare(`
+      SELECT id, category, slug, title, body, status, confidence, related_files, updated_at
+      FROM knowledge_notes
+      WHERE project_id = ? AND id != ? AND category = ? AND status IN ('verified', 'inferred')
+      ORDER BY updated_at DESC LIMIT 60
+    `).all(projectId, noteId, note.category);
+    const scored = [];
+    for (const row of rows) {
+      const otherSubject = new Set(String(row.title || "").toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((word) => word.length >= 4));
+      const shared = [...subject].filter((word) => otherSubject.has(word));
+      const sharedFiles = [...files].filter((file) => (parseJson(row.related_files, []) || []).includes(file));
+      // Two independent ways of being about the same thing. Either alone is enough — notes about one
+      // file often have unlike titles, and notes about one idea often touch no files at all.
+      const overlap = shared.length / Math.max(2, Math.min(subject.size, otherSubject.size));
+      if (overlap < 0.5 && !sharedFiles.length) continue;
+      // Same subject, same words: this is a restatement, not a disagreement.
+      if (String(row.body || "").trim() === String(note.body || "").trim()) continue;
+      scored.push({
+        id: row.id, category: row.category, slug: row.slug, title: row.title,
+        status: row.status, confidence: row.confidence, updatedAt: row.updated_at,
+        link: `[[${row.category}/${row.slug}]]`,
+        sharedTerms: shared.slice(0, 8),
+        sharedFiles: sharedFiles.slice(0, 8),
+        score: Number((overlap + sharedFiles.length * 0.5).toFixed(2)),
+      });
+    }
+    return scored.sort((left, right) => right.score - left.score).slice(0, limit);
+  }
+
+  // Mark two notes as disagreeing. Both are moved to `disputed`, which the ordinary brief and search
+  // paths already exclude — so a contested fact stops being quietly served as truth the moment the
+  // disagreement is noticed, rather than after someone resolves it.
+  disputeNotes(projectId, noteIds, reason) {
+    const stamp = new Date().toISOString();
+    const ids = [...new Set(noteIds.filter(Boolean))].slice(0, 10);
+    if (ids.length < 2) return { disputed: 0 };
+    const placeholders = ids.map(() => "?").join(", ");
+    const changes = this.db.prepare(`
+      UPDATE knowledge_notes SET status = 'disputed', stale_reason = ?, status_changed_at = ?
+      WHERE project_id = ? AND id IN (${placeholders}) AND status != 'disputed'
+    `).run(String(reason || "Two notes about the same subject disagree.").slice(0, 500), stamp, projectId, ...ids).changes;
+    for (const id of ids) {
+      const note = this.db.prepare("SELECT title, body, related_files FROM knowledge_notes WHERE id = ?").get(id);
+      if (note) this.#indexFts(id, note.title, note.body, note.related_files);
+    }
+    return { disputed: Number(changes) || 0, noteIds: ids };
+  }
+
+  // T3.5 — memory decay.
+  //
+  // Nothing aged. A `verified` note from six months and forty task versions ago read exactly like one
+  // written this morning, so the ranker kept serving facts about a system that had moved on.
+  //
+  // This is scoring, not schema: `verifiedAt` already existed. Confidence decays with age from the
+  // last time the fact was actually confirmed, which is what makes it honest — a note re-verified
+  // yesterday is current however old it is, and one written confidently a year ago is not.
+  static AGE_HALF_LIFE_DAYS = 120;
+
+  static ageWeight(stamp, now = Date.now()) {
+    const at = Date.parse(stamp || "");
+    if (!Number.isFinite(at)) return 0.5;         // unknown age is neither fresh nor stale
+    const days = Math.max(0, (now - at) / 86_400_000);
+    return Number(Math.pow(0.5, days / KnowledgeVault.AGE_HALF_LIFE_DAYS).toFixed(4));
+  }
+
+  // Notes that have not been confirmed in a long time, worst first: a queue a maintainer agent can
+  // work through. Deliberately a *queue* rather than an automatic downgrade — a fact does not become
+  // false by being old, it becomes unconfirmed, and those are different claims.
+  staleKnowledge(projectId, { olderThanDays = 90, limit = 20 } = {}) {
+    const cutoff = new Date(Date.now() - Math.max(1, Number(olderThanDays) || 90) * 86_400_000).toISOString();
+    return this.db.prepare(`
+      SELECT id, category, slug, title, status, confidence, verified_at, updated_at, revision
+      FROM knowledge_notes
+      WHERE project_id = ? AND status IN ('verified', 'inferred')
+        AND COALESCE(verified_at, updated_at) < ?
+      ORDER BY COALESCE(verified_at, updated_at) ASC LIMIT ?
+    `).all(projectId, cutoff, Math.max(1, Math.min(100, Number(limit) || 20)))
+      .map((note) => ({
+        ...note,
+        link: `[[${note.category}/${note.slug}]]`,
+        ageWeight: KnowledgeVault.ageWeight(note.verified_at || note.updated_at),
+        lastConfirmedAt: note.verified_at || note.updated_at,
+        next: "Confirm it against the project as it stands now, correct it, or supersede it.",
+      }));
+  }
+
+  // Confirm a note is still true. This is what resets its age, and the only thing that should.
+  confirmNote(projectId, noteId, { author = "agent" } = {}) {
+    const stamp = new Date().toISOString();
+    const changes = this.db.prepare(`
+      UPDATE knowledge_notes SET verified_at = ?, last_validated_at = ?, source_author = ?
+      WHERE project_id = ? AND id = ?
+    `).run(stamp, stamp, String(author).slice(0, 120), projectId, noteId).changes;
+    return { confirmed: Boolean(changes), noteId, confirmedAt: stamp };
+  }
+
+  // T3.1 — a first-class place for an agent to put something it *learned*.
+  //
+  // The vault was one-way: every note was derived from an event, so an agent that discovered "this
+  // API rate-limits at 30/min" had nowhere to record it except prose in a report, where retrieval
+  // would never find it as a fact. devteam_note_set exists but writes flat key/value notes outside
+  // the vault's category/status/confidence model.
+  //
+  // A written note is subject to exactly the same rules as a derived one — same redaction, same
+  // slug, same upsert, same link indexing — with two deliberate limits:
+  //
+  //   * status is never `verified`. An agent asserting something is `inferred`, however sure it
+  //     sounds. `verified` means DevTeam watched it happen (a completed assignment, an adopted
+  //     proposal), and letting an agent claim it would make the distinction worthless exactly where
+  //     it matters most: deciding what to believe in the next session's briefing.
+  //   * `sessions` and `archive` are not writable categories. They are DevTeam's own bookkeeping.
+  write({ projectId, category, title, body, confidence = "medium", relatedFiles = [], author = "agent", taskId = null, eventId = null }) {
+    if (!this.enabled) return { written: false, reason: "The knowledge vault is disabled for this server." };
+    const cleanCategory = String(category || "").trim().toLowerCase();
+    if (!CATEGORIES.includes(cleanCategory)) {
+      throw new Error(`Unknown knowledge category "${category}". Use one of: ${CATEGORIES.join(", ")}.`);
+    }
+    const cleanTitle = String(title || "").trim();
+    const cleanBody = String(body || "").trim();
+    if (!cleanTitle) throw new Error("A knowledge note needs a title.");
+    if (!cleanBody) throw new Error("A knowledge note needs a body — the fact you learned, in a sentence or two.");
+    const cleanConfidence = ["low", "medium", "high"].includes(String(confidence).toLowerCase())
+      ? String(confidence).toLowerCase() : "medium";
+    const stamp = new Date().toISOString();
+    const slug = slugify(cleanTitle);
+    const id = this.#upsert({
+      projectId, category: cleanCategory, slug,
+      title: redact(cleanTitle), body: redact(cleanBody),
+      status: "inferred",
+      confidence: cleanConfidence,
+      sourceTaskId: taskId, sourceEventId: eventId, sourceAuthor: author,
+      relatedFiles, createdAt: stamp,
+      provenance: { type: "agent.note", eventId: eventId ?? null, author, at: stamp },
+    });
+    const note = this.db.prepare("SELECT * FROM knowledge_notes WHERE id = ?").get(id);
+    // T3.2: does this disagree with something the project already believes? Detected on write, while
+    // the agent that wrote it is still here and can say which is right — not months later when a
+    // briefing quietly serves one of two contradictory "verified" facts.
+    const conflicts = this.#conflictCandidates(projectId, {
+      category: cleanCategory, title: cleanTitle, body: cleanBody, relatedFiles,
+    }, id);
+    return {
+      written: true,
+      note: {
+        id, category: cleanCategory, slug, title: note.title, status: note.status,
+        confidence: note.confidence, revision: note.revision,
+        link: `[[${cleanCategory}/${slug}]]`,
+      },
+      links: this.outboundLinks(id),
+      backlinks: this.backlinks(id),
+      ...(conflicts.length ? {
+        possibleConflicts: conflicts,
+        conflictNext: "These existing notes are about the same subject and say something different. If one is wrong, supersede it; if the team disagrees, raise it with devteam_propose — do not leave two contradictory facts standing.",
+      } : {}),
+      next: "Written as an inferred note. It becomes verified only when DevTeam observes it, not by asserting it.",
+    };
+  }
+
   #reconcileGeneratedFiles(vault, expected) {
     for (const folder of [...CATEGORIES, "sessions", "archive"]) {
       const directory = path.join(vault, folder);
@@ -686,20 +1058,51 @@ export class KnowledgeVault {
     if (status) { clauses.push("status = ?"); args.push(status); }
     else clauses.push("status IN ('verified', 'inferred')");
     const cleanQuery = String(query || "").trim();
-    if (cleanQuery) {
-      clauses.push("(title LIKE ? ESCAPE '\\' OR body LIKE ? ESCAPE '\\' OR related_files LIKE ? ESCAPE '\\')");
-      const escaped = cleanQuery.replace(/[\\%_]/g, (match) => `\\${match}`);
-      args.push(`%${escaped}%`, `%${escaped}%`, `%${escaped}%`);
-    }
-    args.push(taskId, Math.max(1, Math.min(50, Number(limit) || 20)));
-    const rows = this.db.prepare(`
-      SELECT id, category, slug, title, body, status, confidence, source_task_id, source_event_id,
+    const bounded = Math.max(1, Math.min(50, Number(limit) || 20));
+    const columns = `id, category, slug, title, body, status, confidence, source_task_id, source_event_id,
              source_author, related_files, updated_at, verified_at, revision,
-             superseded_by, stale_reason, status_changed_at, last_validated_at, last_validated_version
-      FROM knowledge_notes WHERE ${clauses.join(" AND ")}
-      ORDER BY CASE WHEN source_task_id = ? THEN 0 ELSE 1 END, verified_at IS NULL, updated_at DESC
-      LIMIT ?
-    `).all(...args);
+             superseded_by, stale_reason, status_changed_at, last_validated_at, last_validated_version`;
+
+    // Ranked retrieval when there is something to rank. Relevance leads, and the previous ordering —
+    // this task's own notes first, then verified, then recent — breaks ties within it, so a note from
+    // the task at hand still wins against an equally relevant one from somewhere else. Title is
+    // weighted well above body: a note *about* a thing beats one that mentions it in passing.
+    let rows = null;
+    const matchExpression = cleanQuery && this.ftsEnabled ? this.#ftsQuery(cleanQuery) : null;
+    if (matchExpression) {
+      try {
+        rows = this.db.prepare(`
+          SELECT ${columns}
+          FROM knowledge_notes
+          JOIN knowledge_fts ON knowledge_fts.note_id = knowledge_notes.id
+          WHERE ${clauses.join(" AND ")} AND knowledge_fts MATCH ?
+          ORDER BY bm25(knowledge_fts, 6.0, 1.0, 2.0),
+                   CASE WHEN source_task_id = ? THEN 0 ELSE 1 END, verified_at IS NULL, updated_at DESC
+          LIMIT ?
+        `).all(...args, matchExpression, taskId, bounded);
+      } catch {
+        rows = null; // a match expression SQLite refuses degrades to the fallback, never to an error
+      }
+    }
+
+    // No query, no FTS5 in this SQLite build, or a ranked search that found nothing: fall back to
+    // exactly the previous behaviour. The fallback earns its place — FTS matches whole tokens, so a
+    // search for a fragment inside a word finds nothing until LIKE answers it.
+    if (!rows || !rows.length) {
+      const fallbackClauses = [...clauses];
+      const fallbackArgs = [...args];
+      if (cleanQuery) {
+        fallbackClauses.push("(title LIKE ? ESCAPE '\\' OR body LIKE ? ESCAPE '\\' OR related_files LIKE ? ESCAPE '\\')");
+        const escaped = cleanQuery.replace(/[\\%_]/g, (match) => `\\${match}`);
+        fallbackArgs.push(`%${escaped}%`, `%${escaped}%`, `%${escaped}%`);
+      }
+      rows = this.db.prepare(`
+        SELECT ${columns}
+        FROM knowledge_notes WHERE ${fallbackClauses.join(" AND ")}
+        ORDER BY CASE WHEN source_task_id = ? THEN 0 ELSE 1 END, verified_at IS NULL, updated_at DESC
+        LIMIT ?
+      `).all(...fallbackArgs, taskId, bounded);
+    }
     return rows.map((note) => ({
       ...note, title: short(note.title, 200), body: clip(note.body, 4_000), relatedFiles: parseJson(note.related_files, []), related_files: undefined,
       link: `[[${note.status === "archived" || note.category === "archive" ? "archive" : note.category}/${note.slug}]]`,

@@ -4930,7 +4930,120 @@ export class DevTeamStore extends EventEmitter {
     return {
       automated: this.knowledge.enabled,
       vaultPath: path.join(task.project_root, "knowledge"),
-      notes: this.knowledge.search(task.project_id, taskId, { query, category, status, limit }),
+      // Every result carries what points at it, so a decision is read together with what depended
+      // on it rather than looking equally isolated however load-bearing it turns out to be.
+      notes: this.knowledge.search(task.project_id, taskId, { query, category, status, limit })
+        .map((note) => ({ ...note, backlinks: this.knowledge.backlinks(note.id, { limit: 5 }) })),
+    };
+  }
+
+  // An agent recording something it learned, as a first-class vault note rather than prose in a
+  // report. Membership-scoped like every other task-shaped action, and written under the agent's own
+  // name so the timeline and the note agree about who claimed it.
+  knowledgeWrite({ agentId = null, taskId, category, title, body, confidence = "medium", relatedFiles = [] }) {
+    const task = this.getTask(taskId);
+    if (!task) throw new Error("Task not found.");
+    this.assertMembership(agentId, taskId);
+    const agent = agentId ? this.getAgent(agentId) : null;
+    const author = agent?.name || "the human";
+    const eventId = this.#event(taskId, agentId, "agent.finding", `${author} recorded: ${String(title || "").trim()}`, {
+      category: String(category || "").trim().toLowerCase(),
+      confidence,
+      knowledgeNote: true,
+    });
+    const result = this.knowledge.write({
+      projectId: task.project_id, category, title, body, confidence,
+      relatedFiles, author, taskId, eventId,
+    });
+    if (result.written) {
+      try { this.knowledge.exportProject(task.project_id); } catch { /* the vault export is best-effort, as elsewhere */ }
+    }
+    this.#changed("knowledge.written", taskId);
+    return { ...result, vaultPath: path.join(task.project_root, "knowledge") };
+  }
+
+  // Knowledge maintenance, all membership-scoped through a task room like every other agent action.
+
+  // What has not been confirmed in a long time, plus anything currently disputed. A maintainer agent
+  // works this queue; the human sees it on the board.
+  knowledgeMaintenance({ agentId = null, taskId, olderThanDays = 90, limit = 20 }) {
+    const task = this.getTask(taskId);
+    if (!task) throw new Error("Task not found.");
+    this.assertMembership(agentId, taskId);
+    const disputed = this.knowledge.search(task.project_id, taskId, { status: "disputed", limit });
+    return {
+      stale: this.knowledge.staleKnowledge(task.project_id, { olderThanDays, limit }),
+      disputed,
+      next: "Confirm a stale note with devteam_knowledge_confirm if it still holds, correct it by writing over it, or resolve a disputed pair with devteam_propose.",
+    };
+  }
+
+  // Say a note still holds. This is the only thing that resets its age, which is what keeps the
+  // decay honest: re-reading a note is not confirmation, checking it against the project is.
+  knowledgeConfirm({ agentId = null, taskId, noteId }) {
+    const task = this.getTask(taskId);
+    if (!task) throw new Error("Task not found.");
+    this.assertMembership(agentId, taskId);
+    const agent = agentId ? this.getAgent(agentId) : null;
+    const result = this.knowledge.confirmNote(task.project_id, noteId, { author: agent?.name || "the human" });
+    if (!result.confirmed) throw new Error("Note not found in this project.");
+    this.#event(taskId, agentId, "agent.finding", `${agent?.name || "The human"} confirmed a knowledge note still holds.`, { noteId, confirmed: true });
+    this.#changed("knowledge.confirmed", taskId);
+    return result;
+  }
+
+  // Mark notes as disagreeing. Both drop to `disputed`, which briefs and searches already exclude, so
+  // a contested fact stops being served as truth immediately rather than once someone resolves it.
+  knowledgeDispute({ agentId = null, taskId, noteIds, reason }) {
+    const task = this.getTask(taskId);
+    if (!task) throw new Error("Task not found.");
+    this.assertMembership(agentId, taskId);
+    const agent = agentId ? this.getAgent(agentId) : null;
+    const result = this.knowledge.disputeNotes(task.project_id, noteIds, reason);
+    if (!result.disputed) throw new Error("Give at least two note IDs from this project that disagree.");
+    this.#event(taskId, agentId, "agent.finding",
+      `${agent?.name || "The human"} flagged ${result.disputed} knowledge notes as contradicting each other.`,
+      { noteIds: result.noteIds, reason: String(reason || "").slice(0, 500) });
+    this.#changed("knowledge.disputed", taskId);
+    return { ...result, next: "Disputed notes are excluded from briefings until resolved. Decide which is right and write over the other, or raise it with devteam_propose." };
+  }
+
+  // Offer a note to other projects, or withdraw it.
+  knowledgeShare({ agentId = null, taskId, noteId, shared = true }) {
+    const task = this.getTask(taskId);
+    if (!task) throw new Error("Task not found.");
+    this.assertMembership(agentId, taskId);
+    const agent = agentId ? this.getAgent(agentId) : null;
+    const result = this.knowledge.shareNote(task.project_id, noteId, { shared });
+    this.#event(taskId, agentId, "agent.finding",
+      `${agent?.name || "The human"} ${shared ? "shared a lesson with other projects" : "withdrew a lesson from other projects"}.`,
+      { noteId, shared: Boolean(shared) });
+    this.#changed("knowledge.shared", taskId);
+    return result;
+  }
+
+  // Lessons other projects have chosen to share. Kept out of the ordinary knowledge path on purpose:
+  // an agent asks for them, and every one says where it came from and that it needs confirming here.
+  knowledgeShared({ agentId = null, taskId, query = "", limit = 10 }) {
+    const task = this.getTask(taskId);
+    if (!task) throw new Error("Task not found.");
+    this.assertMembership(agentId, taskId);
+    return { notes: this.knowledge.sharedFromOtherProjects(task.project_id, { query, limit }) };
+  }
+
+  // What references a note, and what it references. Membership-scoped through the task room.
+  knowledgeLinks({ agentId = null, taskId, noteId }) {
+    const task = this.getTask(taskId);
+    if (!task) throw new Error("Task not found.");
+    this.assertMembership(agentId, taskId);
+    const note = this.db.prepare("SELECT id, project_id, category, slug, title, status, confidence FROM knowledge_notes WHERE id = ?").get(noteId);
+    // A note in another project is not this room's to read, and "no such note" and "not yours" answer
+    // identically so this cannot be used to enumerate another project's vault.
+    if (!note || note.project_id !== task.project_id) throw new Error("Note not found in this project.");
+    return {
+      note: { id: note.id, category: note.category, slug: note.slug, title: note.title, status: note.status, confidence: note.confidence },
+      backlinks: this.knowledge.backlinks(noteId),
+      links: this.knowledge.outboundLinks(noteId),
     };
   }
 
