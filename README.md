@@ -53,6 +53,8 @@ node bin/devteam.mjs start --workspace C:\Projects\my-app --port 7331 --open
 
 The database and a generated local bearer token are stored in `%LOCALAPPDATA%\DevTeam`. Run `node bin/devteam.mjs token` to print the token again.
 
+Every agent can share that one token, which is right for one person on one machine. When more than one party is involved, issue a token per agent instead — `devteam token --new "Codex desktop"` prints it once and stores only a hash, `--list` shows when each was last used, and `--revoke ID` cuts one off without re-keying anybody else.
+
 ## Connect Codex Desktop
 
 1. Start DevTeam and click the copy button beside **Local server**.
@@ -196,6 +198,8 @@ On Windows a locally installed tool is a `.cmd` shim that `spawn` cannot run wit
 
 Git is optional. A session checkpoint's drift fingerprint records whether the project is a repository at all, and for one that is not, a bounded **workspace digest** of the assignment's own write scope takes git HEAD's place — so a fresh session taking over a manuscript is still told that files moved while it was away.
 
+Checks run in one of three places, chosen per project in the dashboard. **On this machine** is the default and behaves as it always has. **Confined to this folder** uses Node's own permission model, so a test file cannot read `~/.ssh` — it narrows exfiltration but cannot stop execution, because real suites shell out. **In a container** is the one that closes execution: the project names an image in `.devteam/checks.json` and DevTeam runs the check with no network, no inherited environment, nothing mounted but the project directory, and bounded memory and processes. It needs Docker or Podman and adds no dependency if you never select it — and if you do select it and no runtime is available, checks grade `unavailable` rather than quietly running unconfined.
+
 ### Roles are the project's own vocabulary
 
 DevTeam used to ship a fixed list of software job titles, and the `security-reviewer` checklist asked about session fixation and httponly cookies — which a research, legal, or editorial task got asked too. A project now declares its own roles in **`.devteam/roles.json`**:
@@ -241,7 +245,8 @@ DevTeam keeps the room honest automatically. A periodic sweep (and every claim, 
 
 ## Safety
 
-- DevTeam binds to localhost and protects the MCP route with a generated bearer token, rejects non-loopback hosts and foreign origins on the control plane, and binds each agent identity to the MCP session that connected — one session cannot act as another agent.
+- DevTeam binds to localhost and protects the MCP route with a bearer token, rejects non-loopback hosts and foreign origins on the control plane, and binds each agent identity to the MCP session that connected — one session cannot act as another agent. The dashboard's session cookie is issued only when a browser loads the page, never in answer to an API request, so nothing can collect a credential simply by asking for one.
+- Binding to anything other than loopback switches on every restriction at once — no automatic cookie, no unauthenticated reads — and the server refuses to start unless `DEVTEAM_TOKEN` is set to a real secret. An SSH tunnel to a loopback bind is still the better arrangement.
 - Resume, claim, and handoff credentials are hashed at rest and excluded from task/dashboard snapshots. Handoff tokens are task-scoped, expiring, one-time credentials; capsule reads and takeovers require task membership, while observers may read but cannot acquire ownership.
 - Project folders must exist before they can be registered.
 - Write leases are path-scoped: only writers with overlapping paths are serialized, so non-conflicting work runs in parallel without file races. Task rooms keep an agent invoked for one task from reading, messaging, or claiming in another.
@@ -257,5 +262,14 @@ npm run doctor
 node bin/devteam.mjs sync-skill --dest "PATH\TO\your-agent\skills\devteam"
 npm pack --dry-run
 ```
+
+The scheduling core carries two extra guards, because four real deadlocks have lived in the same ~60 lines and three of them were invisible — the board simply stopped moving:
+
+```powershell
+npm run soak      # property suite over a large randomised seed span
+npm run mutation  # breaks one scheduling rule at a time; every behavioural mutant must be caught
+```
+
+A soak failure names a seed. Put that seed in `SEEDS` in `test/devteam-scheduler-properties.test.mjs` and it becomes a permanent regression test — that is the workflow the soak exists to feed. Both run nightly in `.github/workflows/nightly.yml` alongside the suite.
 
 The original command-line bridge remains available as `bridge`, but DevTeam is the recommended desktop/MCP workflow.

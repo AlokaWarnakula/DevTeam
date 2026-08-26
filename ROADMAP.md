@@ -23,7 +23,7 @@ Sizes: **S** ≈ a sitting, **M** ≈ a few days, **L** ≈ a week+, **XL** ≈ 
 
 ### Where this stands
 
-**Sixteen of the twenty roadmap items are done.** DevTeam no longer merely *coordinates* a team: a
+**All twenty roadmap items are done.** DevTeam no longer merely *coordinates* a team: a
 review has two honest outcomes and routes rework back to its author, the room notices when one agent
 breaks another's work and routes a scoped fix to whoever caused it, an agent can divide work that
 turned out too big without losing its lease, and the whole Tier 1 "any task, not one domain" tier is
@@ -35,19 +35,23 @@ are about to touch.
 
 ### What is left
 
-| Item | Size | Why it is still open |
-|---|---|---|
-| **T0.4** — concurrency and durability | L | Not yet needed. The roadmap's own advice: WAL is on, add a durable job table *before* considering multi-process, and **do not reach for Postgres until a measured limit forces it**. |
-| **T4.1** — auth beyond localhost | M | A deliberate hold. The current credential is weak by design for single-user localhost (see *Known and accepted*). It is the blocker **only if DevTeam is ever shared or exposed**, and tightening it costs local convenience for no gain until then. |
-| **T4.4** — container sandboxing for checks | M | Adds a hard Docker/Podman dependency for a protection that only matters when running checks for projects you do not fully trust. The opt-in Node permission model already narrows exfiltration. Worth doing when the trust model changes, not before. |
-| **T4.5 nightly job** | S | The soak *script* exists and works; nothing runs it on a timer, because this repository has no CI. |
+**Every roadmap item is now done.** T0.4, T4.1, T4.4 and the T4.5 nightly job were the last four,
+and each was deliberately scoped rather than built to its maximum — the scoping is the interesting
+part, so it is recorded in each item's ✅ DONE section:
 
-**None of these are blocking ordinary use.** T0.4, T4.1 and T4.4 all become worth doing at the same
-moment: when DevTeam stops being one person's local tool.
+| Item | What was built | What was deliberately left out |
+|---|---|---|
+| **T0.4** | A durable `jobs` table and one-process-per-data-directory | Multi-process. Nothing has hit a measured limit, and the roadmap's own ordering puts durability first |
+| **T4.1** | The cookie handout closed, revocable named tokens, an explicit exposed mode | Users, roles, TLS termination. A tunnel is still the right way to reach it remotely |
+| **T4.4** | Container execution as an opt-in per-project runner | Any hard dependency. No runtime installed means DevTeam behaves exactly as before |
+| **T4.5** | A nightly GitHub Actions workflow running the suite, the soak and the mutation tool | Making the soak part of `node --test` |
+
+**What is genuinely still open is judgement, not code:** the standing "things to deliberately not
+do" list below still holds, and the next real work is whatever using the room actually exposes.
 
 ### Current state
 
-- **249 tests passing** (`node --test`).
+- **277 tests passing** (`node --test`).
 - Working tree has substantial uncommitted work across `src/`, `test/`, `public/`, `skills/` and the
   docs. **Nothing has been committed** — review and commit before starting anything new.
 - Two new source modules since the audit: `src/devteam/roles.mjs` (T1.1) and
@@ -64,7 +68,10 @@ node --test
 node tools/mutate-scheduler.mjs
 ```
 
-Expect **249 passing** from the suite, and **12 caught / 1 equivalent** from the mutation tool (M9 is
+It exits 0 when every behavioural mutant is caught, so it is safe to gate on. The nightly workflow
+(`.github/workflows/nightly.yml`) runs both of these plus a 400-board soak.
+
+Expect **277 passing** from the suite, and **12 caught / 1 equivalent** from the mutation tool (M9 is
 a documented equivalent mutant, not a coverage gap).
 
 For anything touching the scheduler, also run a soak from a fresh offset:
@@ -83,10 +90,11 @@ see the note in *Known and accepted* about the Windows write/module-load race.
 
 | File | What lives there |
 |---|---|
-| `src/devteam/store.mjs` (~4.6k lines) | Everything stateful. Schema, scheduling, leases, claims, approvals, knowledge wiring, checks, regressions, reliability, steering, split |
+| `src/devteam/store.mjs` (~5.8k lines) | Everything stateful. Schema, scheduling, leases, claims, approvals, knowledge wiring, checks, regressions, reliability, steering, split, jobs, the instance lock |
 | `src/devteam/mcp.mjs` | The `devteam_*` tools agents call. This is the agent-facing API |
 | `src/devteam/server.mjs` | Express + MCP transport, `/api/*` control plane, auth |
-| `src/devteam/checks.mjs` | Verified-check execution. Security model documented at the top of the file |
+| `src/devteam/checks.mjs` | Verified-check execution and its three runners (host, node permission model, container). Security model documented at the top of the file |
+| `src/devteam/access.mjs` | Who may call what: loopback vs exposed mode, the dashboard cookie rule, token hashing and comparison |
 | `src/devteam/knowledge.mjs` | Vault: agent-writable notes, backlinks, FTS5/BM25 retrieval, contradictions, decay, cross-project sharing |
 | `src/devteam/roles.mjs` | Per-project role vocabulary; only `verifies`/`plans` mean anything to the scheduler |
 | `src/devteam/codegraph.mjs` | Artifact graph: nodes, edges, scan, reconcile, export |
@@ -277,14 +285,37 @@ the workflow you are aiming at.
 **Watch for.** `claimNextAssignment`'s `existingClaim` early-return, the
 `idx_one_claim_per_agent` unique index, and `agent_holds_claim` in `whyNotClaimable`.
 
-### T0.4 — Concurrency and durability model — **L**
+### T0.4 — Concurrency and durability model — **L** — ✅ DONE (first half, deliberately)
 
-**Problem.** One SQLite file, one process, `busy_timeout = 5000`. Fine locally; it is the reason
-"many projects" is not on the table.
+**Now.** A `jobs` table records work that outlives the call which started it, and one data directory
+belongs to one process.
 
-**Do (in order).** WAL is already on. Add a job/queue table so long work is durable across restarts.
-Only then consider multi-process. Do **not** reach for Postgres until you have hit an actual limit —
-the schema is well-normalized and SQLite will carry you further than you expect.
+**Why a job table at all.** Verified checks run off the event loop (T0.2), so a report can be minutes
+in flight, and the only trace was `assignments.verifying_at` — which startup cleared. A crash
+mid-suite therefore left a record claiming nothing had been running. That is the one thing a
+coordination server must not do: forget that it was part-way through something.
+
+**It is a record, not a queue, and that is the whole design.** Nothing is ever picked back up. A
+restarted DevTeam re-running a suite would run it against a working tree that has moved on, under a
+claim that may now belong to somebody else. Recovery marks the row `interrupted`, emits
+`job.interrupted` on the timeline, and stops there; the agent still holding the claim reports again.
+There is a test asserting that recovery starts nothing.
+
+**One process per data directory.** WAL makes concurrent *SQLite* safe, which is not the same as
+making two DevTeam servers safe: each runs its own reaper and scheduler, so they would recover each
+other's live claims as orphans and hand the same write scopes to two agents. A second exclusive open
+is refused with a message naming the holder. A lock whose pid no longer exists is taken over at once
+— a clean shutdown releases it, a SIGKILL cannot, and refusing to restart for two minutes after a
+hard kill is how a safety measure teaches people to work around it.
+
+**`exclusive: false`** is how anything else reads the database while the server owns it, and adding it
+fixed a latent bug: `devteam token` opened as a second owner and ran orphan recovery, checkpoint
+expiry and status derivation against a live scheduler — moving work around from a command whose job
+is to print a string.
+
+**Deliberately NOT done: multi-process, and Postgres.** The roadmap's own ordering was durability
+first and multi-process only after; nothing has hit a measured limit, and the honest state of that
+question is now enforced rather than assumed. Postgres stays on the "do not do this" list.
 
 ---
 
@@ -854,15 +885,34 @@ redaction (this is the most likely place to leak one client's details into anoth
 
 ## Tier 4 — trust, operations, scale
 
-### T4.1 — Auth that survives leaving localhost — **M**
+### T4.1 — Auth that survives leaving localhost — **M** — ✅ DONE
 
-**Problem.** Any unauthenticated loopback `GET` is issued a `devteam_dash` cookie, which
-`GET /api/setup` will trade for the MCP bearer token. Acceptable for single-user localhost — you
-have accepted this — but it is the blocker if DevTeam is ever shared.
+**The rules now live in `src/devteam/access.mjs`** as pure functions, tested without a socket. The
+server owns enforcement only.
 
-**Do.** Issue the dashboard cookie only on the HTML page load, never on `/api/*`; bind it to a nonce
-printed at startup. Per-agent tokens rather than one shared bearer, so a compromised agent is
-revocable and the audit trail is real.
+**The handout is closed.** The cookie is issued on an HTML document load and nowhere else — never on
+`/api/*`, never on an asset fetch — so no request can collect a credential by asking and then spend
+it at `/api/setup`. The local dashboard notices no difference.
+
+**Named, revocable tokens** sit alongside the shared one (`devteam token --new/--revoke/--list`, and
+the same three over `/api/tokens`). Only hashes are stored and the plaintext is shown once. One
+shared bearer is right until more than one *party* is involved, at which point the problems are not
+secrecy but revocation and attribution: a compromised agent could not be cut off without re-keying
+everybody, and the record could only say that *a* valid credential acted.
+
+**Exposure is a mode, not a gradient.** A loopback bind behaves exactly as it always has. Any other
+bind address turns on every restriction at once — no free cookie, no trusted read, and the `Host`
+check dropped because being reachable by another name is the point — and the server **refuses to
+start** unless `DEVTEAM_TOKEN` is set to a real secret. The dangerous state is the one that cannot
+happen quietly.
+
+**Smaller things that were still wrong:** bearer comparison was `===` on the raw string and is now
+constant-time over hashes, and the token-for-session exchange is rate-limited, because an endpoint
+that answers yes or no about a secret is a guessing oracle if it will answer forever.
+
+**Deliberately NOT done:** users, roles, or TLS termination. DevTeam is not an identity provider, and
+an SSH tunnel to a loopback bind is still the right way to reach it from elsewhere — the exposed mode
+exists so that choosing otherwise is explicit and guarded, not so that it becomes the recommendation.
 
 ### T4.2 — Cost and token accounting — **M** — ✅ DONE
 
@@ -908,14 +958,32 @@ narrative — which is what you need when a task went wrong and you want to know
 **Do.** A read-only timeline export (Markdown) reconstructing the whole task: assignments, claims,
 reports, checks, reviews, decisions.
 
-### T4.4 — Sandboxing agents' checks properly — **M**
+### T4.4 — Sandboxing agents' checks properly — **M** — ✅ DONE
 
-**Current.** Opt-in Node permission-model confinement exists (`sandboxFlagsFor`), limited to `node`
-and still allowing child processes. It narrows exfiltration; it does not close execution.
+**Now.** Three runners, chosen per project: `host` (as before), `node-permission` (the old
+`sandbox: true`), and `container`. The container runner is the only one that closes execution rather
+than narrowing it.
 
-**Do.** Container-based execution (Docker/Podman) as an optional per-project runner. This is the
-only real answer, and it becomes important the moment DevTeam runs checks for projects you do not
-fully trust.
+**The project names the image** in `.devteam/checks.json`; DevTeam supplies the confinement — no
+network, no inherited environment, a bind mount of the project directory and nothing else, a tmpfs
+`/tmp`, bounded memory and pids, `--rm`, and the invoking user where the platform has one. The image
+reference is validated *as a reference*, because anything else in that string becomes arguments to
+`docker run` — the same class of mistake as a shell in an argv.
+
+**No dependency was added.** With no runtime installed, DevTeam behaves exactly as it did before.
+What it never does is fall back: a project that asked for a container and did not get one grades
+`unavailable`, which grants no pass. Same rule as the node sandbox, for the same reason —
+"sandboxed" must never quietly mean "not really".
+
+**The bug worth remembering.** The runtime probe was `docker --version`, which answers happily while
+Docker Desktop is stopped. DevTeam would then select the container runner and grade every refused
+container as a **failed check** — telling an agent its work was broken when nothing had run at all,
+which is the exact inversion of what verified checks are for. The probe is now `info`, which needs a
+daemon, and the exit codes a runtime reserves for its own failures (125/126/127) grade `unavailable`
+rather than `failed`, because the daemon can also stop *between* the probe and the run.
+
+**Deliberately NOT done:** building or pinning images for a project, and any attempt to sandbox the
+*agent* rather than the check. The first is the project's decision; the second is the host's.
 
 ### T4.5 — Scheduler regression safety — **S** — ✅ DONE *(and permanent)*
 
@@ -940,8 +1008,20 @@ and friends) are calibrated for the committed 24-seed span, and a short soak bat
 not generate a board big enough to page. They now apply only to the committed span — a soak failing
 on coverage rather than on a deadlock is a false alarm, and false alarms train people to ignore soaks.
 
-**Still open:** wiring the soak into an actual scheduled job. It is a script and a documented command;
-nothing runs it on a timer, because this repository has no CI.
+**Now scheduled.** `.github/workflows/nightly.yml` runs the suite, a 400-board soak from a random
+offset, and the mutation tool every night, with `workflow_dispatch` for running it by hand.
+`npm run soak` and `npm run mutation` are the local equivalents.
+
+**Two things had to be fixed before a scheduled run meant anything:**
+
+1. **The mutation tool assumed CRLF.** Its anchors are multi-line and it rewrote them to CRLF
+   unconditionally, so on any LF checkout — Linux, CI, `core.autocrlf=false` — nine of thirteen
+   matched nothing and printed `SETUP ERROR`. On a nightly that reads as a coverage collapse rather
+   than an environment difference. It now matches whatever the working copy uses.
+2. **Its exit code was always 1,** because M9 is an equivalent mutant and always survives. A tool
+   that always fails cannot gate anything, so `equivalent: true` marks exactly that mutant, with the
+   reason on the row. A surviving *behavioural* mutant still exits 1 — and so does an anchor that no
+   longer matches, because a mutant testing nothing is a silent loss of coverage.
 
 ### T4.5 (original plan, for reference) — **S**
 
@@ -984,9 +1064,11 @@ that one agent broke another's work), **T1.1** (the cheapest unlock for non-soft
 *Recorded so a future session does not spend time rediscovering decisions that were made
 deliberately. Two independent reviews (correctness and security) produced these.*
 
-- **The `/api` credential is weak.** Any unauthenticated loopback `GET` is issued a `devteam_dash`
-  cookie, which `GET /api/setup` trades for the MCP bearer token. Accepted by the owner as fine for
-  single-user localhost. After the argv hardening it no longer buys arbitrary code execution, only
+- ~~**The `/api` credential is weak.**~~ **Fixed in T4.1.** The cookie is issued only on an HTML
+  document load, so no request can collect a credential by asking and then trade it at
+  `/api/setup`; named tokens are revocable; and a non-loopback bind refuses to start without a real
+  secret. What remains accepted is narrower: on loopback, read-only `GET`s are open to anything that
+  can reach 127.0.0.1, which is the same trust boundary as the machine itself. After the argv hardening it no longer buys arbitrary code execution, only
   "enable verification". See T4.1 if this ever leaves the machine.
 - **Verification runs the project's own code.** `node --test` executes test files an agent just
   wrote, as the host user, outside whatever sandbox the agent itself runs in. The allowlist pin
