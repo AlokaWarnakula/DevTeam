@@ -129,7 +129,12 @@ export class DevTeamStore extends EventEmitter {
   // Carries the transactional part of splitAssignment out to its caller (see T2.1).
   #splitOutcome = { inferred: [], keep: false };
 
-  constructor(dataDir, { liveness = {}, knowledge = {}, codegraph = {}, checkpoint = {}, checks = {} } = {}) {
+  // `exclusive: false` opens the database to *look* at it — `devteam token`, a doctor command, a
+  // script — while the real server is running. Such a process takes no lock, and, just as important,
+  // performs none of the startup recovery: reaping orphaned claims, expiring checkpoints and
+  // re-deriving task status are the server's job, and doing them from a CLI peek would move work
+  // around behind a live scheduler's back. That was already happening before the lock existed.
+  constructor(dataDir, { liveness = {}, knowledge = {}, codegraph = {}, checkpoint = {}, checks = {}, exclusive = true } = {}) {
     super();
     this.dataDir = path.resolve(dataDir);
     mkdirSync(this.dataDir, { recursive: true });
@@ -137,6 +142,16 @@ export class DevTeamStore extends EventEmitter {
     this.db = new DatabaseSync(this.databasePath);
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
     this.#migrate();
+    // T0.4 — one process per data directory, enforced rather than assumed.
+    //
+    // WAL makes concurrent *SQLite* access safe, which is not the same thing as making two DevTeam
+    // servers safe. Each one runs its own reaper and its own scheduler: they would recover each
+    // other's live claims as orphans, hand the same write scopes to two agents, and reap agents that
+    // are talking to the other process. The write-lease model is the invariant this whole server is
+    // built on, so a second instance is refused loudly instead of silently corrupting it.
+    this.exclusive = exclusive;
+    this.instanceId = exclusive ? randomUUID() : null;
+    if (exclusive) this.#claimDataDirectory();
     // How long DevTeam will block while verifying one reported check. The ceiling lives in
     // checks.mjs; this is the per-install default a host may lower.
     this.checkTimeoutMs = Number(checks.timeoutMs) || DEFAULT_CHECK_TIMEOUT_MS;
@@ -166,6 +181,9 @@ export class DevTeamStore extends EventEmitter {
       maxTtlMs: 24 * 60 * 60 * 1000,
       ...checkpoint,
     };
+    // Everything below moves state: it belongs to the process that owns the directory, never to a
+    // CLI looking in while that process is running.
+    if (!exclusive) return;
     this.#expireSessionCheckpoints();
     // A report whose checks were still running when the process died left a verifying flag behind.
     // The child processes are gone with it, so nothing is coming to settle those reports. Clearing
@@ -173,8 +191,105 @@ export class DevTeamStore extends EventEmitter {
     // claim, the lease and the fencing token were never released while verification ran — so the
     // agent simply reports again. The alternative, leaving it set, would refuse every retry forever.
     this.db.exec("UPDATE assignments SET verifying_at = NULL WHERE verifying_at IS NOT NULL");
+    this.#recoverInterruptedJobs();
     this.#recoverOrphanedClaims("Recovered an orphaned assignment during server startup.");
     this.#syncAllTaskStatuses();
+  }
+
+  // How long a lock survives without a heartbeat before another process may take the directory.
+  // Long enough that a busy server is never mistaken for a dead one, short enough that a hard kill
+  // does not leave the tool refusing to start until somebody deletes something by hand — which is
+  // how a safety measure becomes the thing people turn off.
+  static INSTANCE_LOCK_STALE_MS = 120_000;
+  static INSTANCE_HEARTBEAT_MS = 30_000;
+
+  #claimDataDirectory() {
+    const existing = this.db.prepare("SELECT value FROM metadata WHERE key = 'server_instance'").get();
+    const lock = existing ? fromJson(existing.value, null) : null;
+    if (lock?.instanceId && lock.instanceId !== this.instanceId) {
+      const age = Date.now() - Date.parse(lock.heartbeatAt || lock.startedAt || 0);
+      if (Number.isFinite(age) && age < DevTeamStore.INSTANCE_LOCK_STALE_MS) {
+        this.db.close();
+        throw new Error([
+          `Another DevTeam server is already using this data directory`,
+          `(pid ${lock.pid ?? "unknown"}, last seen ${Math.max(0, Math.round(age / 1000))}s ago).`,
+          "DevTeam runs one process per data directory: two would hand out the same write leases from",
+          "two schedulers and reap each other's agents. Stop the other server, or start this one with a",
+          "different --data directory.",
+        ].join(" "));
+      }
+    }
+    this.#writeInstanceLock();
+    // Unref'd so a store never keeps a process alive on its own account — tests create dozens, and a
+    // heartbeat that held the event loop open would hang every one of them.
+    this.instanceHeartbeat = setInterval(() => {
+      try { this.#writeInstanceLock(); } catch { /* the database is closing; the lock will go stale on its own */ }
+    }, DevTeamStore.INSTANCE_HEARTBEAT_MS);
+    this.instanceHeartbeat.unref?.();
+  }
+
+  #writeInstanceLock() {
+    const stamp = now();
+    const existing = this.db.prepare("SELECT value FROM metadata WHERE key = 'server_instance'").get();
+    const startedAt = existing ? (fromJson(existing.value, {})?.startedAt || stamp) : stamp;
+    const value = json({ instanceId: this.instanceId, pid: process.pid, startedAt, heartbeatAt: stamp });
+    if (existing) this.db.prepare("UPDATE metadata SET value = ? WHERE key = 'server_instance'").run(value);
+    else this.db.prepare("INSERT INTO metadata (key, value) VALUES ('server_instance', ?)").run(value);
+  }
+
+  #releaseDataDirectory() {
+    if (this.instanceHeartbeat) clearInterval(this.instanceHeartbeat);
+    this.instanceHeartbeat = null;
+    try {
+      const existing = this.db.prepare("SELECT value FROM metadata WHERE key = 'server_instance'").get();
+      if (existing && fromJson(existing.value, {})?.instanceId === this.instanceId) {
+        this.db.prepare("DELETE FROM metadata WHERE key = 'server_instance'").run();
+      }
+    } catch { /* closing anyway */ }
+  }
+
+  // A job still marked running belongs to a process that no longer exists — this one has only just
+  // started, and nothing else may hold the directory. Close those rows out and say so on the
+  // timeline. Nothing is retried: see the note on the `jobs` table for why that is the whole point.
+  #recoverInterruptedJobs() {
+    const orphaned = this.db.prepare("SELECT * FROM jobs WHERE state = 'running'").all();
+    if (!orphaned.length) return;
+    const stamp = now();
+    for (const job of orphaned) {
+      this.db.prepare("UPDATE jobs SET state = 'interrupted', finished_at = ?, outcome = ? WHERE id = ?")
+        .run(stamp, "Interrupted by a server restart before it finished.", job.id);
+      const detail = fromJson(job.detail, {});
+      const commands = Array.isArray(detail.commands) ? detail.commands.join(", ") : "";
+      this.#event(job.task_id, null, "job.interrupted",
+        `A server restart interrupted the checks DevTeam was running${commands ? ` (${commands})` : ""}. Nothing was recorded from that run; the claim is untouched, so the agent holding it can report again.`,
+        { jobId: job.id, assignmentId: job.assignment_id || null, kind: job.kind });
+    }
+  }
+
+  #startJob({ kind, taskId, assignmentId = null, agentId = null, detail = {} }) {
+    const id = randomUUID();
+    this.db.prepare(`
+      INSERT INTO jobs (id, kind, task_id, assignment_id, agent_id, state, detail, instance_id, started_at)
+      VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?)
+    `).run(id, kind, taskId, assignmentId, agentId, json(detail), this.instanceId, now());
+    return id;
+  }
+
+  #finishJob(jobId, { state = "finished", outcome = null } = {}) {
+    if (!jobId) return;
+    this.db.prepare("UPDATE jobs SET state = ?, finished_at = ?, outcome = ? WHERE id = ?")
+      .run(state, now(), outcome, jobId);
+  }
+
+  // Everything currently executing, across every task. The honest answer to "is this server busy, or
+  // is it stuck?" — and, after a restart, it is empty by construction.
+  openJobs() {
+    return this.db.prepare("SELECT * FROM jobs WHERE state = 'running' ORDER BY started_at ASC").all();
+  }
+
+  jobs(taskId, { limit = 20 } = {}) {
+    return this.db.prepare("SELECT * FROM jobs WHERE task_id = ? ORDER BY started_at DESC LIMIT ?")
+      .all(taskId, Math.max(1, Math.min(100, Number(limit) || 20)));
   }
 
   #migrate() {
@@ -492,6 +607,33 @@ export class DevTeamStore extends EventEmitter {
         created_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_assignment_usage_task ON assignment_usage(task_id, created_at DESC);
+
+      -- T0.4: work that outlives the call which started it.
+      --
+      -- Verified checks run off the event loop, so a report can be minutes in flight. Before this
+      -- the only trace was assignments.verifying_at, which startup cleared — so a crash mid-suite
+      -- left a record claiming nothing had ever been running. That is the one thing a coordination
+      -- server must not do: forget that it was part-way through something.
+      --
+      -- This is deliberately a *record*, not a queue. Nothing here is ever picked back up: re-running
+      -- a suite after a restart would run it against a working tree that has moved on, under a claim
+      -- that may now belong to somebody else. Recovery closes the row, says so on the timeline, and
+      -- leaves the decision to report again with the agent that still holds the claim.
+      CREATE TABLE IF NOT EXISTS jobs (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,                    -- 'verified_checks' today; the column is the seam
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        assignment_id TEXT,
+        agent_id TEXT,
+        state TEXT NOT NULL,                   -- 'running' | 'finished' | 'interrupted'
+        detail TEXT,                           -- JSON: what it was running, for the timeline
+        instance_id TEXT NOT NULL,             -- which server process started it
+        started_at TEXT NOT NULL,
+        finished_at TEXT,
+        outcome TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_jobs_task ON jobs(task_id, started_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_jobs_running ON jobs(state, started_at);
       CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project_id, status);
       CREATE INDEX IF NOT EXISTS idx_assignments_queue ON assignments(status, target_agent_name, created_at);
       CREATE INDEX IF NOT EXISTS idx_assignments_task_status ON assignments(task_id, status);
@@ -1240,6 +1382,7 @@ export class DevTeamStore extends EventEmitter {
   }
 
   close() {
+    this.#releaseDataDirectory();
     this.db.close();
   }
 
@@ -4225,15 +4368,24 @@ export class DevTeamStore extends EventEmitter {
   // assertions runs no processes and settles in one turn, so it never enters the verifying window —
   // flagging it would put a "checks running" state on the board for work nobody is checking.
   #reportRunsCommands(task, checks) {
-    if (!Array.isArray(checks) || !checks.length) return false;
+    return this.#reportedCheckCommands(task, checks).length > 0;
+  }
+
+  // The allowlisted commands this report will actually execute. Both the verifying window and the
+  // durable job row are about *these*, so they are derived once rather than being decided twice by
+  // two nearly-identical predicates that could drift apart.
+  #reportedCheckCommands(task, checks) {
+    if (!Array.isArray(checks) || !checks.length) return [];
     const allowlist = task?.project_id ? this.projectCheckCommands(task.project_id) : [];
-    if (!allowlist.length) return false;
-    return checks.slice(0, 100).some((item) => {
-      if (!item || typeof item !== "object" || Array.isArray(item)) return false;
+    if (!allowlist.length) return [];
+    const commands = [];
+    for (const item of checks.slice(0, 100)) {
+      if (!item || typeof item !== "object" || Array.isArray(item)) continue;
       const requested = String(item.command ?? "").trim();
       const label = String(item.label ?? item.command ?? "").trim();
-      return Boolean(label && requested && matchCheckCommand(allowlist, requested));
-    });
+      if (label && requested && matchCheckCommand(allowlist, requested)) commands.push(requested);
+    }
+    return [...new Set(commands)];
   }
 
   // T2.1 — an agent that finds its work is too big can divide it.
@@ -4408,17 +4560,31 @@ export class DevTeamStore extends EventEmitter {
     // above is refused, and a crash mid-verification leaves a flag that startup clears rather than
     // a claim nobody can settle.
     const runsCommands = this.#reportRunsCommands(task, checks);
+    let jobId = null;
     if (runsCommands) {
       this.db.prepare("UPDATE assignments SET verifying_at = ? WHERE id = ?").run(now(), assignmentId);
+      // T0.4 — the same window, recorded durably. verifying_at answers "is this assignment busy
+      // right now"; the job row answers "what was this server part-way through when it died", which
+      // is a question only a row that outlives the process can answer.
+      jobId = this.#startJob({
+        kind: "verified_checks",
+        taskId: assignment.task_id,
+        assignmentId,
+        agentId,
+        detail: { commands: this.#reportedCheckCommands(task, checks), title: assignment.title },
+      });
       this.#event(assignment.task_id, agentId, "assignment.verifying",
-        `DevTeam is running the checks ${agent.name} reported for “${assignment.title}”.`, { assignmentId, role: assignment.role });
+        `DevTeam is running the checks ${agent.name} reported for “${assignment.title}”.`, { assignmentId, role: assignment.role, jobId });
       this.#changed("assignment.verifying", assignment.task_id);
     }
     let checkRecords;
     try {
       checkRecords = await this.#gradeReportedChecks(assignment, task, checks);
     } finally {
-      if (runsCommands) this.db.prepare("UPDATE assignments SET verifying_at = NULL WHERE id = ?").run(assignmentId);
+      if (runsCommands) {
+        this.db.prepare("UPDATE assignments SET verifying_at = NULL WHERE id = ?").run(assignmentId);
+        this.#finishJob(jobId, { state: "finished", outcome: `Ran ${checkRecords?.filter((record) => record.verified).length ?? 0} verified check(s).` });
+      }
     }
     // The claim can move while those checks run. A force-release, a resume and a checkpoint takeover
     // all reassign it, and none of them wait for verification — so settling against the row read
@@ -5347,6 +5513,8 @@ export class DevTeamStore extends EventEmitter {
       ...task, assignments, approvals, events, proposals, blackboard, projectBlackboard, knowledge, members, sessionCheckpoints, roleCatalogue,
       regressions: this.openRegressions(taskId), checkBaseline: this.checkBaseline(taskId),
       reliability: this.teamReliability(), budget: this.taskBudgetState(taskId), usage: this.taskUsage(taskId),
+      // What this server has been running for the task, including anything a restart cut short.
+      jobs: this.jobs(taskId, { limit: 10 }),
       knowledgeVault: {
         automated: this.knowledge.enabled,
         path: path.join(task.project_root, "knowledge"),

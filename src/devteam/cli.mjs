@@ -85,7 +85,10 @@ export async function runDevTeamCli(args = process.argv.slice(2)) {
   }
 
   if (command === "token") {
-    const store = new DevTeamStore(dataDir);
+    // Printing the token is the one thing you do *while* the server is running, so this opens the
+    // database as an observer: no directory lock, and none of the startup recovery a second owner
+    // would otherwise run against a live scheduler.
+    const store = new DevTeamStore(dataDir, { exclusive: false });
     console.log(store.token);
     store.close();
     return;
