@@ -481,6 +481,12 @@ export async function startDevTeamServer({
       spendUsd: req.body?.spendUsd ?? null,
     }));
   });
+  // T4.3 — the whole task as a narrative, for when something went wrong and the question is where.
+  app.get("/api/tasks/:taskId/replay", (req, res) => {
+    const replay = store.taskReplay(req.params.taskId, { limit: Number(req.query.limit) || 1000 });
+    if (String(req.query.format || "markdown") === "json") return res.json(replay);
+    res.type("text/markdown; charset=utf-8").send(replay.markdown);
+  });
   app.post("/api/tasks/:taskId/block", (req, res) => {
     requireFields(req.body, ["reason"]);
     res.json(store.blockTask({ taskId: req.params.taskId, reason: req.body.reason }));
