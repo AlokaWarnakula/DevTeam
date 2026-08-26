@@ -1,5 +1,5 @@
-import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { readFileSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -11,7 +11,7 @@ import path from "node:path";
 //   * Agent text NEVER becomes a command. A reported command is only ever used to *select* an entry
 //     from an allowlist the human configured for the project; the argv that reaches the OS comes
 //     from that stored entry and nowhere else.
-//   * There is no shell. spawnSync runs with shell:false and an argv array, so an argument is an
+//   * There is no shell. spawn runs with shell:false and an argv array, so an argument is an
 //     argument — it cannot become an operator, a redirection, a substitution, or a second command.
 //   * The allowlist is a pinned snapshot, not a live read of package.json. An agent with write
 //     access to the repo can edit a script body; if the allowlist were derived on demand, editing
@@ -190,64 +190,103 @@ function scrubbedEnvironment() {
 
 // Run one allowlisted check inside the project root and grade it by exit code.
 //
-// This is deliberately synchronous, like the git probe the store already uses: DevTeam is a local
-// single-user coordination server, and a report that returned before its own evidence had been
-// gathered would be a smaller lie than the one this feature exists to stop. The pause is bounded —
-// and the caller bounds the *whole report*, not just each command, so one report can never hold the
-// event loop for longer than the configured timeout however many checks it carries.
+// This is asynchronous, and that is the whole point. DevTeam is one process serving every agent,
+// the dashboard, SSE and the heartbeats that decide who still holds a write lease, so a check that
+// blocked here froze all of them at once for as long as it ran. The *caller* still waits for its
+// own verdict — a report that returned before its own evidence had been gathered would be a smaller
+// lie than the one this feature exists to stop — but nobody else does. The caller also bounds the
+// whole report rather than each command, so one report can never occupy verification for longer
+// than the configured timeout however many checks it carries.
+//
+// Every verdict below is the one the synchronous version produced for the same situation. The four
+// states spawnSync gave for free (clean exit, timeout kill, output flood, never started) are each
+// tracked explicitly here, because spawn hands back a stream instead of a result.
 export function runVerifiedCheck({ argv, cwd, timeoutMs = DEFAULT_CHECK_TIMEOUT_MS, sandbox = false }) {
   const [program, ...args] = argv;
   const confinement = sandbox ? sandboxFlagsFor(program, cwd) : null;
   if (sandbox && !confinement) {
-    return {
+    return Promise.resolve({
       verified: false, status: "unavailable", exitCode: null, durationMs: 0, timedOut: false,
       output: boundCheckOutput(`This project runs checks sandboxed, and DevTeam can only confine "node". "${program}" was not run.`),
-    };
+    });
   }
   // Run the same Node that runs DevTeam rather than whatever "node" happens to resolve to on PATH.
   const executable = program === "node" ? process.execPath : program;
   const timeout = Math.min(Math.max(1000, Number(timeoutMs) || DEFAULT_CHECK_TIMEOUT_MS), MAX_CHECK_TIMEOUT_MS);
   const startedAt = Date.now();
-  const result = spawnSync(executable, confinement ? [...confinement, ...args] : args, {
-    cwd,
-    shell: false, // never: the argv reaches the OS verbatim, so an argument can never become syntax
-    windowsHide: true,
-    encoding: "utf8",
-    timeout,
-    maxBuffer: CHECK_MAX_BUFFER_BYTES,
-    killSignal: "SIGKILL",
-    env: scrubbedEnvironment(),
-  });
-  const durationMs = Date.now() - startedAt;
-  const timedOut = result.error?.code === "ETIMEDOUT";
-  if (result.error && !timedOut) {
-    if (result.error.code === "ENOBUFS") {
-      // The command *ran* and drowned the capture buffer, so its exit status could not be read. An
-      // unreadable status is not a pass: grading this "unavailable" would let any real failure
-      // through simply by printing two megabytes first.
-      return {
-        verified: true, status: "failed", exitCode: null, durationMs, timedOut: false,
-        output: boundCheckOutput(`[DevTeam] the command produced more than ${CHECK_MAX_BUFFER_BYTES} bytes and was stopped before its exit status could be read. An unreadable result cannot count as a pass.`),
-      };
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(executable, confinement ? [...confinement, ...args] : args, {
+        cwd,
+        shell: false, // never: the argv reaches the OS verbatim, so an argument can never become syntax
+        windowsHide: true,
+        env: scrubbedEnvironment(),
+      });
+    } catch (error) {
+      resolve(spawnFailure(error, Date.now() - startedAt));
+      return;
     }
-    // It never started at all. Nothing was verified, so nothing is recorded as verified — and an
-    // unavailable check grants no pass either.
-    return {
-      verified: false, status: "unavailable", exitCode: null, durationMs, timedOut: false,
-      output: boundCheckOutput(`${result.error.code || "spawn failed"}: ${result.error.message || ""}`),
+    let transcript = "";
+    let captured = 0;
+    let overflowed = false;
+    let timedOut = false;
+    let settled = false;
+    const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, timeout);
+    const settle = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
     };
-  }
-  const killed = timedOut || (result.status == null && Boolean(result.signal));
-  const exitCode = killed ? null : (result.status ?? null);
-  const transcript = `${result.stdout || ""}${result.stderr || ""}`;
+    const capture = (chunk) => {
+      if (overflowed) return;
+      captured += chunk.length;
+      if (captured > CHECK_MAX_BUFFER_BYTES) {
+        // The command *ran* and drowned the capture buffer, so its exit status can no longer be
+        // trusted to arrive. An unreadable status is not a pass: grading this "unavailable" would
+        // let any real failure through simply by printing two megabytes first.
+        overflowed = true;
+        child.kill("SIGKILL");
+        return;
+      }
+      transcript += chunk.toString("utf8");
+    };
+    child.stdout?.on("data", capture);
+    child.stderr?.on("data", capture);
+    // An 'error' with no 'close' behind it means the program never started at all. Nothing was
+    // verified, so nothing is recorded as verified — and an unavailable check grants no pass either.
+    child.on("error", (error) => settle(spawnFailure(error, Date.now() - startedAt)));
+    child.on("close", (code, signal) => {
+      const durationMs = Date.now() - startedAt;
+      if (overflowed) {
+        settle({
+          verified: true, status: "failed", exitCode: null, durationMs, timedOut: false,
+          output: boundCheckOutput(`[DevTeam] the command produced more than ${CHECK_MAX_BUFFER_BYTES} bytes and was stopped before its exit status could be read. An unreadable result cannot count as a pass.`),
+        });
+        return;
+      }
+      const killed = timedOut || (code == null && Boolean(signal));
+      const exitCode = killed ? null : (code ?? null);
+      settle({
+        verified: true,
+        status: exitCode === 0 ? "passed" : "failed",
+        exitCode,
+        durationMs,
+        timedOut,
+        output: boundCheckOutput(killed
+          ? `${transcript}\n[DevTeam] killed after ${durationMs}ms${timedOut ? ` (timeout ${timeout}ms)` : ` (signal ${signal})`}`
+          : transcript),
+      });
+    });
+  });
+}
+
+// A program that never started. Reported unavailable rather than failed, because "DevTeam could not
+// run this" and "this did not pass" are different facts, and only the second one is evidence.
+function spawnFailure(error, durationMs) {
   return {
-    verified: true,
-    status: exitCode === 0 ? "passed" : "failed",
-    exitCode,
-    durationMs,
-    timedOut: Boolean(timedOut),
-    output: boundCheckOutput(killed
-      ? `${transcript}\n[DevTeam] killed after ${durationMs}ms${timedOut ? ` (timeout ${timeout}ms)` : ` (signal ${result.signal})`}`
-      : transcript),
+    verified: false, status: "unavailable", exitCode: null, durationMs, timedOut: false,
+    output: boundCheckOutput(`${error?.code || "spawn failed"}: ${error?.message || ""}`),
   };
 }

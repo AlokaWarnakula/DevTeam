@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { spawnSync } from "node:child_process";
-import { mkdirSync, statSync, realpathSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { mkdirSync, readdirSync, statSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { CodeGraph } from "./codegraph.mjs";
@@ -35,6 +35,9 @@ const CLOSED_TASK_STATUSES = ["accepted", "blocked", "cancelled"];
 // Generous for a local single-user server, and bounded so a pathological board cannot stall a claim.
 const CANDIDATE_PAGE_SIZE = 20;
 const CANDIDATE_SCAN_CEILING = 500;
+// How many read-only assignments one agent may hold at once, on top of its single write claim. A
+// guard against one agent draining the review queue, not a correctness rule — reviews take no lease.
+const MAX_CONCURRENT_READ_CLAIMS = 3;
 // Roles that read the tree rather than change it, and therefore wait for pending writers.
 const VERIFIER_ROLES = ["reviewer", "security-reviewer", "tester"];
 // The same list as SQL literals, for conditions that are shared between statements with different
@@ -154,6 +157,12 @@ export class DevTeamStore extends EventEmitter {
       ...checkpoint,
     };
     this.#expireSessionCheckpoints();
+    // A report whose checks were still running when the process died left a verifying flag behind.
+    // The child processes are gone with it, so nothing is coming to settle those reports. Clearing
+    // the flag returns the assignment to a plain live claim, which is exactly what it still is — the
+    // claim, the lease and the fencing token were never released while verification ran — so the
+    // agent simply reports again. The alternative, leaving it set, would refuse every retry forever.
+    this.db.exec("UPDATE assignments SET verifying_at = NULL WHERE verifying_at IS NOT NULL");
     this.#recoverOrphanedClaims("Recovered an orphaned assignment during server startup.");
     this.#syncAllTaskStatuses();
   }
@@ -439,19 +448,31 @@ export class DevTeamStore extends EventEmitter {
       ["events", "author_kind", "TEXT"],
       ["projects", "check_sandbox", "INTEGER NOT NULL DEFAULT 0"],       // confine node checks to the project root
       ["assignment_checks", "superseded_at", "TEXT"],           // only the latest report attempt describes the work as it stands                                   // 'human' or 'agent', so authorship never depends on a nullable FK
+      ["assignments", "verifying_at", "TEXT"],                  // set while DevTeam is running this report's checks off the event loop
     ]) {
       try { this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`); } catch { /* already present */ }
     }
     // One agent may hold at most one claimed assignment at a time. Self-heal any legacy
     // double-claims (keep the earliest) before enforcing it at the schema level, so the
     // unique index can be created even on a database that predates this rule.
+    // T0.3 — one *write* claim per agent, not one claim. The invariant that matters is about write
+    // leases: two agents must never hold overlapping write scopes, and one agent holding two write
+    // leases is how it hoards them. Read-only work — review, testing, research — takes no lease at
+    // all, so capping it bought nothing and cost real throughput on exactly the review-heavy
+    // workflows this server exists for.
+    //
+    // The old index (any claim) is dropped in favour of one scoped to writers. Legacy double-*write*
+    // claims are healed first, exactly as before, so the narrower index can be created on a database
+    // that predates the rule.
     this.db.exec(`
+      DROP INDEX IF EXISTS idx_one_claim_per_agent;
       UPDATE assignments SET status = 'queued', agent_id = NULL, claimed_at = NULL, claim_token_hash = NULL
-      WHERE status = 'claimed' AND agent_id IS NOT NULL AND rowid NOT IN (
-        SELECT MIN(rowid) FROM assignments WHERE status = 'claimed' AND agent_id IS NOT NULL GROUP BY agent_id
+      WHERE status = 'claimed' AND requires_write = 1 AND agent_id IS NOT NULL AND rowid NOT IN (
+        SELECT MIN(rowid) FROM assignments
+        WHERE status = 'claimed' AND requires_write = 1 AND agent_id IS NOT NULL GROUP BY agent_id
       );
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_one_claim_per_agent
-        ON assignments(agent_id) WHERE status = 'claimed' AND agent_id IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_one_write_claim_per_agent
+        ON assignments(agent_id) WHERE status = 'claimed' AND requires_write = 1 AND agent_id IS NOT NULL;
     `);
   }
 
@@ -1365,18 +1386,32 @@ export class DevTeamStore extends EventEmitter {
     return actual.length === expected.length && timingSafeEqual(actual, expected);
   }
 
+  // The repository's current HEAD, used as a drift fingerprint on session checkpoints. Bounded at
+  // two seconds and asynchronous for the same reason verified checks are: this server is one
+  // process, and a git probe that blocked it stalled every other agent's MCP call, the dashboard,
+  // SSE and the heartbeats that decide who still holds a write lease. A project that is not a git
+  // repository (or has no commits) simply has no fingerprint — that is a supported state, not an
+  // error, so every failure path answers null rather than throwing.
   #repositoryHead(projectRoot) {
-    try {
-      const result = spawnSync("git", ["-C", projectRoot, "rev-parse", "HEAD"], {
-        encoding: "utf8",
-        timeout: 2_000,
-        windowsHide: true,
+    return new Promise((resolve) => {
+      let child;
+      try {
+        child = spawn("git", ["-C", projectRoot, "rev-parse", "HEAD"], { windowsHide: true, shell: false });
+      } catch {
+        resolve(null);
+        return;
+      }
+      let out = "";
+      let settled = false;
+      const settle = (value) => { if (!settled) { settled = true; clearTimeout(timer); resolve(value); } };
+      const timer = setTimeout(() => { child.kill("SIGKILL"); settle(null); }, 2_000);
+      child.stdout?.on("data", (chunk) => { if (out.length < 200) out += chunk.toString("utf8"); });
+      child.on("error", () => settle(null));
+      child.on("close", (code) => {
+        const head = code === 0 ? out.trim() : "";
+        settle(/^[0-9a-f]{40,64}$/i.test(head) ? head.toLowerCase() : null);
       });
-      const head = result.status === 0 ? String(result.stdout || "").trim() : "";
-      return /^[0-9a-f]{40,64}$/i.test(head) ? head.toLowerCase() : null;
-    } catch {
-      return null;
-    }
+    });
   }
 
   #checkpointRecord(row, { includeCapsule = false } = {}) {
@@ -1447,7 +1482,7 @@ export class DevTeamStore extends EventEmitter {
       .filter(Boolean))].slice(0, maxItems);
   }
 
-  createSessionCheckpoint({
+  async createSessionCheckpoint({
     agentId,
     taskId,
     assignmentId = null,
@@ -1535,7 +1570,7 @@ export class DevTeamStore extends EventEmitter {
     const handoffToken = randomBytes(24).toString("base64url");
     const stamp = now();
     const expiresAt = new Date(Date.parse(stamp) + ttl).toISOString();
-    const repositoryHead = this.#repositoryHead(task.project_root);
+    const repositoryHead = await this.#repositoryHead(task.project_root);
     const runtimeProfile = this.runtimeProfile(agentId);
     const runtimeAssessment = assignment ? this.assignmentAssessment({ assignmentId: assignment.id }) : null;
     const runtimeResolution = runtimeAssessment && runtimeProfile
@@ -1714,7 +1749,7 @@ export class DevTeamStore extends EventEmitter {
     return this.#checkpointRecord(this.db.prepare("SELECT * FROM session_checkpoints WHERE id = ?").get(checkpointId));
   }
 
-  takeoverSessionCheckpoint({ agentId, taskId, checkpointId, handoffToken }) {
+  async takeoverSessionCheckpoint({ agentId, taskId, checkpointId, handoffToken }) {
     const agent = this.getAgent(agentId);
     if (agent.status === "disconnected") throw new Error("A disconnected session cannot take over work.");
     this.assertMembership(agentId, taskId);
@@ -1844,7 +1879,7 @@ export class DevTeamStore extends EventEmitter {
     });
     if (outcome.expired) this.#changed("session.checkpoint_expired", taskId);
     if (outcome.error) throw new Error(outcome.error);
-    const currentHead = this.#repositoryHead(this.getTask(taskId).project_root);
+    const currentHead = await this.#repositoryHead(this.getTask(taskId).project_root);
     const fingerprint = outcome.checkpoint.capsule?.repositoryFingerprint || {};
     const warnings = [];
     if (Number(fingerprint.taskVersion) !== Number(outcome.taskVersionNow)) warnings.push("The task version changed since the checkpoint. Re-read the task and inspect the current files before writing.");
@@ -2151,21 +2186,20 @@ export class DevTeamStore extends EventEmitter {
       if (prior && Date.parse(prior.disconnected_at) >= Date.now() - RECONNECT_REPLAY_MS) {
         this.db.prepare("UPDATE agents SET message_floor = ? WHERE id = ?").run(prior.message_floor || prior.connected_at, id);
       }
-      // Pin implicit single-task membership now, while it is unambiguous, so a later second
-      // task can't silently orphan this agent out of its room.
-      const activeTasks = this.db.prepare(`
-        SELECT id FROM tasks WHERE status NOT IN ('accepted', 'blocked', 'cancelled')
-      `).all();
-      if (activeTasks.length === 1) {
-        this.db.prepare(`
-          INSERT OR IGNORE INTO task_members (task_id, agent_id, role, joined_at) VALUES (?, ?, 'contributor', ?)
-        `).run(activeTasks[0].id, id, stamp);
-      }
     });
     this.#changed("agent.connected");
+    // A connect that names its task room joins it here, as a real membership with a real joined
+    // event — not a second implicit path. An earlier version instead pinned a connecting agent to
+    // whichever task happened to be the only active one, which then hid every later task from it;
+    // an agent that names no room is now told which rooms exist rather than guessed into one.
+    let room = null;
+    if (freshTaskId) {
+      try { room = this.joinTask(id, freshTaskId); }
+      catch (error) { room = { joined: false, taskId: freshTaskId, error: error.message }; }
+    }
     // The resume token is returned exactly once, to this caller, and only its hash is stored.
     if (runtimeProfile) this.updateRuntimeProfile({ agentId: id, profile: runtimeProfile });
-    return { ...this.getAgent(id), runtimeProfile: this.runtimeProfile(id), resumeToken };
+    return { ...this.getAgent(id), runtimeProfile: this.runtimeProfile(id), room, resumeToken };
   }
 
   sessionRotationRecommendation(agentId) {
@@ -2269,16 +2303,13 @@ export class DevTeamStore extends EventEmitter {
   // --- Task rooms: work, messages, and governance are scoped to the tasks an agent belongs
   // to, so an agent invoked for one task/project can't claim another's work or see its chatter. ---
 
-  // The tasks an agent is a member of. Explicit joins win; if the agent has joined nothing and
-  // there is exactly one active task in the whole store, it is implicitly in that sole room
-  // (keeps the common single-task workflow zero-config while isolating multi-task servers).
+  // The tasks an agent is a member of — exactly the rooms it explicitly joined, and nothing else.
+  // There is deliberately no implicit "sole active task" fallback: it made single-task use
+  // zero-config at the price of an agent's room silently changing meaning the moment a second task
+  // appeared, which read as "the board stopped handing out work" with nothing to explain it.
+  // devteam_connect(taskId) and devteam_join are the ways in; roomStatusForAgent says so out loud.
   #memberTaskIds(agentId) {
-    const explicit = this.db.prepare("SELECT task_id FROM task_members WHERE agent_id = ?").all(agentId).map((row) => row.task_id);
-    if (explicit.length) return explicit;
-    const active = this.db.prepare(`
-      SELECT id FROM tasks WHERE status NOT IN ('accepted', 'blocked', 'cancelled')
-    `).all().map((row) => row.id);
-    return active.length === 1 ? active : [];
+    return this.db.prepare("SELECT task_id FROM task_members WHERE agent_id = ?").all(agentId).map((row) => row.task_id);
   }
 
   // Connected agents that belong to a given task (used to scope proposal consensus).
@@ -2287,17 +2318,11 @@ export class DevTeamStore extends EventEmitter {
     return connected.filter((id) => this.#memberTaskIds(id).includes(taskId));
   }
 
-  // The task rooms an agent may *claim work in*. Observers are members (they see chatter and
-  // proposals) but never claim, so they are excluded here. If the agent has any explicit
-  // membership, only its non-observer rooms are claimable; otherwise the sole-active-task
-  // implicit room applies (contributor by default), keeping single-task use zero-config.
+  // The task rooms an agent may *claim work in*: the rooms it joined as a contributor. Observers
+  // are members (they see chatter and proposals) but never claim, so they are excluded here.
   #claimableTaskIds(agentId) {
-    const rows = this.db.prepare("SELECT task_id, role FROM task_members WHERE agent_id = ?").all(agentId);
-    if (rows.length) return rows.filter((row) => row.role !== "observer").map((row) => row.task_id);
-    const active = this.db.prepare(`
-      SELECT id FROM tasks WHERE status NOT IN ('accepted', 'blocked', 'cancelled')
-    `).all().map((row) => row.id);
-    return active.length === 1 ? active : [];
+    return this.db.prepare("SELECT task_id, role FROM task_members WHERE agent_id = ?")
+      .all(agentId).filter((row) => row.role !== "observer").map((row) => row.task_id);
   }
 
   // Authorization for a task-scoped action by an agent. Membership is not just routing: an agent
@@ -2554,7 +2579,7 @@ export class DevTeamStore extends EventEmitter {
   // Order matters and is the order a reader should think in: is it even open, may this agent work in
   // that room, is the room open, is it addressed to someone else, is this agent's reach into the room
   // wide enough, is its own work ready, and is it waiting on a writer.
-  #claimPredicates({ agentName, memberRooms, claimRooms }) {
+  #claimPredicates({ agentName, memberRooms, claimRooms, holdsWriteClaim = false }) {
     const list = (values) => (values.length ? values.map(() => "?").join(", ") : null);
     const claimRoomList = list(claimRooms);
     // In a room the agent already belongs to it may take targeted-or-untargeted work; in a room it
@@ -2564,6 +2589,14 @@ export class DevTeamStore extends EventEmitter {
       {
         code: "assignment_not_queued",
         sql: "a.status = 'queued'",
+        params: [],
+      },
+      {
+        // An agent holding a write claim may still pick up read-only work, but not a second writer:
+        // one agent with two write leases is exactly the hoarding the single-claim rule existed to
+        // prevent, and it is the only part of that rule worth keeping.
+        code: "agent_holds_write_claim",
+        sql: holdsWriteClaim ? "a.requires_write = 0" : "1 = 1",
         params: [],
       },
       {
@@ -2692,10 +2725,15 @@ export class DevTeamStore extends EventEmitter {
     this.#recoverOrphanedClaims();
     const agent = this.getAgent(agentId);
     if (agent.status === "disconnected") throw new Error("Agent is disconnected. Connect again.");
-    // One claim at a time: an agent already holding a claimed assignment must finish (or release)
-    // it before taking another. Prevents a single busy agent from hoarding multiple write leases.
-    const existingClaim = this.db.prepare("SELECT id FROM assignments WHERE agent_id = ? AND status = 'claimed' LIMIT 1").get(agentId);
-    if (existingClaim) return null;
+    // T0.3 — an agent may hold one write claim plus a bounded number of read-only claims. A writer
+    // is capped at one because that is the lease invariant; readers take no lease, so capping them
+    // only throttled review. The read cap is a guard against one agent draining the review queue and
+    // starving its teammates, not a correctness rule.
+    const held = this.db.prepare(`
+      SELECT requires_write FROM assignments WHERE agent_id = ? AND status = 'claimed'
+    `).all(agentId);
+    const holdsWriteClaim = held.some((row) => row.requires_write);
+    if (held.length >= MAX_CONCURRENT_READ_CLAIMS + 1) return null;
     // This prevents an agent invoked for one project/task from silently claiming another's work,
     // and stops an observer from taking on execution it only joined to watch.
     const memberRooms = this.#claimableTaskIds(agentId);
@@ -2704,7 +2742,7 @@ export class DevTeamStore extends EventEmitter {
       this.db.prepare("UPDATE agents SET status = CASE WHEN status = 'busy' THEN status ELSE 'waiting' END, last_seen = ? WHERE id = ?").run(now(), agentId);
       return null;
     }
-    const predicates = this.#claimPredicates({ agentName: agent.name, memberRooms, claimRooms });
+    const predicates = this.#claimPredicates({ agentName: agent.name, memberRooms, claimRooms, holdsWriteClaim });
     const assignment = this.#transaction(() => {
       // The eligible queue is the conjunction of the named predicates above — membership,
       // targeting, dependencies and review gating — each of which whyNotClaimable can also evaluate
@@ -2776,8 +2814,9 @@ export class DevTeamStore extends EventEmitter {
           this.db.prepare("UPDATE agents SET status = 'busy', current_task_id = ?, last_seen = ? WHERE id = ?")
             .run(candidate.task_id, stamp, agentId);
         }
-        // Persist the room the moment the agent commits to its work, so an implicit membership
-        // survives a second task being created later.
+        // An agent reaches this room by joining it or by being invited into it by name. The
+        // invited case has no membership row yet, so record one now that it has committed to the
+        // work — otherwise it would claim the item and immediately lose sight of the room it is in.
         this.db.prepare(`
           INSERT OR IGNORE INTO task_members (task_id, agent_id, role, joined_at) VALUES (?, ?, 'contributor', ?)
         `).run(candidate.task_id, agentId, stamp);
@@ -2851,13 +2890,19 @@ export class DevTeamStore extends EventEmitter {
       if (agent.status === "disconnected") {
         add("agent_disconnected", `“${agent.name}” is disconnected; connect to DevTeam again before claiming.`);
       }
-      // One claim at a time, so a single busy agent cannot hoard write leases.
-      const held = this.db.prepare("SELECT id, title FROM assignments WHERE agent_id = ? AND status = 'claimed' LIMIT 1").get(agent.id);
-      if (held) {
-        add("agent_holds_claim", held.id === assignment.id
-          ? `“${agent.name}” already holds this claim.`
-          : `“${agent.name}” already holds the claim on “${held.title}”; an agent takes one assignment at a time.`,
-        { heldAssignmentId: held.id, heldTitle: held.title });
+      // One *write* claim per agent, plus a bounded number of read-only ones (T0.3).
+      const heldAll = this.db.prepare("SELECT id, title, requires_write FROM assignments WHERE agent_id = ? AND status = 'claimed'").all(agent.id);
+      const heldThis = heldAll.find((row) => row.id === assignment.id);
+      const heldWriter = heldAll.find((row) => row.requires_write);
+      if (heldThis) {
+        add("agent_holds_claim", `“${agent.name}” already holds this claim.`,
+          { heldAssignmentId: heldThis.id, heldTitle: heldThis.title });
+      } else if (heldAll.length >= MAX_CONCURRENT_READ_CLAIMS + 1) {
+        add("agent_holds_claim", `“${agent.name}” is already holding ${heldAll.length} assignments, which is as many as one agent takes at once.`,
+          { heldAssignmentId: heldAll[0].id, heldTitle: heldAll[0].title, heldCount: heldAll.length });
+      } else if (heldWriter && assignment.requires_write) {
+        add("agent_holds_write_claim", `“${agent.name}” already holds the write lease for “${heldWriter.title}”; an agent takes one piece of write work at a time, though it may still review.`,
+          { heldAssignmentId: heldWriter.id, heldTitle: heldWriter.title });
       }
     }
 
@@ -2877,7 +2922,16 @@ export class DevTeamStore extends EventEmitter {
       { status: assignment.status, holder });
     }
     if (failed.has("room_not_claimable")) {
-      add("room_not_claimable", `“${agent.name}” is not a claiming member of this task room and holds no invitation into it; join as a contributor first.`, { taskId: assignment.task_id });
+      // Belonging to *no* room at all is a different situation from being in the wrong one, and it
+      // is the one a fresh session lands in. Say which it is, and name the rooms it could join, so
+      // "there is work on the board and I am doing nothing" is never a silent empty answer.
+      const rooms = this.#memberTaskIds(agent.id);
+      if (!rooms.length) {
+        add("room_membership_required", `“${agent.name}” has not joined any task room, so no work is claimable anywhere; call devteam_join with the intended taskId first.`,
+          { taskId: assignment.task_id, availableTasks: this.roomStatusForAgent(agent.id).activeTasks });
+      } else {
+        add("room_not_claimable", `“${agent.name}” is not a claiming member of this task room and holds no invitation into it; join as a contributor first.`, { taskId: assignment.task_id });
+      }
     }
     if (failed.has("task_closed")) {
       add("task_closed", `Its task is ${assignment.task_status}; a closed task hands out no work.`, { taskStatus: assignment.task_status });
@@ -2992,10 +3046,20 @@ export class DevTeamStore extends EventEmitter {
       SELECT a.id FROM assignments a WHERE a.task_id = ? AND a.status = 'queued' ORDER BY a.created_at ASC
     `).all(room).map((row) => this.whyNotClaimable(row.id, agentId, { refreshLiveness: false })));
     const held = this.db.prepare("SELECT id, title FROM assignments WHERE agent_id = ? AND status = 'claimed' LIMIT 1").get(agentId);
+    // An agent in no room sees an empty board even when the server is busy. Without this the answer
+    // to "why is there nothing for me?" is an empty list, which reads as "the team has no work".
+    const roomStatus = rooms.length ? null : this.roomStatusForAgent(agentId);
     return {
       agentId,
       agentName: agent.name,
       rooms,
+      ...(roomStatus && roomStatus.activeTasks.length
+        ? {
+            membershipRequired: true,
+            availableTasks: roomStatus.activeTasks,
+            next: "You have joined no task room, so nothing is claimable. Call devteam_join with the intended taskId from availableTasks.",
+          }
+        : {}),
       holdingClaim: held ? { assignmentId: held.id, title: held.title } : null,
       queuedCount: queued.length,
       claimable: queued.filter((entry) => entry.claimable).map((entry) => entry.assignmentId),
@@ -3107,15 +3171,16 @@ export class DevTeamStore extends EventEmitter {
   // Normalize what an agent reported, then verify whatever it asked DevTeam to verify. A check is a
   // plain string (an assertion, as before) or { label, command } where command *selects* an entry
   // from the project's allowlist. The selected entry's argv is what runs; the agent's text never is.
-  #gradeReportedChecks(assignment, task, checks) {
+  async #gradeReportedChecks(assignment, task, checks) {
     const allowlist = task?.project_id ? this.projectCheckCommands(task.project_id) : [];
     const sandbox = task?.project_id ? this.projectCheckSandbox(task.project_id) : false;
     const records = [];
     let executed = 0;
-    // spawnSync blocks the event loop, so the configured timeout is the budget for the *report*, not
-    // for each command in it. Without this, ten allowlisted checks at the default timeout could hold
-    // the whole server — MCP, dashboard, SSE, heartbeats — for twenty minutes on one tool call, and
-    // the refusal path deliberately leaves the claim intact, so it could be replayed forever.
+    // The configured timeout is the budget for the *report*, not for each command in it. Checks no
+    // longer block the event loop, so this is no longer about keeping the server alive — it is about
+    // keeping one report bounded: the refusal path deliberately leaves the claim intact, so ten
+    // allowlisted checks at the default timeout could otherwise be replayed forever, each round
+    // holding a write lease for twenty minutes while the rest of the team waited on those paths.
     const budgetStartedAt = Date.now();
     const remainingBudget = () => this.checkTimeoutMs - (Date.now() - budgetStartedAt);
     for (const item of Array.isArray(checks) ? checks.slice(0, 100) : []) {
@@ -3141,7 +3206,7 @@ export class DevTeamStore extends EventEmitter {
       } else if (entry) {
         executed += 1;
         record.command = entry.argv;
-        Object.assign(record, runVerifiedCheck({
+        Object.assign(record, await runVerifiedCheck({
           argv: entry.argv,
           cwd: task.project_root,  // pinned to the project root; nothing selects a working directory
           timeoutMs: remainingBudget(),
@@ -3338,7 +3403,33 @@ export class DevTeamStore extends EventEmitter {
     };
   }
 
-  completeAssignment({ agentId, assignmentId, message, status = "done", changedFiles = [], checks = [], nextStatus = "waiting", claimToken = null }) {
+  // Whether this report will actually execute anything. A report whose checks are all plain
+  // assertions runs no processes and settles in one turn, so it never enters the verifying window —
+  // flagging it would put a "checks running" state on the board for work nobody is checking.
+  #reportRunsCommands(task, checks) {
+    if (!Array.isArray(checks) || !checks.length) return false;
+    const allowlist = task?.project_id ? this.projectCheckCommands(task.project_id) : [];
+    if (!allowlist.length) return false;
+    return checks.slice(0, 100).some((item) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) return false;
+      const requested = String(item.command ?? "").trim();
+      const label = String(item.label ?? item.command ?? "").trim();
+      return Boolean(label && requested && matchCheckCommand(allowlist, requested));
+    });
+  }
+
+  // T2.1 — an agent that finds its work is too big can divide it.
+  //
+  // "Divide work among themselves" was the one thing in the stated goal that the system did not
+  // support at all: a planner created assignments by hand, and an agent that claimed one and
+  // discovered it was three days of work had no move. It could grind through it, or report blocked
+  // and wait for a human-shaped triage step. Neither is what a team does.
+  //
+  // The design constraint that shapes everything here: **splitting must not cost the splitter its
+  // lease**. An agent that has to release its claim to reorganise the work will not do it — it will
+  // grind on instead — and in the gap another agent can take the paths it was midway through
+  // editing. So the parent stays claimed by the same agent, at the same generation, throughout.
+  async completeAssignment({ agentId, assignmentId, message, status = "done", changedFiles = [], checks = [], nextStatus = "waiting", claimToken = null, usage = null }) {
     const agent = this.getAgent(agentId);
     const assignment = this.db.prepare("SELECT * FROM assignments WHERE id = ?").get(assignmentId);
     if (!assignment) throw new Error("Assignment not found.");
@@ -3348,11 +3439,49 @@ export class DevTeamStore extends EventEmitter {
     const ownedByCaller = assignment.agent_id === agentId && assignment.status === "claimed";
     const tokenMatches = claimToken == null || (assignment.claim_token_hash && this.#hashToken(claimToken) === assignment.claim_token_hash);
     if (!ownedByCaller || !tokenMatches) return this.#claimConflict(assignment, agentId);
+    // This assignment already has a report's checks running. Refusing the second one is not a race
+    // guard for its own sake: an accepted report spawns real processes in the project root, so a
+    // retried or duplicated call would run the suite twice over one working tree and record
+    // whichever finished last. The claim is untouched, so the agent loses nothing by waiting.
+    if (assignment.verifying_at) {
+      return {
+        completed: false,
+        verifying: { assignmentId, taskId: assignment.task_id, since: assignment.verifying_at },
+        reason: "DevTeam is still running the checks from your previous report on this assignment. Wait for that call to return instead of reporting again.",
+      };
+    }
     const cleanChanged = [...new Set(changedFiles.map((item) => String(item).trim()).filter(Boolean))].slice(0, 200);
     const task = this.getTask(assignment.task_id);
     // Anything the agent asked DevTeam to verify is run *now*, before a single row is written, so a
     // failure cannot become a permanently green record that approvals are then built on top of.
-    const checkRecords = this.#gradeReportedChecks(assignment, task, checks);
+    // Running it takes real time and no longer holds the event loop, so the assignment carries a
+    // verifying flag for that window: the board can show "checks running", the duplicate report
+    // above is refused, and a crash mid-verification leaves a flag that startup clears rather than
+    // a claim nobody can settle.
+    const runsCommands = this.#reportRunsCommands(task, checks);
+    if (runsCommands) {
+      this.db.prepare("UPDATE assignments SET verifying_at = ? WHERE id = ?").run(now(), assignmentId);
+      this.#event(assignment.task_id, agentId, "assignment.verifying",
+        `DevTeam is running the checks ${agent.name} reported for “${assignment.title}”.`, { assignmentId, role: assignment.role });
+      this.#changed("assignment.verifying", assignment.task_id);
+    }
+    let checkRecords;
+    try {
+      checkRecords = await this.#gradeReportedChecks(assignment, task, checks);
+    } finally {
+      if (runsCommands) this.db.prepare("UPDATE assignments SET verifying_at = NULL WHERE id = ?").run(assignmentId);
+    }
+    // The claim can move while those checks run. A force-release, a resume and a checkpoint takeover
+    // all reassign it, and none of them wait for verification — so settling against the row read
+    // before the await would write a report on a lease this caller no longer holds. Re-fence against
+    // the row as it stands now, including the generation, which every one of those paths bumps.
+    const current = this.db.prepare("SELECT * FROM assignments WHERE id = ?").get(assignmentId);
+    if (!current) throw new Error("Assignment not found.");
+    const stillOwned = current.agent_id === agentId
+      && current.status === "claimed"
+      && Number(current.claim_generation) === Number(assignment.claim_generation)
+      && (claimToken == null || (current.claim_token_hash && this.#hashToken(claimToken) === current.claim_token_hash));
+    if (!stillOwned) return this.#claimConflict(current, agentId);
     const cleanChecks = checkRecords.map((record) => record.label).slice(0, 100);
     const failedChecks = checkRecords.filter((record) => record.status === "failed");
     // A verified failure cannot be reported as done. The claim is deliberately left intact: the

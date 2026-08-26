@@ -42,9 +42,9 @@ async function checksFixture(t, { scripts = null, enable = true } = {}) {
   const project = store.ensureProject("Checks project", projectRoot);
   const task = store.createTask({ projectId: project.id, title: "Checks", description: "Exercise verified checks." });
   if (enable) store.setProjectCheckCommands({ projectId: project.id });
-  const agent = store.connectAgent({ name: "Reporter", provider: "fixture" });
+  const agent = store.connectAgent({ name: "Reporter", provider: "fixture", freshTaskId: task.id });
   const plan = store.claimNextAssignment(agent.id);
-  store.completeAssignment({ agentId: agent.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+  await store.completeAssignment({ agentId: agent.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
   return { store, project, task, agent, projectRoot };
 }
 
@@ -57,7 +57,7 @@ test("a check whose command exits non-zero cannot be recorded as passing", async
   const { store, task, agent } = await checksFixture(t);
   const claim = claimWork(store, agent, task);
 
-  const refused = store.completeAssignment({
+  const refused = await store.completeAssignment({
     agentId: agent.id, assignmentId: claim.id, claimToken: claim.claimToken,
     message: "All green, shipping it.",
     checks: [{ label: "lint: 0 problems", command: "lint" }],
@@ -80,7 +80,7 @@ test("a check whose command exits non-zero cannot be recorded as passing", async
     "the attempt is visible to the human rather than silently swallowed");
 
   // The honest path stays open: the same failing check may be reported as blocked.
-  const blocked = store.completeAssignment({
+  const blocked = await store.completeAssignment({
     agentId: agent.id, assignmentId: claim.id, claimToken: claim.claimToken,
     message: "Lint fails and I cannot fix it here.", status: "blocked",
     checks: [{ label: "lint", command: "lint" }],
@@ -93,7 +93,7 @@ test("a passing command is verified and recorded with its real evidence", async 
   const { store, task, agent } = await checksFixture(t);
   const claim = claimWork(store, agent, task);
 
-  const result = store.completeAssignment({
+  const result = await store.completeAssignment({
     agentId: agent.id, assignmentId: claim.id, claimToken: claim.claimToken,
     message: "Done.",
     checks: [{ label: "unit tests", command: "test" }, "reviewed the diff by eye"],
@@ -122,7 +122,7 @@ test("nothing runs unless a human enabled it, and only what they allowlisted", a
   assert.deepEqual(store.projectCheckCommands(project.id), [], "verification is off until a human turns it on");
 
   const first = claimWork(store, agent, task, "Before enabling");
-  const untouched = store.completeAssignment({
+  const untouched = await store.completeAssignment({
     agentId: agent.id, assignmentId: first.id, claimToken: first.claimToken, message: "Done.",
     checks: [{ label: "lint", command: "lint" }],
   });
@@ -137,7 +137,7 @@ test("nothing runs unless a human enabled it, and only what they allowlisted", a
     "a script with a shell operator or a path-qualified program is not derivable and is left out");
 
   const second = claimWork(store, agent, task, "After enabling");
-  const unknown = store.completeAssignment({
+  const unknown = await store.completeAssignment({
     agentId: agent.id, assignmentId: second.id, claimToken: second.claimToken, message: "Done.",
     checks: [{ label: "deploy to production", command: "deploy" }],
   });
@@ -149,7 +149,7 @@ test("nothing runs unless a human enabled it, and only what they allowlisted", a
   // Turning it back off is one call, and it stops execution immediately.
   store.setProjectCheckCommands({ projectId: project.id, commands: [] });
   const third = claimWork(store, agent, task, "After disabling");
-  const off = store.completeAssignment({
+  const off = await store.completeAssignment({
     agentId: agent.id, assignmentId: third.id, claimToken: third.claimToken, message: "Done.",
     checks: [{ label: "lint", command: "lint" }],
   });
@@ -176,7 +176,7 @@ test("agent text selects an allowlist entry and is never executed as written", a
   }
 
   const claim = claimWork(store, agent, task);
-  const result = store.completeAssignment({
+  const result = await store.completeAssignment({
     agentId: agent.id, assignmentId: claim.id, claimToken: claim.claimToken, message: "Done.",
     checks: injections.map((command) => ({ label: `attempt: ${command}`, command })),
   });
@@ -210,7 +210,7 @@ test("the allowlist is a pinned snapshot, so rewriting package.json changes noth
     ["node", "scripts/pass.mjs"], "the stored argv is unchanged by the rewrite");
 
   const claim = claimWork(store, agent, task);
-  const result = store.completeAssignment({
+  const result = await store.completeAssignment({
     agentId: agent.id, assignmentId: claim.id, claimToken: claim.claimToken, message: "Done.",
     checks: [{ label: "unit tests", command: "test" }],
   });
@@ -247,13 +247,13 @@ test("command parsing refuses everything it cannot run faithfully", () => {
 test("a check that cannot start is unavailable, never a pass and never a failure", async (t) => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "devteam-checks-missing-"));
   t.after(async () => { await rm(projectRoot, { recursive: true, force: true }); });
-  const missing = runVerifiedCheck({ argv: ["devteam-no-such-program-exists"], cwd: projectRoot, timeoutMs: 5000 });
+  const missing = await runVerifiedCheck({ argv: ["devteam-no-such-program-exists"], cwd: projectRoot, timeoutMs: 5000 });
   assert.equal(missing.verified, false, "nothing was verified, so nothing is recorded as verified");
   assert.equal(missing.status, "unavailable");
   assert.equal(missing.exitCode, null);
 
   // A check that hangs is a failing check, not a pass.
-  const hang = runVerifiedCheck({
+  const hang = await runVerifiedCheck({
     argv: ["node", "-e", "setTimeout(() => {}, 60000)"],
     cwd: projectRoot,
     timeoutMs: 1000,
@@ -325,7 +325,7 @@ test("a failing command cannot launder itself into 'not run' by drowning the out
   t.after(async () => { await rm(projectRoot, { recursive: true, force: true }); });
   // Exits non-zero AND prints past the 2MB capture limit. Graded "unavailable" before the review,
   // which let the report complete; an exit status we could not read is not a pass.
-  const flooded = runVerifiedCheck({
+  const flooded = await runVerifiedCheck({
     argv: ["node", "--eval", "process.stdout.write('x'.repeat(4*1024*1024)); process.exit(7);"],
     cwd: projectRoot, timeoutMs: 30_000,
   });
@@ -352,13 +352,13 @@ test("the verification timeout bounds the whole report, not each command in it",
   const project = store.ensureProject("Budget project", projectRoot);
   const task = store.createTask({ projectId: project.id, title: "Budget", description: "Exercise the report budget." });
   store.setProjectCheckCommands({ projectId: project.id });
-  const agent = store.connectAgent({ name: "Reporter", provider: "fixture" });
+  const agent = store.connectAgent({ name: "Reporter", provider: "fixture", freshTaskId: task.id });
   const plan = store.claimNextAssignment(agent.id);
-  store.completeAssignment({ agentId: agent.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+  await store.completeAssignment({ agentId: agent.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
   const claim = claimWork(store, agent, task);
 
   const startedAt = Date.now();
-  const result = store.completeAssignment({
+  const result = await store.completeAssignment({
     agentId: agent.id, assignmentId: claim.id, claimToken: claim.claimToken, message: "Done.", status: "blocked",
     checks: Array.from({ length: 10 }, (unused, index) => ({ label: `slow ${index}`, command: "slow" })),
   });
@@ -378,7 +378,7 @@ test("only the latest report attempt describes the work as it now stands", async
   const claim = claimWork(store, agent, task);
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const refused = store.completeAssignment({
+    const refused = await store.completeAssignment({
       agentId: agent.id, assignmentId: claim.id, claimToken: claim.claimToken,
       message: "Green, honest.", checks: [{ label: "unit tests", command: "lint" }],
     });
@@ -389,7 +389,7 @@ test("only the latest report attempt describes the work as it now stands", async
   assert.equal(midway.checks[0].status, "failed");
 
   // The agent fixes the work and reports a check that really passes.
-  const fixed = store.completeAssignment({
+  const fixed = await store.completeAssignment({
     agentId: agent.id, assignmentId: claim.id, claimToken: claim.claimToken,
     message: "Fixed.", checks: [{ label: "unit tests", command: "test" }],
   });
@@ -423,7 +423,7 @@ test("a sandboxed project confines its checks to the project folder", async (t) 
   assert.equal(store.projectCheckSandbox(project.id), true);
 
   const claim = claimWork(store, agent, task);
-  const result = store.completeAssignment({
+  const result = await store.completeAssignment({
     agentId: agent.id, assignmentId: claim.id, claimToken: claim.claimToken, message: "Done.", status: "blocked",
     checks: [{ label: "unit tests", command: "test" }, { label: "exfiltration attempt", command: "lint" }],
   });
@@ -433,13 +433,233 @@ test("a sandboxed project confines its checks to the project folder", async (t) 
   assert.match(exfil.output, /ERR_ACCESS_DENIED/);
 });
 
-test("confinement is refused rather than silently skipped for a program it cannot confine", () => {
+test("confinement is refused rather than silently skipped for a program it cannot confine", async () => {
   // Only node can be confined this way. Running anything else unconfined while the project is marked
   // sandboxed would make "sandboxed" mean nothing, so it is not run at all.
   assert.equal(sandboxFlagsFor("git", "/tmp/x"), null);
   assert.ok(sandboxFlagsFor("node", "/tmp/x").includes("--permission"));
-  const refused = runVerifiedCheck({ argv: ["git", "status"], cwd: os.tmpdir(), sandbox: true });
+  const refused = await runVerifiedCheck({ argv: ["git", "status"], cwd: os.tmpdir(), sandbox: true });
   assert.equal(refused.status, "unavailable");
   assert.equal(refused.verified, false);
   assert.match(refused.output, /can only confine/);
 });
+
+// --- T0.2: verification runs off the event loop -------------------------------------------------
+
+// A project whose one allowlisted check takes long enough to observe. Everything else about it is
+// the ordinary fixture; only the script body differs.
+async function slowChecksFixture(t, { millis = 900, exitCode = 0 } = {}) {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-slow-checks-data-"));
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "devteam-slow-checks-project-"));
+  await mkdir(path.join(projectRoot, "scripts"), { recursive: true });
+  await writeFile(path.join(projectRoot, "scripts", "slow.mjs"),
+    `setTimeout(() => { process.stdout.write("slow check done"); process.exit(${exitCode}); }, ${millis});\n`, "utf8");
+  await writeFile(path.join(projectRoot, "package.json"), JSON.stringify({
+    name: "slow-checks-fixture",
+    scripts: { test: "node scripts/slow.mjs" },
+  }, null, 2), "utf8");
+  const store = new DevTeamStore(dataDir, { knowledge: { enabled: false }, codegraph: { enabled: false }, checks: { timeoutMs: 30_000 } });
+  t.after(async () => {
+    try { store.close(); } catch { /* some tests close early */ }
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  });
+  const project = store.ensureProject("Slow checks project", projectRoot);
+  const task = store.createTask({ projectId: project.id, title: "Slow checks", description: "Exercise off-loop verification." });
+  store.setProjectCheckCommands({ projectId: project.id });
+  const agent = store.connectAgent({ name: "Reporter", provider: "fixture", freshTaskId: task.id });
+  const plan = store.claimNextAssignment(agent.id);
+  await store.completeAssignment({ agentId: agent.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+  return { store, project, task, agent, projectRoot };
+}
+
+test("verification does not hold the event loop, and says so on the board while it runs", async (t) => {
+  // This is the whole point of running checks off-loop. Under spawnSync the timer below could not
+  // fire at all until the check finished, and every other agent's call, the dashboard, SSE and the
+  // heartbeats that decide who still holds a write lease waited with it.
+  const { store, task, agent } = await slowChecksFixture(t, { millis: 900 });
+  const claim = claimWork(store, agent, task);
+
+  let ticks = 0;
+  const ticker = setInterval(() => { ticks += 1; }, 50);
+  t.after(() => clearInterval(ticker));
+
+  const settling = store.completeAssignment({
+    agentId: agent.id, assignmentId: claim.id, claimToken: claim.claimToken,
+    message: "Ran the slow check.", checks: [{ label: "suite", command: "test" }],
+  });
+
+  // The flag is set synchronously, before the first await, so it is already visible here.
+  const verifyingRow = store.db.prepare("SELECT verifying_at, status, agent_id FROM assignments WHERE id = ?").get(claim.id);
+  assert.ok(verifyingRow.verifying_at, "the assignment is marked verifying while its checks run");
+  assert.equal(verifyingRow.status, "claimed", "and keeps its claim, so its write lease never lapses mid-verification");
+  assert.equal(verifyingRow.agent_id, agent.id);
+  assert.ok(store.taskDetail(task.id).events.some((event) => event.type === "assignment.verifying"),
+    "the timeline says checks are running rather than going silent");
+
+  // Ordinary reads keep answering while the child process runs.
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  assert.ok(store.listAgents().length >= 1, "the store still answers while verification is in flight");
+
+  const result = await settling;
+  assert.equal(result.completed, true);
+  assert.equal(result.checks[0].status, "passed");
+  assert.ok(ticks >= 3, `the event loop kept running during verification (ticks: ${ticks})`);
+  assert.equal(store.db.prepare("SELECT verifying_at FROM assignments WHERE id = ?").get(claim.id).verifying_at, null,
+    "the flag is cleared once the report settles");
+});
+
+test("a second report is refused while the first one's checks are still running", async (t) => {
+  // Each accepted report spawns real processes against one working tree. A duplicate call would run
+  // the suite twice over the same files and record whichever finished last.
+  const { store, task, agent } = await slowChecksFixture(t, { millis: 700 });
+  const claim = claimWork(store, agent, task);
+  const first = store.completeAssignment({
+    agentId: agent.id, assignmentId: claim.id, claimToken: claim.claimToken,
+    message: "First report.", checks: [{ label: "suite", command: "test" }],
+  });
+  const second = await store.completeAssignment({
+    agentId: agent.id, assignmentId: claim.id, claimToken: claim.claimToken,
+    message: "Same work, reported twice.", checks: [{ label: "suite", command: "test" }],
+  });
+  assert.equal(second.completed, false);
+  assert.equal(second.verifying.assignmentId, claim.id);
+  assert.match(second.reason, /still running the checks/i);
+
+  const settled = await first;
+  assert.equal(settled.completed, true, "the first report is unaffected by the refused duplicate");
+  // One report ran, so exactly one batch of check rows is current.
+  const current = store.db.prepare("SELECT COUNT(*) AS count FROM assignment_checks WHERE assignment_id = ? AND superseded_at IS NULL").get(claim.id);
+  assert.equal(current.count, 1);
+});
+
+test("a claim that moves while its checks run cannot be settled by the session that lost it", async (t) => {
+  // Verification is no longer instantaneous, so the claim can move underneath a report in flight —
+  // a force-release, a resume, or a checkpoint takeover all reassign it without waiting. Settling
+  // against the row read before the checks started would write a report on a lease this session no
+  // longer holds.
+  const { store, task, agent } = await slowChecksFixture(t, { millis: 900 });
+  const claim = claimWork(store, agent, task);
+  const settling = store.completeAssignment({
+    agentId: agent.id, assignmentId: claim.id, claimToken: claim.claimToken,
+    message: "Reported just before losing the lease.", checks: [{ label: "suite", command: "test" }],
+  });
+  // The human force-releases it while the check is still running.
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  store.forceReleaseAssignment({ assignmentId: claim.id, confirmTitle: claim.title });
+
+  const result = await settling;
+  assert.equal(result.completed, false, "a report whose lease moved mid-verification is refused");
+  assert.ok(result.claimConflict, "and is refused with a structured conflict, not a silent overwrite");
+  const row = store.db.prepare("SELECT status, completed_at, verifying_at FROM assignments WHERE id = ?").get(claim.id);
+  assert.equal(row.status, "queued", "the released assignment stays queued for whoever picks it up");
+  assert.equal(row.completed_at, null, "and was never recorded as done by the session that lost it");
+  assert.equal(row.verifying_at, null);
+});
+
+test("a report that only asserts never enters the verifying window", async (t) => {
+  // Nothing is executed, so there is nothing to wait for. Flagging it would put "checks running" on
+  // the board for work nobody is checking.
+  const { store, task, agent } = await slowChecksFixture(t);
+  const claim = claimWork(store, agent, task);
+  const settling = store.completeAssignment({
+    agentId: agent.id, assignmentId: claim.id, claimToken: claim.claimToken,
+    message: "Read the code.", checks: ["I read it carefully"],
+  });
+  assert.equal(store.db.prepare("SELECT verifying_at FROM assignments WHERE id = ?").get(claim.id).verifying_at, null);
+  const result = await settling;
+  assert.equal(result.completed, true);
+  assert.equal(result.checks[0].verified, false, "an assertion is still recorded as the agent's own claim");
+  assert.equal(store.taskDetail(task.id).events.some((event) => event.type === "assignment.verifying"), false);
+});
+
+test("a failed check clears the verifying flag and leaves the claim intact", async (t) => {
+  const { store, task, agent } = await slowChecksFixture(t, { millis: 200, exitCode: 3 });
+  const claim = claimWork(store, agent, task);
+  const refused = await store.completeAssignment({
+    agentId: agent.id, assignmentId: claim.id, claimToken: claim.claimToken,
+    message: "Claiming this is done.", checks: [{ label: "suite", command: "test" }],
+  });
+  assert.equal(refused.completed, false);
+  assert.ok(refused.checksFailed, "a verified failure is refused, exactly as before");
+  const row = store.db.prepare("SELECT status, agent_id, verifying_at FROM assignments WHERE id = ?").get(claim.id);
+  assert.equal(row.verifying_at, null, "the flag never outlives the report that set it");
+  assert.equal(row.status, "claimed", "and the claim is left intact so the agent can fix and report again");
+  assert.equal(row.agent_id, agent.id);
+});
+
+test("a verifying flag left by a crash is cleared on the next startup", async (t) => {
+  // The child processes died with the process that spawned them, so nothing is coming to settle
+  // that report. The claim, the lease and the fencing token were never released, so clearing the
+  // flag returns the assignment to exactly what it still is: a live claim the agent can report on.
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-verify-crash-"));
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "devteam-verify-crash-project-"));
+  const opened = [];
+  t.after(async () => {
+    for (const instance of opened) { try { instance.close(); } catch { /* already closed */ } }
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  });
+  const store = new DevTeamStore(dataDir, { knowledge: { enabled: false }, codegraph: { enabled: false } });
+  opened.push(store);
+  const project = store.ensureProject("Crash project", projectRoot);
+  const task = store.createTask({ projectId: project.id, title: "Crash", description: "Die mid-verification." });
+  const agent = store.connectAgent({ name: "Reporter", provider: "fixture", freshTaskId: task.id });
+  const plan = store.claimNextAssignment(agent.id);
+  store.db.prepare("UPDATE assignments SET verifying_at = ? WHERE id = ?").run(new Date().toISOString(), plan.id);
+  store.close();
+
+  const restarted = new DevTeamStore(dataDir, { knowledge: { enabled: false }, codegraph: { enabled: false } });
+  opened.push(restarted);
+  const row = restarted.db.prepare("SELECT verifying_at, status, agent_id FROM assignments WHERE id = ?").get(plan.id);
+  assert.equal(row.verifying_at, null, "a stale verifying flag never survives a restart");
+  assert.equal(row.status, "claimed");
+  assert.equal(row.agent_id, agent.id, "and the claim it belonged to is untouched");
+});
+
+// --- T2.3: regression awareness -----------------------------------------------------------------
+
+// A project whose one allowlisted check can be flipped between passing and failing from the test, so
+// "it used to pass and now it does not" is a real observation rather than a simulated one.
+async function regressionFixture(t) {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-regress-data-"));
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "devteam-regress-project-"));
+  await mkdir(path.join(projectRoot, "scripts"), { recursive: true });
+  const setSuite = async (passing) => {
+    await writeFile(path.join(projectRoot, "scripts", "suite.mjs"),
+      passing ? "process.stdout.write('ok');\n" : "process.stderr.write('broken');\nprocess.exit(1);\n", "utf8");
+  };
+  await setSuite(true);
+  await writeFile(path.join(projectRoot, "package.json"), JSON.stringify({
+    name: "regress-fixture", scripts: { test: "node scripts/suite.mjs" },
+  }, null, 2), "utf8");
+
+  const store = new DevTeamStore(dataDir, { knowledge: { enabled: false }, codegraph: { enabled: false }, checks: { timeoutMs: 20_000 } });
+  t.after(async () => {
+    try { store.close(); } catch { /* some tests close early */ }
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  });
+  const project = store.ensureProject("Regress project", projectRoot);
+  store.setProjectCheckCommands({ projectId: project.id });
+  const task = store.createTask({ projectId: project.id, title: "Keep it green", description: "Do not break each other's work." });
+  const alice = store.connectAgent({ name: "Alice", provider: "test", freshTaskId: task.id });
+  const bob = store.connectAgent({ name: "Bob", provider: "test", freshTaskId: task.id });
+  const plan = store.claimNextAssignment(alice.id);
+  await store.completeAssignment({ agentId: alice.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+  return { store, project, task, alice, bob, setSuite };
+}
+
+const SUITE = [{ label: "suite", command: "test" }];
+
+// Claim a fresh assignment for an agent and report it, returning the report result.
+async function doWork(store, agent, task, title, { changedFiles = [], checks = [], paths = undefined } = {}) {
+  store.createAssignment({ taskId: task.id, title, description: "Work.", role: "implementer", requiresWrite: true, paths, targetAgentName: agent.name });
+  const claim = store.claimNextAssignment(agent.id);
+  assert.equal(claim.title, title, `${agent.name} should have claimed ${title}`);
+  return { claim, result: await store.completeAssignment({
+    agentId: agent.id, assignmentId: claim.id, claimToken: claim.claimToken,
+    message: `${title} done.`, changedFiles, checks,
+  }) };
+}
+

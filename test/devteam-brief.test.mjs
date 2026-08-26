@@ -45,7 +45,7 @@ test("extreme blackboards still produce a deterministic 32 KiB brief with mandat
     title: "Keep the mandatory core",
     description: "😀".repeat(20_000),
   });
-  const agent = store.connectAgent({ name: "Stress agent", provider: "test" });
+  const agent = store.connectAgent({ name: "Stress agent", provider: "test", freshTaskId: task.id });
   const claim = store.claimNextAssignment(agent.id);
   const huge = `${"x".repeat(99_900)}😀${"\\\"".repeat(40)}`;
   const insertTask = store.db.prepare(`

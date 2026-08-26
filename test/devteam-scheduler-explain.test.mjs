@@ -12,9 +12,11 @@ import { DevTeamStore } from "../src/devteam/store.mjs";
 const SKIP_BRANCHES = [
   "agent_disconnected",
   "agent_holds_claim",
+  "agent_holds_write_claim",
   "assignment_not_queued",
   "task_closed",
   "room_not_claimable",
+  "room_membership_required",
   "room_invitation_only",
   "targeted_elsewhere",
   "dependency_pending",
@@ -57,9 +59,9 @@ async function explainFixture(t) {
 }
 
 // Drain the planner assignment createTask seeds, so later tests start from an empty queue.
-function drainPlanner(store, agent) {
+async function drainPlanner(store, agent) {
   const plan = store.claimNextAssignment(agent.id);
-  store.completeAssignment({ agentId: agent.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+  await store.completeAssignment({ agentId: agent.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
   return plan;
 }
 
@@ -80,22 +82,30 @@ test("whyNotClaimable names a reason for every branch on which the scan skips a 
   // --- assignment_not_queued / agent_holds_claim -----------------------------------------------
   {
     const { store, task } = await explainFixture(t);
-    const agent = store.connectAgent({ name: "Holder", provider: "fixture" });
+    const agent = store.connectAgent({ name: "Holder", provider: "fixture", freshTaskId: task.id });
     const plan = store.claimNextAssignment(agent.id);
-    const other = store.createAssignment({ taskId: task.id, title: "Second item", description: "More work.", role: "implementer" });
     const held = record(store.whyNotClaimable(plan.id, agent.id), "assignment_not_queued");
     assert.equal(held.status, "claimed");
     assert.equal(held.holder, "Holder", "the claim explanation names who holds it");
-    const blocked = record(store.whyNotClaimable(other.id, agent.id), "agent_holds_claim");
-    assert.equal(blocked.heldAssignmentId, plan.id);
+    // Its own live claim is reported as such when asked about that assignment.
+    record(store.whyNotClaimable(plan.id, agent.id), "agent_holds_claim");
+
+    // T0.3: holding a *write* claim blocks a second writer — that is the lease invariant — but the
+    // same agent may still take read-only work, so a review is not reported as blocked here.
+    await store.completeAssignment({ agentId: agent.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+    store.createAssignment({ taskId: task.id, title: "First writer", description: "Edit.", role: "implementer", requiresWrite: true, paths: ["src/first.mjs"] });
+    const writeClaim = store.claimNextAssignment(agent.id);
+    const secondWriter = store.createAssignment({ taskId: task.id, title: "Second writer", description: "Edit elsewhere.", role: "implementer", requiresWrite: true, paths: ["src/second.mjs"] });
+    const blocked = record(store.whyNotClaimable(secondWriter.id, agent.id), "agent_holds_write_claim");
+    assert.equal(blocked.heldAssignmentId, writeClaim.id);
     assert.match(blocked.detail, /Holder/);
   }
 
   // --- agent_disconnected -----------------------------------------------------------------------
   {
     const { store, task } = await explainFixture(t);
-    const agent = store.connectAgent({ name: "Departed", provider: "fixture" });
-    drainPlanner(store, agent);
+    const agent = store.connectAgent({ name: "Departed", provider: "fixture", freshTaskId: task.id });
+    await drainPlanner(store, agent);
     const work = store.createAssignment({ taskId: task.id, title: "Left behind", description: "Work.", role: "implementer" });
     store.disconnectAgent(agent.id, "Session ended.");
     record(store.whyNotClaimable(work.id, agent.id), "agent_disconnected");
@@ -105,8 +115,8 @@ test("whyNotClaimable names a reason for every branch on which the scan skips a 
   // --- task_closed ------------------------------------------------------------------------------
   {
     const { store, task } = await explainFixture(t);
-    const agent = store.connectAgent({ name: "Worker", provider: "fixture" });
-    drainPlanner(store, agent);
+    const agent = store.connectAgent({ name: "Worker", provider: "fixture", freshTaskId: task.id });
+    await drainPlanner(store, agent);
     const work = store.createAssignment({ taskId: task.id, title: "Shelved", description: "Work.", role: "implementer" });
     store.blockTask({ taskId: task.id, reason: "Needs a human decision." });
     const reason = record(store.whyNotClaimable(work.id, agent.id), "task_closed");
@@ -114,19 +124,28 @@ test("whyNotClaimable names a reason for every branch on which the scan skips a 
     assert.equal(store.claimNextAssignment(agent.id), null, "the scan hands out nothing from a closed task");
   }
 
-  // --- room_not_claimable / room_invitation_only / targeted_elsewhere ---------------------------
+  // --- room_not_claimable / room_membership_required / room_invitation_only / targeted_elsewhere -
   {
     const { store, project, task } = await explainFixture(t);
-    const insider = store.connectAgent({ name: "Insider", provider: "fixture" });
-    drainPlanner(store, insider);
-    store.joinTask(insider.id, task.id, "contributor");
+    const insider = store.connectAgent({ name: "Insider", provider: "fixture", freshTaskId: task.id });
+    await drainPlanner(store, insider);
     const elsewhere = store.createTask({ projectId: project.id, title: "Other room", description: "Not yours." });
-    const outsider = store.connectAgent({ name: "Outsider", provider: "fixture" });
-    store.joinTask(outsider.id, elsewhere.id, "contributor");
+    const outsider = store.connectAgent({ name: "Outsider", provider: "fixture", freshTaskId: elsewhere.id });
 
     const untargeted = store.createAssignment({ taskId: task.id, title: "Room work", description: "Work.", role: "implementer" });
     const reason = record(store.whyNotClaimable(untargeted.id, outsider.id), "room_not_claimable");
     assert.equal(reason.taskId, task.id);
+
+    // Being in the wrong room and being in no room at all are different situations, and only the
+    // second one is fixed by joining anything. A fresh session lands in the second one, so it gets
+    // its own code and is handed the list of rooms it could join.
+    const roomless = store.connectAgent({ name: "Roomless", provider: "fixture" });
+    const needsRoom = record(store.whyNotClaimable(untargeted.id, roomless.id), "room_membership_required");
+    assert.deepEqual(needsRoom.availableTasks.map((entry) => entry.id).sort(), [task.id, elsewhere.id].sort());
+    const board = store.whyNoClaimableWork(roomless.id);
+    assert.equal(board.membershipRequired, true);
+    assert.match(board.next, /devteam_join/);
+    assert.equal(store.claimNextAssignment(roomless.id), null, "and the scan hands it nothing");
 
     // An invitation addressed by name reaches into the room for that item only.
     const invitation = store.createAssignment({
@@ -145,8 +164,8 @@ test("whyNotClaimable names a reason for every branch on which the scan skips a 
   // --- dependency_pending -----------------------------------------------------------------------
   {
     const { store, task } = await explainFixture(t);
-    const agent = store.connectAgent({ name: "Worker", provider: "fixture" });
-    drainPlanner(store, agent);
+    const agent = store.connectAgent({ name: "Worker", provider: "fixture", freshTaskId: task.id });
+    await drainPlanner(store, agent);
     const first = store.createAssignment({ taskId: task.id, title: "Lay the foundation", description: "Work.", role: "implementer" });
     const second = store.createAssignment({
       taskId: task.id, title: "Build on it", description: "Work.", role: "implementer", dependsOn: [first.id],
@@ -161,8 +180,8 @@ test("whyNotClaimable names a reason for every branch on which the scan skips a 
   // --- awaiting_writer (the self-blocking verifier deadlock, F8) ---------------------------------
   {
     const { store, task } = await explainFixture(t);
-    const agent = store.connectAgent({ name: "Worker", provider: "fixture" });
-    drainPlanner(store, agent);
+    const agent = store.connectAgent({ name: "Worker", provider: "fixture", freshTaskId: task.id });
+    await drainPlanner(store, agent);
     store.createAssignment({
       taskId: task.id, title: "Ship the feature", description: "Edit source.",
       role: "implementer", requiresWrite: true, paths: ["src"],
@@ -185,8 +204,8 @@ test("whyNotClaimable names a reason for every branch on which the scan skips a 
   // --- write_lease_conflict ---------------------------------------------------------------------
   {
     const { store, task } = await explainFixture(t);
-    const first = store.connectAgent({ name: "First writer", provider: "fixture" });
-    drainPlanner(store, first);
+    const first = store.connectAgent({ name: "First writer", provider: "fixture", freshTaskId: task.id });
+    await drainPlanner(store, first);
     store.createAssignment({
       taskId: task.id, title: "Rework the core", description: "Edit source.",
       role: "implementer", requiresWrite: true, paths: ["src/devteam"],
@@ -197,7 +216,7 @@ test("whyNotClaimable names a reason for every branch on which the scan skips a 
     });
     const claim = store.claimNextAssignment(first.id);
     assert.equal(claim.title, "Rework the core");
-    const second = store.connectAgent({ name: "Second writer", provider: "fixture" });
+    const second = store.connectAgent({ name: "Second writer", provider: "fixture", freshTaskId: task.id });
     store.joinTask(second.id, task.id, "contributor");
     const reason = record(store.whyNotClaimable(overlapping.id, second.id), "write_lease_conflict");
     assert.equal(reason.holder, "First writer", "the conflicting holder is named");
@@ -210,8 +229,8 @@ test("whyNotClaimable names a reason for every branch on which the scan skips a 
   // --- runtime_gate / runtime_decision_hold -----------------------------------------------------
   {
     const { store, task } = await explainFixture(t);
-    const planner = store.connectAgent({ name: "Planner", provider: "fixture" });
-    drainPlanner(store, planner);
+    const planner = store.connectAgent({ name: "Planner", provider: "fixture", freshTaskId: task.id });
+    await drainPlanner(store, planner);
     store.disconnectAgent(planner.id, "Done planning.");
     const critical = store.createAssignment({
       taskId: task.id,
@@ -219,7 +238,7 @@ test("whyNotClaimable names a reason for every branch on which the scan skips a 
       description: "Implement authentication permission checks with a database schema migration.",
       role: "implementer", requiresWrite: true, paths: ["src/auth.mjs"],
     });
-    const agent = store.connectAgent({ name: "Underpowered", provider: "fixture", runtimeProfile: balancedProfile() });
+    const agent = store.connectAgent({ name: "Underpowered", provider: "fixture", runtimeProfile: balancedProfile(), freshTaskId: task.id });
     const gate = record(store.whyNotClaimable(critical.id, agent.id), "runtime_gate");
     assert.match(gate.detail, /Fixture balanced/, "the advertised label of what it is running is quoted back");
     assert.match(gate.detail, /Fixture frontier/, "as is the advertised label of what the work needs");
@@ -240,8 +259,8 @@ test("whyNotClaimable names a reason for every branch on which the scan skips a 
 
 test("whyNotClaimable reports the whole chain and says so plainly when nothing blocks", async (t) => {
   const { store, task } = await explainFixture(t);
-  const agent = store.connectAgent({ name: "Worker", provider: "fixture" });
-  drainPlanner(store, agent);
+  const agent = store.connectAgent({ name: "Worker", provider: "fixture", freshTaskId: task.id });
+  await drainPlanner(store, agent);
 
   const ready = store.createAssignment({ taskId: task.id, title: "Plain work", description: "Nothing in the way.", role: "implementer" });
   const clear = store.whyNotClaimable(ready.id, agent.id);
@@ -263,11 +282,13 @@ test("whyNotClaimable reports the whole chain and says so plainly when nothing b
 
   const chain = store.whyNotClaimable(piled.id, agent.id);
   const codes = codesOf(chain);
-  assert.ok(codes.includes("agent_holds_claim"), "the agent's own held claim is reported");
-  assert.ok(codes.includes("dependency_pending"), "so is the unmet dependency");
+  // T0.3: the agent holds a read-only planner claim, which no longer blocks read-only work, so
+  // `agent_holds_claim` is correctly absent here. Everything else still piles up.
+  assert.equal(codes.includes("agent_holds_claim"), false, "a read-only claim does not block review work");
+  assert.ok(codes.includes("dependency_pending"), "the unmet dependency is reported");
   assert.ok(codes.includes("awaiting_writer"), "so is the pending writer");
   assert.ok(codes.includes("target_absent"), "so is the departed target");
-  assert.ok(codes.length >= 4, `the chain is ordered and complete, got ${JSON.stringify(codes)}`);
+  assert.ok(codes.length >= 3, `the chain is ordered and complete, got ${JSON.stringify(codes)}`);
   assert.equal(chain.reasons.find((reason) => reason.code === "target_absent").blocking, false,
     "an absent target widens who may claim, so it is reported without being counted as a blocker");
   assert.match(chain.reasons.find((reason) => reason.code === "awaiting_writer").detail, new RegExp(writer.title));
@@ -281,8 +302,8 @@ test("whyNotClaimable reports the whole chain and says so plainly when nothing b
 
 test("the scheduling hold shown on a card is the same explanation, not a second opinion", async (t) => {
   const { store, task } = await explainFixture(t);
-  const agent = store.connectAgent({ name: "Worker", provider: "fixture" });
-  drainPlanner(store, agent);
+  const agent = store.connectAgent({ name: "Worker", provider: "fixture", freshTaskId: task.id });
+  await drainPlanner(store, agent);
   store.createAssignment({
     taskId: task.id, title: "Ship the feature", description: "Edit source.",
     role: "implementer", requiresWrite: true, paths: ["src"],
@@ -305,8 +326,8 @@ test("the scheduling hold shown on a card is the same explanation, not a second 
 
 test("an idle agent can ask why the whole board is unclaimable, without seeing other rooms", async (t) => {
   const { store, project, task } = await explainFixture(t);
-  const agent = store.connectAgent({ name: "Idle", provider: "fixture" });
-  drainPlanner(store, agent);
+  const agent = store.connectAgent({ name: "Idle", provider: "fixture", freshTaskId: task.id });
+  await drainPlanner(store, agent);
   store.joinTask(agent.id, task.id, "contributor");
   const elsewhere = store.createTask({ projectId: project.id, title: "Another room", description: "Not yours." });
   store.createAssignment({ taskId: elsewhere.id, title: "Someone else's work", description: "Private.", role: "implementer" });
@@ -328,7 +349,7 @@ test("an idle agent can ask why the whole board is unclaimable, without seeing o
 
   // Asking about a room the agent never joined is refused rather than answered.
   assert.throws(() => store.whyNoClaimableWork(agent.id, elsewhere.id), /not a member/i);
-  const outsider = store.connectAgent({ name: "Outsider", provider: "fixture" });
+  const outsider = store.connectAgent({ name: "Outsider", provider: "fixture", freshTaskId: elsewhere.id });
   store.joinTask(outsider.id, elsewhere.id, "contributor");
   assert.throws(() => store.assertExplainable(outsider.id, task.id), /not a member/i);
 });
@@ -338,8 +359,8 @@ test("a write-lease conflict never carries a foreign task room's title or holder
   // in. Before this was caught in review, the explanation named that room's assignment title, id and
   // holder, and #schedulingHold carried the same string into taskDetail for the room you *are* in.
   const { store, project, task } = await explainFixture(t);
-  const insider = store.connectAgent({ name: "Insider", provider: "fixture" });
-  const outsider = store.connectAgent({ name: "Outsider", provider: "fixture" });
+  const insider = store.connectAgent({ name: "Insider", provider: "fixture", freshTaskId: task.id });
+  const outsider = store.connectAgent({ name: "Outsider", provider: "fixture", freshTaskId: task.id });
   const confidential = store.createTask({ projectId: project.id, title: "Confidential", description: "Another room." });
   store.joinTask(insider.id, confidential.id, "contributor");
   store.joinTask(outsider.id, task.id, "contributor");
@@ -348,7 +369,7 @@ test("a write-lease conflict never carries a foreign task room's title or holder
   for (let round = 0; round < 6; round += 1) {
     for (const agentId of [insider.id, outsider.id]) {
       const plan = store.claimNextAssignment(agentId);
-      if (plan?.claimToken) store.completeAssignment({ agentId, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+      if (plan?.claimToken) await store.completeAssignment({ agentId, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
     }
   }
 
@@ -391,10 +412,10 @@ test("a write-lease conflict never carries a foreign task room's title or holder
 
 test("the explanation surfaces authorize before they compute, and are not an existence oracle", async (t) => {
   const { store, project, task } = await explainFixture(t);
-  // The second room must exist before the outsider connects: a lone active task is pinned as
-  // implicit membership at connect time, which would make it a member of the room under test.
+  // The outsider needs a room of its own, so that "not a member of the room under test" is the
+  // only thing being tested here rather than "in no room at all".
   const elsewhere = store.createTask({ projectId: project.id, title: "Elsewhere", description: "Not yours." });
-  const outsider = store.connectAgent({ name: "Outsider", provider: "fixture" });
+  const outsider = store.connectAgent({ name: "Outsider", provider: "fixture", freshTaskId: elsewhere.id });
   store.joinTask(outsider.id, elsewhere.id, "contributor");
   const foreign = store.createAssignment({ taskId: task.id, title: "Private work", description: "Not yours.", role: "implementer" });
 
@@ -410,14 +431,14 @@ test("the explanation answers against the same liveness the scan will act on", a
   // next claim call handed straight over — an idle agent asking why it had nothing to do was told a
   // stale answer about the exact assignment it was about to be given.
   const { store, task } = await explainFixture(t);
-  const first = store.connectAgent({ name: "First", provider: "fixture" });
-  const second = store.connectAgent({ name: "Second", provider: "fixture" });
+  const first = store.connectAgent({ name: "First", provider: "fixture", freshTaskId: task.id });
+  const second = store.connectAgent({ name: "Second", provider: "fixture", freshTaskId: task.id });
   store.joinTask(first.id, task.id, "contributor");
   store.joinTask(second.id, task.id, "contributor");
   for (let round = 0; round < 4; round += 1) {
     for (const agentId of [first.id, second.id]) {
       const plan = store.claimNextAssignment(agentId);
-      if (plan?.claimToken) store.completeAssignment({ agentId, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+      if (plan?.claimToken) await store.completeAssignment({ agentId, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
     }
   }
 

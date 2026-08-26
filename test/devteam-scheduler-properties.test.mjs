@@ -217,7 +217,7 @@ async function runSimulation(t, seed) {
   // Sessions come and go; a name is the stable identity, the id is per-connection.
   const sessions = new Map(agentNames.map((name) => [name, null]));
   const connect = (name) => {
-    const agent = store.connectAgent({ name, provider: "property-fixture" });
+    const agent = store.connectAgent({ name, provider: "property-fixture", freshTaskId: task.id });
     store.joinTask(agent.id, task.id, "contributor");
     sessions.set(name, agent.id);
     return agent.id;
@@ -230,7 +230,7 @@ async function runSimulation(t, seed) {
 
   // Drain the planner item createTask seeds, so the generated graph is the whole board.
   const seeded = store.claimNextAssignment(liveAgents()[0].id);
-  store.completeAssignment({ agentId: liveAgents()[0].id, assignmentId: seeded.id, claimToken: seeded.claimToken, message: "Planned." });
+  await store.completeAssignment({ agentId: liveAgents()[0].id, assignmentId: seeded.id, claimToken: seeded.claimToken, message: "Planned." });
 
   const specs = generateGraph(random, agentNames);
   createGraph(store, task, specs);
@@ -238,11 +238,11 @@ async function runSimulation(t, seed) {
   const context = `seed=${seed}`;
   const exercised = { agreementChecks: 0, legalClaims: 0, fencedReports: 0, disconnectsHoldingClaim: 0, hardDeaths: 0 };
 
-  const report = (agentId, claim) => {
+  const report = async (agentId, claim) => {
     // Task version must advance exactly when files actually changed, and never otherwise.
     const before = store.getTask(task.id).version;
     const changedFiles = chance(random, 0.5) ? [`src/generated-${Math.floor(random() * 1000)}.mjs`] : [];
-    const result = store.completeAssignment({
+    const result = await store.completeAssignment({
       agentId, assignmentId: claim.id, claimToken: claim.claimToken,
       message: "Generated report.", changedFiles,
     });
@@ -308,14 +308,14 @@ async function runSimulation(t, seed) {
       if (claim) {
         // Occasionally prove the fence is real before reporting honestly.
         if (chance(random, 0.15)) {
-          const fenced = store.completeAssignment({
+          const fenced = await store.completeAssignment({
             agentId: agent.id, assignmentId: claim.id, claimToken: "not-the-right-token", message: "Stale report.",
           });
           assert.equal(fenced.completed, false, `${context}: a report with a wrong claim token was accepted`);
           assert.ok(fenced.claimConflict, `${context}: a fenced report must explain itself`);
           exercised.fencedReports += 1;
         }
-        if (chance(random, 0.75)) report(agent.id, claim);
+        if (chance(random, 0.75)) await report(agent.id, claim);
       }
     }
     assertNoDoubleLease(store, `${context} at step ${step}`);
@@ -334,13 +334,13 @@ async function runSimulation(t, seed) {
       const carried = store.db.prepare("SELECT id FROM assignments WHERE agent_id = ? AND status = 'claimed' LIMIT 1").get(agent.id);
       if (carried) {
         progressed = true;
-        report(agent.id, { id: carried.id, claimToken: null });
+        await report(agent.id, { id: carried.id, claimToken: null });
         continue;
       }
       const claim = claimFor(agent, `drain step ${step}`);
       if (!claim) continue;
       progressed = true;
-      report(agent.id, claim);
+      await report(agent.id, claim);
     }
     if (!progressed) break;
   }
@@ -404,10 +404,10 @@ test("the invariants are load-bearing: a scheduler that withholds claimable work
   });
   const project = store.ensureProject("Guard project", projectRoot);
   const task = store.createTask({ projectId: project.id, title: "Guard", description: "Deliberately broken scheduler." });
-  const agent = store.connectAgent({ name: "Worker0", provider: "property-fixture" });
+  const agent = store.connectAgent({ name: "Worker0", provider: "property-fixture", freshTaskId: task.id });
   store.joinTask(agent.id, task.id, "contributor");
   const plan = store.claimNextAssignment(agent.id);
-  store.completeAssignment({ agentId: agent.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+  await store.completeAssignment({ agentId: agent.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
   store.createAssignment({
     taskId: task.id, title: "Claimable but explained", description: "Aimed at somebody who left.",
     role: "implementer", targetAgentName: "AgentWhoLeft",

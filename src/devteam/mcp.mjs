@@ -67,16 +67,12 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
       capabilities: z.array(z.string().max(80)).max(20).default([]).describe("Useful specialties such as implementation, review, security, or testing"),
       runtimeProfile: z.any().optional().describe("Provider-neutral host/runtime profile. Report only host-, adapter-, or user-supplied model and effort options; never invent availability."),
       sessionGeneration: z.number().int().min(1).optional().describe("Host-reported fresh conversation generation when available."),
-      taskId: z.string().uuid().optional().describe("Task room to join on connect. Required to disambiguate a server hosting more than one task."),
+      taskId: z.string().uuid().optional().describe("Task room to join on connect. Membership is explicit: without it you join no room and can claim nothing."),
     },
   }, safe(async ({ name, provider, capabilities, runtimeProfile, sessionGeneration, taskId }) => {
     const agent = store.connectAgent({ name, provider, capabilities, runtimeProfile, sessionGeneration, freshTaskId: taskId || null });
     session.agentId = agent.id;
-    let room = null;
-    if (taskId) {
-      try { room = store.joinTask(agent.id, taskId); } catch (error) { room = { joined: false, error: error.message }; }
-    }
-    const { resumeToken, ...agentInfo } = agent;
+    const { resumeToken, room, ...agentInfo } = agent;
     const roomStatus = store.roomStatusForAgent(agent.id);
     const roomRequired = roomStatus.joinedTaskIds.length === 0 && roomStatus.activeTasks.length > 0;
     return {
@@ -86,7 +82,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
       ...(roomRequired ? { roomRequired: true, availableTasks: roomStatus.activeTasks } : {}),
       resumeToken,
       next: roomRequired
-        ? "Choose the intended task from availableTasks and call devteam_join before devteam_wait. Keep resumeToken privately: if this session drops, pass it to devteam_resume."
+        ? "You are in no task room, so nothing is claimable. Choose the intended task from availableTasks and call devteam_join before devteam_wait. Keep resumeToken privately: if this session drops, pass it to devteam_resume."
         : "Call devteam_wait with this agentId. Keep resumeToken privately: if this session drops and you reconnect, pass it to devteam_resume to reclaim this session's work and missed messages.",
     };
   }));
@@ -105,7 +101,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
 
   server.registerTool("devteam_join", {
     title: "Join a task room",
-    description: "Join a specific task's room so you claim only its work, receive only its messages, and vote only on its proposals. In a single-task server you are placed in that room automatically; join explicitly when the server hosts more than one task, or to observe a specific one.",
+    description: "Join a specific task's room so you claim only its work, receive only its messages, and vote only on its proposals. Membership is always explicit: until you join a room (here or via devteam_connect's taskId) nothing on the board is claimable by you.",
     inputSchema: {
       agentId: z.string().uuid(),
       taskId: z.string().uuid(),
@@ -132,7 +128,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
         status: "room_required",
         keepWaiting: false,
         availableTasks: initialRoomStatus.activeTasks,
-        message: "This server has active work in multiple task rooms. Choose the intended taskId from availableTasks and call devteam_join before waiting.",
+        message: "You have joined no task room, so no work here is claimable by you. Choose the intended taskId from availableTasks and call devteam_join before waiting.",
         next: "Call devteam_join with this agentId, the intended taskId, and role contributor; then call devteam_wait again.",
       };
     }
@@ -291,7 +287,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
     },
   }, safe(async ({ expiresInMinutes, ...args }) => {
     requireIdentity(args.agentId);
-    const result = store.createSessionCheckpoint({ ...args, expiresInMs: expiresInMinutes * 60_000 });
+    const result = await store.createSessionCheckpoint({ ...args, expiresInMs: expiresInMinutes * 60_000 });
     return withInbox(args.agentId, {
       ...result,
       next: "Keep the old session and claim intact. Open a fresh session, connect and join this task, then call devteam_session_takeover with checkpoint.id and the one-time handoffToken.",
@@ -322,7 +318,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
     },
   }, safe(async (args) => {
     requireIdentity(args.agentId);
-    return withInbox(args.agentId, store.takeoverSessionCheckpoint(args));
+    return withInbox(args.agentId, await store.takeoverSessionCheckpoint(args));
   }));
 
   server.registerTool("devteam_session_checkpoint_cancel", {
@@ -480,7 +476,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
 
   server.registerTool("devteam_report", {
     title: "Report completed work",
-    description: "Complete the currently claimed assignment with evidence. Report exact files and checks; changed files advance the task version and invalidate prior approvals. A check may carry a command, which DevTeam runs itself inside the project root and grades by exit code — a report claiming success for a command that actually fails is refused, and your claim is left intact so you can fix it and report again. Checks without a command are recorded as your assertion and labeled as such. status=blocked closes only this assignment and queues planner triage; use devteam_block separately only for a genuine task-wide blocker.",
+    description: "Complete the currently claimed assignment with evidence. Report exact files and checks; changed files advance the task version and invalidate prior approvals. A check may carry a command, which DevTeam runs itself inside the project root and grades by exit code — a report claiming success for a command that actually fails is refused, and your claim is left intact so you can fix it and report again. Checks without a command are recorded as your assertion and labeled as such. While those commands run the assignment shows as verifying and keeps your claim; if this returns completed:false with a verifying payload, an earlier report of yours is still being checked — wait for it rather than reporting again. status=blocked closes only this assignment and queues planner triage; use devteam_block separately only for a genuine task-wide blocker.",
     inputSchema: {
       agentId: z.string().uuid(),
       assignmentId: z.string().uuid(),
@@ -499,7 +495,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
     },
   }, safe(async ({ disconnectAfter, ...args }) => {
     requireIdentity(args.agentId);
-    const result = store.completeAssignment({
+    const result = await store.completeAssignment({
       ...args,
       nextStatus: disconnectAfter ? "disconnected" : "waiting",
     });

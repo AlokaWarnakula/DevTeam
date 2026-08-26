@@ -22,7 +22,7 @@ async function fixture(t, options = {}) {
   });
   const project = store.ensureProject("Checkpoint project", projectRoot);
   const task = store.createTask({ projectId: project.id, title: "Safe session handoff", description: "Transfer an active writer without losing its claim." });
-  const oldAgent = store.connectAgent({ name: "Old Codex", provider: "test" });
+  const oldAgent = store.connectAgent({ name: "Old Codex", provider: "test", freshTaskId: task.id });
   const assignment = store.claimNextAssignment(oldAgent.id);
   return { store, dataDir, projectRoot, project, task, oldAgent, assignment };
 }
@@ -30,7 +30,7 @@ async function fixture(t, options = {}) {
 test("checkpoint capsules are byte-exact, bounded, redacted, and never expose stored hashes", async (t) => {
   const { store, task, oldAgent, assignment } = await fixture(t);
   store.postMessage({ agentId: oldAgent.id, taskId: task.id, type: "agent.decision", message: `Use SQLite. password=hunter2 ${"😀".repeat(20_000)}` });
-  const result = store.createSessionCheckpoint({
+  const result = await store.createSessionCheckpoint({
     agentId: oldAgent.id,
     taskId: task.id,
     assignmentId: assignment.id,
@@ -70,7 +70,7 @@ test("checkpoint capsules carry compact current runtime facts and the next-sessi
     source: "host",
     observedAt: new Date().toISOString(),
   } });
-  const result = store.createSessionCheckpoint({ agentId: oldAgent.id, taskId: task.id, assignmentId: assignment.id });
+  const result = await store.createSessionCheckpoint({ agentId: oldAgent.id, taskId: task.id, assignmentId: assignment.id });
   assert.equal(result.checkpoint.capsule.currentRuntime.profile.providerId, "checkpoint-host");
   assert.equal(result.checkpoint.capsule.currentRuntime.profile.currentModel, "balanced-model");
   assert.equal(result.checkpoint.capsule.nextSessionRecommendation.level, "base");
@@ -84,17 +84,17 @@ test("checkpoint capsules carry compact current runtime facts and the next-sessi
 
 test("takeover atomically moves the claim, bumps fencing, rejects replay, and fences the old report", async (t) => {
   const { store, task, oldAgent, assignment } = await fixture(t);
-  const checkpoint = store.createSessionCheckpoint({ agentId: oldAgent.id, taskId: task.id, nextAction: "Finish planning." });
-  const fresh = store.connectAgent({ name: "Fresh Codex", provider: "test" });
-  const competitor = store.connectAgent({ name: "Other fresh session", provider: "test" });
+  const checkpoint = await store.createSessionCheckpoint({ agentId: oldAgent.id, taskId: task.id, nextAction: "Finish planning." });
+  const fresh = store.connectAgent({ name: "Fresh Codex", provider: "test", freshTaskId: task.id });
+  const competitor = store.connectAgent({ name: "Other fresh session", provider: "test", freshTaskId: task.id });
 
-  assert.throws(() => store.takeoverSessionCheckpoint({
+  await assert.rejects(async () => store.takeoverSessionCheckpoint({
     agentId: oldAgent.id, taskId: task.id, checkpointId: checkpoint.checkpoint.id, handoffToken: checkpoint.handoffToken,
   }), /distinct fresh/);
-  assert.throws(() => store.takeoverSessionCheckpoint({
+  await assert.rejects(async () => store.takeoverSessionCheckpoint({
     agentId: fresh.id, taskId: task.id, checkpointId: checkpoint.checkpoint.id, handoffToken: "wrong-token-value-wrong-token",
   }), /invalid/);
-  const taken = store.takeoverSessionCheckpoint({
+  const taken = await store.takeoverSessionCheckpoint({
     agentId: fresh.id, taskId: task.id, checkpointId: checkpoint.checkpoint.id, handoffToken: checkpoint.handoffToken,
   });
   assert.equal(taken.takenOver, true);
@@ -108,7 +108,7 @@ test("takeover atomically moves the claim, bumps fencing, rejects replay, and fe
   assert.equal(consumed.status, "claimed");
   assert.equal(consumed.handoff_token_hash, null);
 
-  const staleReport = store.completeAssignment({
+  const staleReport = await store.completeAssignment({
     agentId: oldAgent.id,
     assignmentId: assignment.id,
     claimToken: assignment.claimToken,
@@ -116,10 +116,10 @@ test("takeover atomically moves the claim, bumps fencing, rejects replay, and fe
   });
   assert.equal(staleReport.completed, false);
   assert.equal(staleReport.claimConflict.generation, assignment.claimGeneration + 1);
-  assert.throws(() => store.takeoverSessionCheckpoint({
+  await assert.rejects(async () => store.takeoverSessionCheckpoint({
     agentId: competitor.id, taskId: task.id, checkpointId: checkpoint.checkpoint.id, handoffToken: checkpoint.handoffToken,
   }), /one-time|no longer ready/i);
-  const completed = store.completeAssignment({
+  const completed = await store.completeAssignment({
     agentId: fresh.id,
     assignmentId: assignment.id,
     claimToken: taken.assignment.claimToken,
@@ -130,15 +130,15 @@ test("takeover atomically moves the claim, bumps fencing, rejects replay, and fe
 
 test("concurrent takeover attempts produce exactly one owner and one new fencing token", async (t) => {
   const { store, task, oldAgent, assignment } = await fixture(t);
-  const checkpoint = store.createSessionCheckpoint({ agentId: oldAgent.id, taskId: task.id });
-  const first = store.connectAgent({ name: "Concurrent A", provider: "test" });
-  const second = store.connectAgent({ name: "Concurrent B", provider: "test" });
-  const attempts = await Promise.allSettled([first, second].map((agent) => Promise.resolve().then(() => store.takeoverSessionCheckpoint({
+  const checkpoint = await store.createSessionCheckpoint({ agentId: oldAgent.id, taskId: task.id });
+  const first = store.connectAgent({ name: "Concurrent A", provider: "test", freshTaskId: task.id });
+  const second = store.connectAgent({ name: "Concurrent B", provider: "test", freshTaskId: task.id });
+  const attempts = await Promise.allSettled([first, second].map((agent) => store.takeoverSessionCheckpoint({
     agentId: agent.id,
     taskId: task.id,
     checkpointId: checkpoint.checkpoint.id,
     handoffToken: checkpoint.handoffToken,
-  }))));
+  })));
   assert.equal(attempts.filter((result) => result.status === "fulfilled").length, 1);
   assert.equal(attempts.filter((result) => result.status === "rejected").length, 1);
   const winner = attempts.find((result) => result.status === "fulfilled").value;
@@ -151,7 +151,7 @@ test("concurrent takeover attempts produce exactly one owner and one new fencing
 
 test("a disconnected old session can be recovered from its persisted checkpoint after restart", async (t) => {
   const { store, dataDir, projectRoot, task, oldAgent, assignment } = await fixture(t);
-  const checkpoint = store.createSessionCheckpoint({ agentId: oldAgent.id, taskId: task.id });
+  const checkpoint = await store.createSessionCheckpoint({ agentId: oldAgent.id, taskId: task.id });
   store.disconnectAgent(oldAgent.id, "Desktop closed after checkpoint.");
   assert.equal(store.db.prepare("SELECT status, agent_id, claim_token_hash FROM assignments WHERE id = ?").get(assignment.id).status, "queued");
   store.close();
@@ -159,8 +159,8 @@ test("a disconnected old session can be recovered from its persisted checkpoint 
   const restarted = new DevTeamStore(dataDir, { knowledge: { enabled: false }, codegraph: { enabled: false } });
   t.after(() => { try { restarted.close(); } catch { /* already closed */ } });
   assert.equal(restarted.sessionCheckpointGet({ taskId: task.id, checkpointId: checkpoint.checkpoint.id }).status, "ready");
-  const fresh = restarted.connectAgent({ name: "Restarted Codex", provider: "test" });
-  const taken = restarted.takeoverSessionCheckpoint({
+  const fresh = restarted.connectAgent({ name: "Restarted Codex", provider: "test", freshTaskId: task.id });
+  const taken = await restarted.takeoverSessionCheckpoint({
     agentId: fresh.id, taskId: task.id, checkpointId: checkpoint.checkpoint.id, handoffToken: checkpoint.handoffToken,
   });
   assert.equal(taken.assignment.id, assignment.id);
@@ -171,51 +171,51 @@ test("a disconnected old session can be recovered from its persisted checkpoint 
 
 test("expired, cancelled, and stale checkpoints never release or steal a live claim", async (t) => {
   const { store, task, oldAgent, assignment } = await fixture(t, { checkpoint: { ttlMs: 1 } });
-  const expired = store.createSessionCheckpoint({ agentId: oldAgent.id, taskId: task.id });
+  const expired = await store.createSessionCheckpoint({ agentId: oldAgent.id, taskId: task.id });
   await new Promise((resolve) => setTimeout(resolve, 10));
-  const fresh = store.connectAgent({ name: "Fresh", provider: "test" });
-  assert.throws(() => store.takeoverSessionCheckpoint({
+  const fresh = store.connectAgent({ name: "Fresh", provider: "test", freshTaskId: task.id });
+  await assert.rejects(async () => store.takeoverSessionCheckpoint({
     agentId: fresh.id, taskId: task.id, checkpointId: expired.checkpoint.id, handoffToken: expired.handoffToken,
   }), /expired/);
   assert.equal(store.db.prepare("SELECT agent_id FROM assignments WHERE id = ?").get(assignment.id).agent_id, oldAgent.id);
   store.checkpoint.ttlMs = 30 * 60 * 1000;
 
-  const cancelled = store.createSessionCheckpoint({ agentId: oldAgent.id, taskId: task.id });
+  const cancelled = await store.createSessionCheckpoint({ agentId: oldAgent.id, taskId: task.id });
   store.cancelSessionCheckpoint({ agentId: oldAgent.id, taskId: task.id, checkpointId: cancelled.checkpoint.id });
-  assert.throws(() => store.takeoverSessionCheckpoint({
+  await assert.rejects(async () => store.takeoverSessionCheckpoint({
     agentId: fresh.id, taskId: task.id, checkpointId: cancelled.checkpoint.id, handoffToken: cancelled.handoffToken,
   }), /one-time|no longer ready/i);
   assert.equal(store.db.prepare("SELECT agent_id FROM assignments WHERE id = ?").get(assignment.id).agent_id, oldAgent.id);
 
-  const stale = store.createSessionCheckpoint({ agentId: oldAgent.id, taskId: task.id });
+  const stale = await store.createSessionCheckpoint({ agentId: oldAgent.id, taskId: task.id });
   store.db.prepare("UPDATE assignments SET claim_generation = claim_generation + 1 WHERE id = ?").run(assignment.id);
-  assert.throws(() => store.takeoverSessionCheckpoint({
+  await assert.rejects(async () => store.takeoverSessionCheckpoint({
     agentId: fresh.id, taskId: task.id, checkpointId: stale.checkpoint.id, handoffToken: stale.handoffToken,
   }), /stale|moved/);
   assert.equal(store.db.prepare("SELECT agent_id FROM assignments WHERE id = ?").get(assignment.id).agent_id, oldAgent.id);
 
-  const forceReleased = store.createSessionCheckpoint({ agentId: oldAgent.id, taskId: task.id });
+  const forceReleased = await store.createSessionCheckpoint({ agentId: oldAgent.id, taskId: task.id });
   store.forceReleaseAssignment({ assignmentId: assignment.id, confirmTitle: assignment.title });
   assert.equal(store.sessionCheckpointGet({ taskId: task.id, checkpointId: forceReleased.checkpoint.id }).status, "cancelled");
-  assert.throws(() => store.takeoverSessionCheckpoint({
+  await assert.rejects(async () => store.takeoverSessionCheckpoint({
     agentId: fresh.id, taskId: task.id, checkpointId: forceReleased.checkpoint.id, handoffToken: forceReleased.handoffToken,
   }), /one-time|no longer ready/i);
 });
 
 test("checkpoint takeover enforces task rooms and observer boundaries", async (t) => {
   const { store, project, task, oldAgent } = await fixture(t);
-  const checkpoint = store.createSessionCheckpoint({ agentId: oldAgent.id, taskId: task.id });
+  const checkpoint = await store.createSessionCheckpoint({ agentId: oldAgent.id, taskId: task.id });
   const otherTask = store.createTask({ projectId: project.id, title: "Other room", description: "Must remain isolated." });
-  const outsider = store.connectAgent({ name: "Outsider", provider: "test" });
+  const outsider = store.connectAgent({ name: "Outsider", provider: "test", freshTaskId: otherTask.id });
   store.joinTask(outsider.id, otherTask.id, "contributor");
-  assert.throws(() => store.takeoverSessionCheckpoint({
+  await assert.rejects(async () => store.takeoverSessionCheckpoint({
     agentId: outsider.id, taskId: task.id, checkpointId: checkpoint.checkpoint.id, handoffToken: checkpoint.handoffToken,
   }), /not a member/);
   assert.throws(() => store.sessionCheckpointGet({ agentId: outsider.id, taskId: task.id, checkpointId: checkpoint.checkpoint.id }), /not a member/);
 
-  const observer = store.connectAgent({ name: "Observer", provider: "test" });
+  const observer = store.connectAgent({ name: "Observer", provider: "test", freshTaskId: otherTask.id });
   store.joinTask(observer.id, task.id, "observer");
-  assert.throws(() => store.takeoverSessionCheckpoint({
+  await assert.rejects(async () => store.takeoverSessionCheckpoint({
     agentId: observer.id, taskId: task.id, checkpointId: checkpoint.checkpoint.id, handoffToken: checkpoint.handoffToken,
   }), /Observers/);
   assert.equal(store.sessionCheckpointGet({ agentId: observer.id, taskId: task.id, checkpointId: checkpoint.checkpoint.id }).status, "ready");
@@ -223,14 +223,14 @@ test("checkpoint takeover enforces task rooms and observer boundaries", async (t
 
 test("task-version drift warns the new session while preserving an unchanged active claim", async (t) => {
   const { store, task, oldAgent } = await fixture(t);
-  const checkpoint = store.createSessionCheckpoint({ agentId: oldAgent.id, taskId: task.id });
-  const sibling = store.connectAgent({ name: "Sibling", provider: "test" });
+  const checkpoint = await store.createSessionCheckpoint({ agentId: oldAgent.id, taskId: task.id });
+  const sibling = store.connectAgent({ name: "Sibling", provider: "test", freshTaskId: task.id });
   const work = store.createAssignment({ taskId: task.id, title: "Independent update", description: "Advance task evidence.", role: "implementer" });
   const siblingClaim = store.claimNextAssignment(sibling.id);
   assert.equal(siblingClaim.id, work.id);
-  store.completeAssignment({ agentId: sibling.id, assignmentId: work.id, claimToken: siblingClaim.claimToken, message: "Updated evidence.", changedFiles: ["src/work.mjs"] });
-  const fresh = store.connectAgent({ name: "Fresh after drift", provider: "test" });
-  const taken = store.takeoverSessionCheckpoint({
+  await store.completeAssignment({ agentId: sibling.id, assignmentId: work.id, claimToken: siblingClaim.claimToken, message: "Updated evidence.", changedFiles: ["src/work.mjs"] });
+  const fresh = store.connectAgent({ name: "Fresh after drift", provider: "test", freshTaskId: task.id });
+  const taken = await store.takeoverSessionCheckpoint({
     agentId: fresh.id, taskId: task.id, checkpointId: checkpoint.checkpoint.id, handoffToken: checkpoint.handoffToken,
   });
   assert.ok(taken.warnings.some((warning) => /task version changed/i.test(warning)));

@@ -66,7 +66,7 @@ test("dashboard API and authenticated MCP endpoint work together", async (t) => 
   assert.ok(tools.tools.some((tool) => tool.name === "devteam_connect"));
   assert.ok(tools.tools.some((tool) => tool.name === "devteam_wait"));
 
-  const connected = await client.callTool({ name: "devteam_connect", arguments: { name: "Integration Agent", provider: "test", capabilities: ["planning"] } });
+  const connected = await client.callTool({ name: "devteam_connect", arguments: { name: "Integration Agent", provider: "test", capabilities: ["planning"], taskId: createdTask.id } });
   const agentId = connected.structuredContent.agent.id;
   const waiting = await client.callTool({ name: "devteam_wait", arguments: { agentId, timeoutSeconds: 1 } });
   assert.equal(waiting.structuredContent.status, "assigned");
@@ -167,11 +167,11 @@ test("an already-delivered runtime recommendation does not hot-loop subsequent M
     source: "host",
     observedAt: new Date().toISOString(),
   };
-  const connected = await client.callTool({ name: "devteam_connect", arguments: { name: "Runtime worker", provider: "test" } });
+  const connected = await client.callTool({ name: "devteam_connect", arguments: { name: "Runtime worker", provider: "test", taskId: task.id } });
   const agentId = connected.structuredContent.agent.id;
   const planner = instance.store.claimNextAssignment(agentId);
   assert.ok(planner?.id, "the fixture planner assignment is claimable");
-  instance.store.completeAssignment({ agentId, assignmentId: planner.id, claimToken: planner.claimToken, message: "Planned." });
+  await instance.store.completeAssignment({ agentId, assignmentId: planner.id, claimToken: planner.claimToken, message: "Planned." });
   instance.store.updateRuntimeProfile({ agentId, profile: runtimeProfile });
   instance.store.continueCurrentSession({ agentId, taskId: task.id });
   instance.store.createAssignment({
@@ -206,7 +206,7 @@ test("MCP assignment dependencies sequence work and devteam_brief stays compact"
   const client = new Client({ name: "devteam-dependency-test", version: "1.0.0" });
   await client.connect(transport);
   t.after(() => client.close());
-  const connected = await client.callTool({ name: "devteam_connect", arguments: { name: "Worker", provider: "test" } });
+  const connected = await client.callTool({ name: "devteam_connect", arguments: { name: "Worker", provider: "test", taskId: task.id } });
   const agentId = connected.structuredContent.agent.id;
   const planner = await client.callTool({ name: "devteam_wait", arguments: { agentId, timeoutSeconds: 1 } });
   assert.equal(planner.structuredContent.briefMeta.bytes, Buffer.byteLength(JSON.stringify(planner.structuredContent), "utf8"));
@@ -250,7 +250,7 @@ test("a human message wakes a waiting agent through MCP and records delivery", a
   await client.connect(transport);
   t.after(() => client.close());
 
-  const connected = await client.callTool({ name: "devteam_connect", arguments: { name: "Codex", provider: "test", capabilities: ["coding"] } });
+  const connected = await client.callTool({ name: "devteam_connect", arguments: { name: "Codex", provider: "test", capabilities: ["coding"], taskId: task.id } });
   const agentId = connected.structuredContent.agent.id;
 
   const authoredMessage = "Codex,\n\nplease   prioritise security.";
@@ -362,7 +362,7 @@ test("a busy agent is reached with pending messages on its next action", async (
   await client.connect(transport);
   t.after(() => client.close());
 
-  const connected = await client.callTool({ name: "devteam_connect", arguments: { name: "Worker", provider: "test" } });
+  const connected = await client.callTool({ name: "devteam_connect", arguments: { name: "Worker", provider: "test", taskId: task.id } });
   const agentId = connected.structuredContent.agent.id;
   const assigned = await client.callTool({ name: "devteam_wait", arguments: { agentId, timeoutSeconds: 2 } });
   assert.equal(assigned.structuredContent.status, "assigned", "the agent is now busy on the planner assignment");
@@ -398,7 +398,7 @@ test("shared blackboard round-trips over MCP and a stuck write lease can be forc
   await client.connect(transport);
   t.after(() => client.close());
 
-  const connected = await client.callTool({ name: "devteam_connect", arguments: { name: "Worker", provider: "test" } });
+  const connected = await client.callTool({ name: "devteam_connect", arguments: { name: "Worker", provider: "test", taskId: task.id } });
   const agentId = connected.structuredContent.agent.id;
 
   // Shared memory writes and reads back over MCP with provenance.
@@ -591,7 +591,7 @@ test("the runtime profile control plane persists human-entered models and stays 
   assert.equal(base.currentModelClass, "balanced");
   assert.equal(base.availableModels[0].label, "Fixture Balanced 5", "the display name the human typed survives the round trip");
 
-  const agent = instance.store.connectAgent({ name: "RestAgent", provider: "fixture" });
+  const agent = instance.store.connectAgent({ name: "RestAgent", provider: "fixture", freshTaskId: task.id });
   const put = await fetch(`${instance.url}/api/agents/${agent.id}/runtime`, {
     method: "PUT", headers: authed, body: JSON.stringify({ profile }),
   });
@@ -634,9 +634,9 @@ test("the scheduler explains a held assignment over REST and over MCP", async (t
 
   const project = instance.store.ensureProject("Explain REST", process.cwd());
   const task = instance.store.createTask({ projectId: project.id, title: "Explain REST", description: "Exercise the explanation surface." });
-  const agent = instance.store.connectAgent({ name: "Explainer", provider: "fixture" });
+  const agent = instance.store.connectAgent({ name: "Explainer", provider: "fixture", freshTaskId: task.id });
   const plan = instance.store.claimNextAssignment(agent.id);
-  instance.store.completeAssignment({ agentId: agent.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+  await instance.store.completeAssignment({ agentId: agent.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
   instance.store.createAssignment({
     taskId: task.id, title: "Ship the feature", description: "Edit source.",
     role: "implementer", requiresWrite: true, paths: ["src"],

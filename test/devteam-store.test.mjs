@@ -19,12 +19,12 @@ test("automatic knowledge vault exports safe Obsidian notes and feeds task brief
 
   const project = store.ensureProject("Knowledge project", projectRoot);
   const task = store.createTask({ projectId: project.id, title: "Add durable memory", description: "Exercise automatic knowledge." });
-  const agent = store.connectAgent({ name: "Codex", provider: "OpenAI" });
+  const agent = store.connectAgent({ name: "Codex", provider: "OpenAI", freshTaskId: task.id });
   const plan = store.claimNextAssignment(agent.id);
   store.noteSet({ agentId: agent.id, taskId: task.id, scope: "project", key: "architecture/runtime", value: "SQLite is the source of truth; Markdown is the exported view." });
   const proposal = store.createProposal({ agentId: agent.id, taskId: task.id, kind: "decision", summary: "Use one serialized knowledge exporter", details: {} });
   store.voteProposal({ proposalId: proposal.id, vote: "agree" });
-  store.completeAssignment({
+  await store.completeAssignment({
     agentId: agent.id,
     assignmentId: plan.id,
     message: "Implemented exporter. password=hunter2",
@@ -75,28 +75,28 @@ test("file-linked knowledge becomes stale or superseded without affecting unrela
   }
   const project = store.ensureProject("Lifecycle", projectRoot);
   const task = store.createTask({ projectId: project.id, title: "Refresh implementation facts", description: "Change the same file twice." });
-  const agent = store.connectAgent({ name: "Writer", provider: "test" });
+  const agent = store.connectAgent({ name: "Writer", provider: "test", freshTaskId: task.id });
   const planner = store.claimNextAssignment(agent.id);
   const firstWork = store.createAssignment({ agentId: agent.id, taskId: task.id, title: "First shared implementation", description: "Implement shared.", role: "implementer", requiresWrite: true, paths: ["src/shared.js"] });
-  store.completeAssignment({ agentId: agent.id, assignmentId: planner.id, claimToken: planner.claimToken, message: "Planned." });
+  await store.completeAssignment({ agentId: agent.id, assignmentId: planner.id, claimToken: planner.claimToken, message: "Planned." });
   const firstClaim = store.claimNextAssignment(agent.id);
   assert.equal(firstClaim.id, firstWork.id);
-  store.completeAssignment({ agentId: agent.id, assignmentId: firstClaim.id, claimToken: firstClaim.claimToken, message: "First shared behavior.", changedFiles: ["src/shared.js"] });
+  await store.completeAssignment({ agentId: agent.id, assignmentId: firstClaim.id, claimToken: firstClaim.claimToken, message: "First shared behavior.", changedFiles: ["src/shared.js"] });
 
   const secondWork = store.createAssignment({ agentId: agent.id, taskId: task.id, title: "Replace shared implementation", description: "Replace shared.", role: "implementer", requiresWrite: true, paths: ["src/shared.js"] });
   const secondClaim = store.claimNextAssignment(agent.id);
   assert.equal(secondClaim.id, secondWork.id);
-  store.completeAssignment({ agentId: agent.id, assignmentId: secondClaim.id, claimToken: secondClaim.claimToken, message: "Current shared behavior.", changedFiles: ["src/shared.js"] });
+  await store.completeAssignment({ agentId: agent.id, assignmentId: secondClaim.id, claimToken: secondClaim.claimToken, message: "Current shared behavior.", changedFiles: ["src/shared.js"] });
 
   const thirdWork = store.createAssignment({ agentId: agent.id, taskId: task.id, title: "Unrelated implementation", description: "Change an unrelated module.", role: "implementer", requiresWrite: true, paths: ["src/unrelated.js"] });
   const thirdClaim = store.claimNextAssignment(agent.id);
   assert.equal(thirdClaim.id, thirdWork.id);
-  store.completeAssignment({ agentId: agent.id, assignmentId: thirdClaim.id, claimToken: thirdClaim.claimToken, message: "Unrelated behavior.", changedFiles: ["src/unrelated.js"] });
+  await store.completeAssignment({ agentId: agent.id, assignmentId: thirdClaim.id, claimToken: thirdClaim.claimToken, message: "Unrelated behavior.", changedFiles: ["src/unrelated.js"] });
 
   const escapedWork = store.createAssignment({ agentId: agent.id, taskId: task.id, title: "Escaped report", description: "A malformed changed path must not invalidate knowledge.", role: "implementer", requiresWrite: true, paths: ["src"] });
   const escapedClaim = store.claimNextAssignment(agent.id);
   assert.equal(escapedClaim.id, escapedWork.id);
-  store.completeAssignment({ agentId: agent.id, assignmentId: escapedClaim.id, claimToken: escapedClaim.claimToken, message: "Malformed report.", changedFiles: ["../outside.js"] });
+  await store.completeAssignment({ agentId: agent.id, assignmentId: escapedClaim.id, claimToken: escapedClaim.claimToken, message: "Malformed report.", changedFiles: ["../outside.js"] });
 
   const componentNotes = store.db.prepare(`
     SELECT * FROM knowledge_notes WHERE project_id = ? AND category = 'components' ORDER BY source_event_id ASC
@@ -133,10 +133,10 @@ test("DevTeam coordinates plan, write lease, review, versioning, and consensus",
 
   const project = store.ensureProject("Test project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Ship a safe change", description: "Implement and review it.", requiredApprovals: 2 });
-  const planner = store.connectAgent({ name: "Planner", provider: "Codex", capabilities: ["planning"] });
-  const writer = store.connectAgent({ name: "Writer", provider: "Claude", capabilities: ["coding"] });
-  const reviewerA = store.connectAgent({ name: "Reviewer A", provider: "Codex", capabilities: ["review"] });
-  const reviewerB = store.connectAgent({ name: "Reviewer B", provider: "Claude", capabilities: ["review"] });
+  const planner = store.connectAgent({ name: "Planner", provider: "Codex", capabilities: ["planning"], freshTaskId: task.id });
+  const writer = store.connectAgent({ name: "Writer", provider: "Claude", capabilities: ["coding"], freshTaskId: task.id });
+  const reviewerA = store.connectAgent({ name: "Reviewer A", provider: "Codex", capabilities: ["review"], freshTaskId: task.id });
+  const reviewerB = store.connectAgent({ name: "Reviewer B", provider: "Claude", capabilities: ["review"], freshTaskId: task.id });
 
   const plan = store.claimNextAssignment(planner.id);
   assert.equal(plan.role, "planner");
@@ -144,7 +144,7 @@ test("DevTeam coordinates plan, write lease, review, versioning, and consensus",
   store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Review A", description: "Review current version.", role: "reviewer", targetAgentName: "Reviewer A" });
   store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Review B", description: "Review current version.", role: "reviewer", targetAgentName: "Reviewer B" });
   assert.equal(store.getTask(task.id).status, "planning", "review assignments do not prematurely move a planning task to review");
-  store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Plan dispatched." });
+  await store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Plan dispatched." });
   assert.equal(store.getTask(task.id).status, "active");
 
   assert.equal(store.claimNextAssignment(reviewerA.id), null, "review waits while an unrelated write remains queued");
@@ -152,17 +152,17 @@ test("DevTeam coordinates plan, write lease, review, versioning, and consensus",
   assert.equal(implementation.requires_write, 1);
   assert.equal(store.claimNextAssignment(reviewerA.id), null, "review waits while an unrelated write is claimed");
   assert.equal(store.claimNextAssignment(planner.id), null, "an untargeted agent cannot take targeted work");
-  const completed = store.completeAssignment({ agentId: writer.id, assignmentId: implementation.id, message: "Implemented.", changedFiles: ["src/example.js"], checks: ["npm test"] });
+  const completed = await store.completeAssignment({ agentId: writer.id, assignmentId: implementation.id, message: "Implemented.", changedFiles: ["src/example.js"], checks: ["npm test"] });
   assert.equal(completed.version, 2);
   assert.equal(store.getTask(task.id).status, "review");
 
   const reviewOne = store.claimNextAssignment(reviewerA.id);
-  store.completeAssignment({ agentId: reviewerA.id, assignmentId: reviewOne.id, message: "Looks correct.", checks: ["npm test"] });
+  await store.completeAssignment({ agentId: reviewerA.id, assignmentId: reviewOne.id, message: "Looks correct.", checks: ["npm test"] });
   const firstApproval = store.approveTask({ agentId: reviewerA.id, taskId: task.id, summary: "Reviewed version 2." });
   assert.equal(firstApproval.accepted, false);
 
   const reviewTwo = store.claimNextAssignment(reviewerB.id);
-  store.completeAssignment({ agentId: reviewerB.id, assignmentId: reviewTwo.id, message: "Independent review passed." });
+  await store.completeAssignment({ agentId: reviewerB.id, assignmentId: reviewTwo.id, message: "Independent review passed." });
   const secondApproval = store.approveTask({ agentId: reviewerB.id, taskId: task.id, summary: "Approved version 2." });
   assert.equal(secondApproval.accepted, true);
   assert.equal(store.getTask(task.id).status, "accepted");
@@ -176,18 +176,18 @@ test("a file change invalidates approvals from the previous task version", async
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Test project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Version task", description: "Test approval invalidation.", requiredApprovals: 2 });
-  const planner = store.connectAgent({ name: "Planner", provider: "Codex" });
-  const reviewer = store.connectAgent({ name: "Reviewer", provider: "Claude" });
+  const planner = store.connectAgent({ name: "Planner", provider: "Codex", freshTaskId: task.id });
+  const reviewer = store.connectAgent({ name: "Reviewer", provider: "Claude", freshTaskId: task.id });
   const plan = store.claimNextAssignment(planner.id);
   store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Review", description: "Review version one.", role: "reviewer", targetAgentName: "Reviewer" });
-  store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Plan ready." });
+  await store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Plan ready." });
   const review = store.claimNextAssignment(reviewer.id);
-  store.completeAssignment({ agentId: reviewer.id, assignmentId: review.id, message: "Version one reviewed." });
+  await store.completeAssignment({ agentId: reviewer.id, assignmentId: review.id, message: "Version one reviewed." });
   store.approveTask({ agentId: reviewer.id, taskId: task.id, summary: "Version one is fine." });
   const change = store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Change", description: "Modify a file.", role: "implementer", requiresWrite: true, targetAgentName: "Planner" });
   const claimedChange = store.claimNextAssignment(planner.id);
   assert.equal(claimedChange.id, change.id);
-  store.completeAssignment({ agentId: planner.id, assignmentId: claimedChange.id, message: "Updated plan file.", changedFiles: ["plan.md"] });
+  await store.completeAssignment({ agentId: planner.id, assignmentId: claimedChange.id, message: "Updated plan file.", changedFiles: ["plan.md"] });
   const detail = store.taskDetail(task.id);
   assert.equal(detail.version, 2);
   assert.equal(detail.approvals.length, 0);
@@ -199,9 +199,9 @@ test("disconnecting during work releases the assignment for another agent", asyn
   const store = new DevTeamStore(dataDir);
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Test project", process.cwd());
-  store.createTask({ projectId: project.id, title: "Recover work", description: "Release claimed work." });
-  const first = store.connectAgent({ name: "First", provider: "Codex" });
-  const second = store.connectAgent({ name: "Second", provider: "Claude" });
+  const task = store.createTask({ projectId: project.id, title: "Recover work", description: "Release claimed work." });
+  const first = store.connectAgent({ name: "First", provider: "Codex", freshTaskId: task.id });
+  const second = store.connectAgent({ name: "Second", provider: "Claude", freshTaskId: task.id });
   const claimed = store.claimNextAssignment(first.id);
   store.disconnectAgent(first.id, "Desktop closed.");
   assert.equal(store.claimNextAssignment(second.id).id, claimed.id);
@@ -213,12 +213,12 @@ test("a same-name reconnect does not evict the prior session; resume reclaims it
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Resume project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Resume safely", description: "Do not kill the first session." });
-  const first = store.connectAgent({ name: "Codex", provider: "OpenAI Codex Desktop" });
+  const first = store.connectAgent({ name: "Codex", provider: "OpenAI Codex Desktop", freshTaskId: task.id });
   const claimed = store.claimNextAssignment(first.id);
 
   // A message arrives, then the first chat drops and a second "Codex" chat opens.
   store.humanMessage(task.id, "Keep going on the plan.", "Codex");
-  const second = store.connectAgent({ name: "Codex", provider: "OpenAI Codex Desktop" });
+  const second = store.connectAgent({ name: "Codex", provider: "OpenAI Codex Desktop", freshTaskId: task.id });
 
   // The prior session is NOT evicted and its claim is NOT stealable by the new session.
   assert.notEqual(store.getAgent(first.id).status, "disconnected", "the first session survives a same-name reconnect");
@@ -242,16 +242,16 @@ test("a silent busy writer keeps its write lease; only explicit recovery transfe
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Stale project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Protect the writer", description: "Silence must not steal a write lease." });
-  const planner = store.connectAgent({ name: "Planner", provider: "test" });
+  const planner = store.connectAgent({ name: "Planner", provider: "test", freshTaskId: task.id });
   const plan = store.claimNextAssignment(planner.id);
   const write = store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Write", description: "Change files.", requiresWrite: true });
-  store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Plan complete." });
+  await store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Plan complete." });
   assert.equal(store.claimNextAssignment(planner.id).id, write.id);
 
   // The writer goes silent for a long time while it is actually still reasoning/editing.
   store.db.prepare("UPDATE agents SET last_seen = ? WHERE id = ?").run("2000-01-01T00:00:00.000Z", planner.id);
 
-  const replacement = store.connectAgent({ name: "Replacement", provider: "test" });
+  const replacement = store.connectAgent({ name: "Replacement", provider: "test", freshTaskId: task.id });
   assert.equal(store.claimNextAssignment(replacement.id), null, "silence alone must never transfer a write lease");
   assert.equal(store.getAgent(planner.id).status, "unresponsive", "the silent writer is flagged, not disconnected");
   assert.equal(store.taskDetail(task.id).assignments.find((a) => a.id === write.id).status, "claimed", "the writer still owns the work");
@@ -268,10 +268,10 @@ test("a claim carries a fencing token; a stale report is refused with a structur
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Fence project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Fence the lease", description: "Stale reports must not land." });
-  const planner = store.connectAgent({ name: "Planner", provider: "test" });
+  const planner = store.connectAgent({ name: "Planner", provider: "test", freshTaskId: task.id });
   const plan = store.claimNextAssignment(planner.id);
   const write = store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Write", description: "Change files.", requiresWrite: true, targetAgentName: "Planner" });
-  store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Planned." });
+  await store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Planned." });
   const claim = store.claimNextAssignment(planner.id);
   assert.equal(claim.id, write.id);
   assert.ok(claim.claimToken, "the claim returns a fencing token");
@@ -280,7 +280,7 @@ test("a claim carries a fencing token; a stale report is refused with a structur
   // A human force-releases the stuck lease; the original session then tries to report with its now
   // stale token.
   store.forceReleaseAssignment({ assignmentId: write.id, confirmTitle: "Write" });
-  const conflict = store.completeAssignment({ agentId: planner.id, assignmentId: write.id, message: "Too late.", claimToken: claim.claimToken });
+  const conflict = await store.completeAssignment({ agentId: planner.id, assignmentId: write.id, message: "Too late.", claimToken: claim.claimToken });
   assert.equal(conflict.completed, false, "a report against a lease that moved on is refused");
   assert.ok(conflict.claimConflict, "and the refusal is structured");
   assert.match(conflict.claimConflict.nextAction, /devteam_wait|devteam_resume/);
@@ -288,7 +288,7 @@ test("a claim carries a fencing token; a stale report is refused with a structur
   // A fresh claim gets a new token and generation and can complete normally.
   const reclaim = store.claimNextAssignment(planner.id);
   assert.ok(reclaim.claimGeneration > claim.claimGeneration, "reclaiming bumps the generation");
-  const done = store.completeAssignment({ agentId: planner.id, assignmentId: write.id, message: "Done.", claimToken: reclaim.claimToken, changedFiles: ["package.json"] });
+  const done = await store.completeAssignment({ agentId: planner.id, assignmentId: write.id, message: "Done.", claimToken: reclaim.claimToken, changedFiles: ["package.json"] });
   assert.equal(done.completed, true, "the current lease holder completes with the matching token");
 });
 
@@ -298,16 +298,16 @@ test("write assignments with non-overlapping paths run in parallel; overlapping 
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Parallel project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Build in parallel", description: "Two writers, different files." });
-  const planner = store.connectAgent({ name: "Planner", provider: "test" });
-  const alice = store.connectAgent({ name: "Alice", provider: "test" });
-  const bob = store.connectAgent({ name: "Bob", provider: "test" });
-  const carol = store.connectAgent({ name: "Carol", provider: "test" });
+  const planner = store.connectAgent({ name: "Planner", provider: "test", freshTaskId: task.id });
+  const alice = store.connectAgent({ name: "Alice", provider: "test", freshTaskId: task.id });
+  const bob = store.connectAgent({ name: "Bob", provider: "test", freshTaskId: task.id });
+  const carol = store.connectAgent({ name: "Carol", provider: "test", freshTaskId: task.id });
 
   const plan = store.claimNextAssignment(planner.id);
   store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Ocean", description: "Build ocean.", requiresWrite: true, targetAgentName: "Alice", paths: ["src/ocean/**"] });
   store.createAssignment({ agentId: planner.id, taskId: task.id, title: "HUD", description: "Build HUD.", requiresWrite: true, targetAgentName: "Bob", paths: ["src/hud"] });
   store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Waves", description: "Ocean waves.", requiresWrite: true, targetAgentName: "Carol", paths: ["src/ocean/waves.js"] });
-  store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Planned." });
+  await store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Planned." });
 
   const aWork = store.claimNextAssignment(alice.id);
   assert.equal(aWork.title, "Ocean");
@@ -316,7 +316,7 @@ test("write assignments with non-overlapping paths run in parallel; overlapping 
   assert.equal(bWork && bWork.title, "HUD", "a non-overlapping writer claims in parallel");
   assert.equal(store.claimNextAssignment(carol.id), null, "an overlapping write waits for the lease to free");
 
-  store.completeAssignment({ agentId: alice.id, assignmentId: aWork.id, message: "Ocean done.", changedFiles: ["src/ocean/index.js"] });
+  await store.completeAssignment({ agentId: alice.id, assignmentId: aWork.id, message: "Ocean done.", changedFiles: ["src/ocean/index.js"] });
   const cWork = store.claimNextAssignment(carol.id);
   assert.equal(cWork && cWork.title, "Waves", "the overlapping writer proceeds once the lease frees");
 });
@@ -338,13 +338,13 @@ test("a symlink/junction cannot present the same directory under two non-overlap
 
   const project = store.ensureProject("Symlink project", projectRoot);
   const task = store.createTask({ projectId: project.id, title: "Resolve real paths", description: "Junction must not alias a lease." });
-  const planner = store.connectAgent({ name: "Planner", provider: "test" });
-  const alice = store.connectAgent({ name: "Alice", provider: "test" });
-  const bob = store.connectAgent({ name: "Bob", provider: "test" });
+  const planner = store.connectAgent({ name: "Planner", provider: "test", freshTaskId: task.id });
+  const alice = store.connectAgent({ name: "Alice", provider: "test", freshTaskId: task.id });
+  const bob = store.connectAgent({ name: "Bob", provider: "test", freshTaskId: task.id });
   const plan = store.claimNextAssignment(planner.id);
   store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Real dir", description: "Edit the real directory.", requiresWrite: true, targetAgentName: "Alice", paths: ["real-hud"] });
   store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Via junction", description: "Edit through the junction.", requiresWrite: true, targetAgentName: "Bob", paths: ["hud"] });
-  store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Planned." });
+  await store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Planned." });
 
   const aWork = store.claimNextAssignment(alice.id);
   assert.equal(aWork.title, "Real dir");
@@ -356,8 +356,8 @@ test("a long-silent read-only claim is recovered automatically", async (t) => {
   const store = new DevTeamStore(dataDir);
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Recover project", process.cwd());
-  store.createTask({ projectId: project.id, title: "Recover a read-only claim", description: "Planner work is safe to requeue." });
-  const worker = store.connectAgent({ name: "Worker", provider: "test" });
+  const task = store.createTask({ projectId: project.id, title: "Recover a read-only claim", description: "Planner work is safe to requeue." });
+  const worker = store.connectAgent({ name: "Worker", provider: "test", freshTaskId: task.id });
   const plan = store.claimNextAssignment(worker.id); // planner role: read-only
   assert.equal(plan.requires_write, 0);
   // Long enough silent to safely recover the read-only claim (> staleWorkMs), but not so long the
@@ -365,7 +365,7 @@ test("a long-silent read-only claim is recovered automatically", async (t) => {
   const longSilence = new Date(Date.now() - 20 * 60 * 1000).toISOString();
   store.db.prepare("UPDATE agents SET last_seen = ? WHERE id = ?").run(longSilence, worker.id);
 
-  const replacement = store.connectAgent({ name: "Replacement", provider: "test" });
+  const replacement = store.connectAgent({ name: "Replacement", provider: "test", freshTaskId: task.id });
   assert.equal(store.claimNextAssignment(replacement.id).id, plan.id, "a long-silent read-only claim is safely recovered");
   assert.equal(store.getAgent(worker.id).status, "unresponsive");
 });
@@ -375,12 +375,12 @@ test("claiming work repairs an assignment already orphaned by a disconnected age
   const store = new DevTeamStore(dataDir);
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Orphan project", process.cwd());
-  store.createTask({ projectId: project.id, title: "Recover orphan", description: "Repair old database state." });
-  const original = store.connectAgent({ name: "Original", provider: "test" });
+  const task = store.createTask({ projectId: project.id, title: "Recover orphan", description: "Repair old database state." });
+  const original = store.connectAgent({ name: "Original", provider: "test", freshTaskId: task.id });
   const claimed = store.claimNextAssignment(original.id);
   store.db.prepare("UPDATE agents SET status = 'disconnected', disconnected_at = ? WHERE id = ?").run(new Date().toISOString(), original.id);
 
-  const replacement = store.connectAgent({ name: "Replacement", provider: "test" });
+  const replacement = store.connectAgent({ name: "Replacement", provider: "test", freshTaskId: task.id });
   assert.equal(store.claimNextAssignment(replacement.id).id, claimed.id);
   const event = store.taskDetail(claimed.task_id).events.find((item) => item.type === "assignment.released");
   assert.match(event.message, /returned to the queue/);
@@ -394,15 +394,16 @@ test("work, messages, and proposals are scoped to an agent's task room", async (
   const projectB = store.ensureProject("Project B", path.join(os.tmpdir(), "devteam-rooms-b"));
   const taskA = store.createTask({ projectId: projectA.id, title: "Task A", description: "Work A." });
   const taskB = store.createTask({ projectId: projectB.id, title: "Task B", description: "Work B." });
-  const alice = store.connectAgent({ name: "Alice", provider: "test" });
-  const bob = store.connectAgent({ name: "Bob", provider: "test" });
+  const alice = store.connectAgent({ name: "Alice", provider: "test", freshTaskId: taskA.id });
+  const bob = store.connectAgent({ name: "Bob", provider: "test", freshTaskId: taskB.id });
   const carol = store.connectAgent({ name: "Carol", provider: "test" });
 
-  store.joinTask(alice.id, taskA.id);
-  store.joinTask(bob.id, taskB.id);
-
-  // With two active tasks, an agent that joined nothing has no implicit room and claims nothing.
-  assert.equal(store.claimNextAssignment(carol.id), null, "an unjoined agent cannot claim across a multi-task server");
+  // An agent that named no room on connect is in no room, whatever the board looks like, and is
+  // told so rather than being shown an empty queue it has no way to interpret.
+  assert.equal(store.claimNextAssignment(carol.id), null, "an unjoined agent cannot claim anything");
+  const carolBoard = store.whyNoClaimableWork(carol.id);
+  assert.equal(carolBoard.membershipRequired, true);
+  assert.deepEqual(carolBoard.availableTasks.map((entry) => entry.id).sort(), [taskA.id, taskB.id].sort());
 
   // Each agent only claims work from its own room.
   assert.equal(store.claimNextAssignment(alice.id).task_id, taskA.id);
@@ -428,10 +429,8 @@ test("membership is authorization: a non-member cannot read, message, propose, o
   const projectB = store.ensureProject("Project B", path.join(os.tmpdir(), "devteam-authz-b"));
   const taskA = store.createTask({ projectId: projectA.id, title: "Task A", description: "Work A." });
   const taskB = store.createTask({ projectId: projectB.id, title: "Task B", description: "Work B." });
-  const alice = store.connectAgent({ name: "Alice", provider: "test" });
-  const bob = store.connectAgent({ name: "Bob", provider: "test" });
-  store.joinTask(alice.id, taskA.id);
-  store.joinTask(bob.id, taskB.id);
+  const alice = store.connectAgent({ name: "Alice", provider: "test", freshTaskId: taskA.id });
+  const bob = store.connectAgent({ name: "Bob", provider: "test", freshTaskId: taskB.id });
 
   // Bob (Task B) may not reach into Task A by supplying its id.
   assert.throws(() => store.postMessage({ agentId: bob.id, taskId: taskA.id, message: "sneaking in" }), /not a member/);
@@ -456,16 +455,16 @@ test("an observer joins a room but never claims its work", async (t) => {
   const watcher = store.connectAgent({ name: "Watcher", provider: "test" });
   store.joinTask(watcher.id, taskA.id, "observer");
   assert.equal(store.claimNextAssignment(watcher.id), null, "an observer cannot claim the planner assignment it joined to watch");
-  assert.ok(taskB, "a second task keeps membership explicit rather than implicit");
+  assert.ok(taskB, "a second task is on the board, and observing one room does not reach it");
 });
 
-test("implicit single-task membership persists when a second task appears", async (t) => {
-  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-implicit-persist-"));
+test("membership named at connect survives a second task appearing", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-membership-persist-"));
   const store = new DevTeamStore(dataDir);
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const projectA = store.ensureProject("Project A", process.cwd());
   const taskA = store.createTask({ projectId: projectA.id, title: "First task", description: "The sole task at connect time." });
-  const worker = store.connectAgent({ name: "Worker", provider: "test" }); // auto-joined to the sole task
+  const worker = store.connectAgent({ name: "Worker", provider: "test", freshTaskId: taskA.id }); // explicit join, recorded now
 
   // A second active task later must not orphan the worker out of Task A.
   const projectB = store.ensureProject("Project B", path.join(os.tmpdir(), "devteam-implicit-persist-b"));
@@ -476,21 +475,82 @@ test("implicit single-task membership persists when a second task appears", asyn
   assert.equal(store.claimNextAssignment(worker.id).task_id, taskA.id, "and can still claim Task A's work");
 });
 
-test("an agent holds at most one claimed assignment at a time", async (t) => {
+test("an agent holds one write claim, and may still review while it holds it", async (t) => {
+  // T0.3: the invariant that matters is about write leases. Two agents must never hold overlapping
+  // write scopes, and one agent holding two write leases is how it hoards them. Read-only work takes
+  // no lease at all, so capping it bought nothing and throttled exactly the review-heavy workflows
+  // this server exists for.
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-one-claim-"));
   const store = new DevTeamStore(dataDir);
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("One claim project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Bound the claims", description: "No hoarding." });
-  const worker = store.connectAgent({ name: "Worker", provider: "test" });
+  const worker = store.connectAgent({ name: "Worker", provider: "test", freshTaskId: task.id });
   const plan = store.claimNextAssignment(worker.id);
-  store.createAssignment({ agentId: worker.id, taskId: task.id, title: "Job one", description: "Do it.", targetAgentName: "Worker" });
-  store.createAssignment({ agentId: worker.id, taskId: task.id, title: "Job two", description: "Do it.", targetAgentName: "Worker" });
-  assert.equal(store.claimNextAssignment(worker.id), null, "a busy agent already holding a claim cannot grab a second");
-  store.completeAssignment({ agentId: worker.id, assignmentId: plan.id, message: "Planned." });
-  const first = store.claimNextAssignment(worker.id);
-  assert.ok(first, "after completing, the agent claims the next job");
-  assert.equal(store.claimNextAssignment(worker.id), null, "but still only one at a time");
+  await store.completeAssignment({ agentId: worker.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+
+  const firstWriter = store.createAssignment({ taskId: task.id, title: "Edit one", description: "Do it.", role: "implementer", requiresWrite: true, paths: ["src/one.mjs"], targetAgentName: "Worker" });
+  // Untargeted, so the last assertion tests the *lease*, not who it was addressed to.
+  const secondWriter = store.createAssignment({ taskId: task.id, title: "Edit two", description: "Do it.", role: "implementer", requiresWrite: true, paths: ["src/two.mjs"] });
+  const write = store.claimNextAssignment(worker.id);
+  assert.equal(write.id, firstWriter.id);
+
+  // A second writer is refused even though its paths do not overlap: one write lease per agent.
+  assert.equal(store.claimNextAssignment(worker.id), null, "an agent takes one piece of write work at a time");
+  const blocked = store.whyNotClaimable(secondWriter.id, worker.id);
+  assert.equal(blocked.claimable, false);
+  assert.ok(blocked.reasons.some((reason) => reason.code === "agent_holds_write_claim"));
+
+  // Read-only work is a different matter: reviewing while holding a write lease is not hoarding.
+  // It has to be in another room, because the review gate holds a verifier behind pending writers in
+  // its *own* task — which is exactly right, and is why the throughput this unlocks is cross-room.
+  const otherTask = store.createTask({ projectId: project.id, title: "Another room", description: "Review work lives here." });
+  store.joinTask(worker.id, otherTask.id);
+  const otherPlan = store.db.prepare("SELECT id FROM assignments WHERE task_id = ? AND status = 'queued'").get(otherTask.id);
+  store.db.prepare("UPDATE assignments SET status = 'done', completed_at = ? WHERE id = ?").run(new Date().toISOString(), otherPlan.id);
+  for (const label of ["Read one", "Read two", "Read three", "Read four"]) {
+    store.createAssignment({ taskId: otherTask.id, title: label, description: "Review.", role: "reviewer", targetAgentName: "Worker" });
+  }
+
+  const firstRead = store.claimNextAssignment(worker.id);
+  assert.ok(firstRead, "a writer may still pick up review work");
+  assert.equal(firstRead.requires_write, 0);
+  const secondRead = store.claimNextAssignment(worker.id);
+  assert.ok(secondRead, "and more than one of it");
+  assert.equal(store.db.prepare("SELECT COUNT(*) AS count FROM assignments WHERE agent_id = ? AND status = 'claimed'").get(worker.id).count, 3);
+
+  // But not without bound: the cap stops one agent draining the whole review queue.
+  const thirdRead = store.claimNextAssignment(worker.id);
+  assert.ok(thirdRead, "up to the cap");
+  assert.equal(store.claimNextAssignment(worker.id), null, "and no further");
+
+  // The write lease is still exclusive against *other* agents, which is the point of all of this.
+  const rival = store.connectAgent({ name: "Rival", provider: "test", freshTaskId: task.id });
+  const rivalBlocked = store.whyNotClaimable(secondWriter.id, rival.id);
+  assert.equal(rivalBlocked.claimable, true, "a non-overlapping writer is still free for someone else");
+  assert.equal(store.claimNextAssignment(rival.id).id, secondWriter.id);
+});
+
+test("two agents still cannot hold overlapping write scopes", async (t) => {
+  // The guarantee T0.3 must not weaken, asserted separately from the throughput change.
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-write-exclusive-"));
+  const store = new DevTeamStore(dataDir);
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Exclusive project", process.cwd());
+  const task = store.createTask({ projectId: project.id, title: "One writer per path", description: "Leases still hold." });
+  const first = store.connectAgent({ name: "First", provider: "test", freshTaskId: task.id });
+  const second = store.connectAgent({ name: "Second", provider: "test", freshTaskId: task.id });
+  const plan = store.claimNextAssignment(first.id);
+  await store.completeAssignment({ agentId: first.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+
+  store.createAssignment({ taskId: task.id, title: "Edit shared", description: "Do it.", role: "implementer", requiresWrite: true, paths: ["src/shared.mjs"] });
+  const overlapping = store.createAssignment({ taskId: task.id, title: "Edit shared again", description: "Do it.", role: "implementer", requiresWrite: true, paths: ["src/shared.mjs"] });
+  const held = store.claimNextAssignment(first.id);
+  assert.ok(held);
+  const conflict = store.whyNotClaimable(overlapping.id, second.id);
+  assert.equal(conflict.claimable, false);
+  assert.ok(conflict.reasons.some((reason) => reason.code === "write_lease_conflict"),
+    "the one guarantee that must survive the multi-claim change");
 });
 
 test("path scopes are canonicalized so a '..' alias cannot smuggle an overlapping lease", async (t) => {
@@ -499,13 +559,13 @@ test("path scopes are canonicalized so a '..' alias cannot smuggle an overlappin
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Scope project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Guard the paths", description: "Aliases must not overlap." });
-  const planner = store.connectAgent({ name: "Planner", provider: "test" });
-  const alice = store.connectAgent({ name: "Alice", provider: "test" });
-  const bob = store.connectAgent({ name: "Bob", provider: "test" });
+  const planner = store.connectAgent({ name: "Planner", provider: "test", freshTaskId: task.id });
+  const alice = store.connectAgent({ name: "Alice", provider: "test", freshTaskId: task.id });
+  const bob = store.connectAgent({ name: "Bob", provider: "test", freshTaskId: task.id });
   const plan = store.claimNextAssignment(planner.id);
   store.createAssignment({ agentId: planner.id, taskId: task.id, title: "HUD direct", description: "Edit hud.", requiresWrite: true, targetAgentName: "Alice", paths: ["src/hud"] });
   store.createAssignment({ agentId: planner.id, taskId: task.id, title: "HUD alias", description: "Same dir via alias.", requiresWrite: true, targetAgentName: "Bob", paths: ["src/ocean/../hud"] });
-  store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Planned." });
+  await store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Planned." });
 
   const aWork = store.claimNextAssignment(alice.id);
   assert.equal(aWork.title, "HUD direct");
@@ -519,19 +579,19 @@ test("blocking a task closes open assignments and frees the project write lease"
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Blocked project", process.cwd());
   const blockedTask = store.createTask({ projectId: project.id, title: "Blocked", description: "Stop this work." });
-  const writer = store.connectAgent({ name: "Writer", provider: "test" });
+  const writer = store.connectAgent({ name: "Writer", provider: "test", freshTaskId: blockedTask.id });
   const plan = store.claimNextAssignment(writer.id);
   const write = store.createAssignment({ agentId: writer.id, taskId: blockedTask.id, title: "Write", description: "Change files.", requiresWrite: true });
-  store.completeAssignment({ agentId: writer.id, assignmentId: plan.id, message: "Plan complete." });
+  await store.completeAssignment({ agentId: writer.id, assignmentId: plan.id, message: "Plan complete." });
   store.claimNextAssignment(writer.id);
   store.blockTask({ taskId: blockedTask.id, reason: "Human stopped the task." });
   assert.equal(store.taskDetail(blockedTask.id).assignments.find((assignment) => assignment.id === write.id).status, "blocked");
 
   const nextTask = store.createTask({ projectId: project.id, title: "Next", description: "This task should proceed." });
-  const nextAgent = store.connectAgent({ name: "Next", provider: "test" });
+  const nextAgent = store.connectAgent({ name: "Next", provider: "test", freshTaskId: nextTask.id });
   const nextPlan = store.claimNextAssignment(nextAgent.id);
   const nextWrite = store.createAssignment({ agentId: nextAgent.id, taskId: nextTask.id, title: "Next write", description: "Proceed.", requiresWrite: true });
-  store.completeAssignment({ agentId: nextAgent.id, assignmentId: nextPlan.id, message: "Plan complete." });
+  await store.completeAssignment({ agentId: nextAgent.id, assignmentId: nextPlan.id, message: "Plan complete." });
   assert.equal(store.claimNextAssignment(nextAgent.id).id, nextWrite.id);
 });
 
@@ -541,13 +601,13 @@ test("blocking a task stands co-workers down to waiting instead of force-disconn
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Co-worker project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Two writers", description: "One blocks, the other survives." });
-  const planner = store.connectAgent({ name: "Planner", provider: "test" });
-  const alice = store.connectAgent({ name: "Alice", provider: "test" });
-  const bob = store.connectAgent({ name: "Bob", provider: "test" });
+  const planner = store.connectAgent({ name: "Planner", provider: "test", freshTaskId: task.id });
+  const alice = store.connectAgent({ name: "Alice", provider: "test", freshTaskId: task.id });
+  const bob = store.connectAgent({ name: "Bob", provider: "test", freshTaskId: task.id });
   const plan = store.claimNextAssignment(planner.id);
   store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Ocean", description: "Edit ocean.", requiresWrite: true, targetAgentName: "Alice", paths: ["src/ocean"] });
   store.createAssignment({ agentId: planner.id, taskId: task.id, title: "HUD", description: "Edit hud.", requiresWrite: true, targetAgentName: "Bob", paths: ["src/hud"] });
-  store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Planned." });
+  await store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Planned." });
   store.claimNextAssignment(alice.id);
   store.claimNextAssignment(bob.id);
 
@@ -564,27 +624,27 @@ test("assignment dependencies hold queued work until every same-task prerequisit
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Dependencies", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Build in order", description: "Parent before child." });
-  const planner = store.connectAgent({ name: "Planner", provider: "test" });
-  const worker = store.connectAgent({ name: "Worker", provider: "test" });
+  const planner = store.connectAgent({ name: "Planner", provider: "test", freshTaskId: task.id });
+  const worker = store.connectAgent({ name: "Worker", provider: "test", freshTaskId: task.id });
   const plan = store.claimNextAssignment(planner.id);
   const parent = store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Schema", description: "Create schema.", targetAgentName: "Worker" });
   const child = store.createAssignment({ agentId: planner.id, taskId: task.id, title: "API", description: "Use schema.", targetAgentName: "Worker", dependsOn: [parent.id] });
-  store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Planned." });
+  await store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Planned." });
 
   const detailBefore = store.taskDetail(task.id).assignments.find((item) => item.id === child.id);
   assert.deepEqual(detailBefore.dependsOn, [parent.id]);
   assert.deepEqual(detailBefore.blockedBy.map((item) => item.title), ["Schema"]);
   assert.equal(store.claimNextAssignment(worker.id).id, parent.id, "the prerequisite is claimed first");
   assert.equal(store.claimNextAssignment(planner.id), null, "another agent cannot skip ahead to the dependent work");
-  store.completeAssignment({ agentId: worker.id, assignmentId: parent.id, message: "Schema done." });
+  await store.completeAssignment({ agentId: worker.id, assignmentId: parent.id, message: "Schema done." });
   assert.equal(store.claimNextAssignment(worker.id).id, child.id, "the child unlocks after its dependency is done");
   assert.deepEqual(store.taskDetail(task.id).assignments.find((item) => item.id === child.id).blockedBy, []);
-  store.completeAssignment({ agentId: worker.id, assignmentId: child.id, message: "API done." });
+  await store.completeAssignment({ agentId: worker.id, assignmentId: child.id, message: "API done." });
 
   const blockedParent = store.createAssignment({ agentId: planner.id, taskId: task.id, title: "External choice", description: "May block.", targetAgentName: "Worker" });
   const blockedChild = store.createAssignment({ agentId: planner.id, taskId: task.id, title: "After choice", description: "Must remain queued.", targetAgentName: "Worker", dependsOn: [blockedParent.id] });
   assert.equal(store.claimNextAssignment(worker.id).id, blockedParent.id);
-  store.completeAssignment({ agentId: worker.id, assignmentId: blockedParent.id, message: "Choice unavailable.", status: "blocked" });
+  await store.completeAssignment({ agentId: worker.id, assignmentId: blockedParent.id, message: "Choice unavailable.", status: "blocked" });
   const blockedDetail = store.taskDetail(task.id).assignments.find((item) => item.id === blockedChild.id);
   assert.equal(blockedDetail.status, "queued");
   assert.equal(blockedDetail.blockedBy[0].status, "blocked", "a blocked prerequisite never silently unlocks its dependent");
@@ -601,12 +661,12 @@ test("review stages do not deadlock behind a transitive downstream writer", asyn
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Staged review", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Ship staged changes", description: "Implement, review, fix, and test." });
-  const planner = store.connectAgent({ name: "Planner", provider: "test" });
-  const implementer = store.connectAgent({ name: "Implementer", provider: "test" });
-  const reviewer = store.connectAgent({ name: "Reviewer", provider: "test" });
-  const securityReviewer = store.connectAgent({ name: "Security Reviewer", provider: "test" });
-  const fixer = store.connectAgent({ name: "Fixer", provider: "test" });
-  const tester = store.connectAgent({ name: "Tester", provider: "test" });
+  const planner = store.connectAgent({ name: "Planner", provider: "test", freshTaskId: task.id });
+  const implementer = store.connectAgent({ name: "Implementer", provider: "test", freshTaskId: task.id });
+  const reviewer = store.connectAgent({ name: "Reviewer", provider: "test", freshTaskId: task.id });
+  const securityReviewer = store.connectAgent({ name: "Security Reviewer", provider: "test", freshTaskId: task.id });
+  const fixer = store.connectAgent({ name: "Fixer", provider: "test", freshTaskId: task.id });
+  const tester = store.connectAgent({ name: "Tester", provider: "test", freshTaskId: task.id });
 
   const plan = store.claimNextAssignment(planner.id);
   const implementation = store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Implement", description: "Build the change.", role: "implementer", requiresWrite: true, targetAgentName: "Implementer" });
@@ -614,22 +674,22 @@ test("review stages do not deadlock behind a transitive downstream writer", asyn
   const securityReview = store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Security review", description: "Review security.", role: "security-reviewer", targetAgentName: "Security Reviewer", dependsOn: [review.id] });
   const fix = store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Fix findings", description: "Apply review findings.", role: "implementer", requiresWrite: true, targetAgentName: "Fixer", dependsOn: [securityReview.id] });
   const testAssignment = store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Test", description: "Verify the final change.", role: "tester", targetAgentName: "Tester", dependsOn: [fix.id] });
-  store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Staged workflow planned." });
+  await store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Staged workflow planned." });
 
   assert.equal(store.claimNextAssignment(implementer.id).id, implementation.id);
   assert.equal(store.claimNextAssignment(reviewer.id), null, "review still waits for its upstream writer");
-  store.completeAssignment({ agentId: implementer.id, assignmentId: implementation.id, message: "Implemented.", changedFiles: ["src/feature.mjs"] });
+  await store.completeAssignment({ agentId: implementer.id, assignmentId: implementation.id, message: "Implemented.", changedFiles: ["src/feature.mjs"] });
 
   assert.equal(store.claimNextAssignment(reviewer.id)?.id, review.id, "review ignores the transitive downstream fixer");
   assert.equal(store.claimNextAssignment(securityReviewer.id), null, "security review waits for review");
-  store.completeAssignment({ agentId: reviewer.id, assignmentId: review.id, message: "Reviewed." });
+  await store.completeAssignment({ agentId: reviewer.id, assignmentId: review.id, message: "Reviewed." });
 
   assert.equal(store.claimNextAssignment(securityReviewer.id)?.id, securityReview.id, "security review ignores its direct downstream fixer");
-  store.completeAssignment({ agentId: securityReviewer.id, assignmentId: securityReview.id, message: "Security reviewed." });
+  await store.completeAssignment({ agentId: securityReviewer.id, assignmentId: securityReview.id, message: "Security reviewed." });
 
   assert.equal(store.claimNextAssignment(fixer.id)?.id, fix.id);
   assert.equal(store.claimNextAssignment(tester.id), null, "tester waits for the upstream fixer");
-  store.completeAssignment({ agentId: fixer.id, assignmentId: fix.id, message: "Findings fixed.", changedFiles: ["src/feature.mjs"] });
+  await store.completeAssignment({ agentId: fixer.id, assignmentId: fix.id, message: "Findings fixed.", changedFiles: ["src/feature.mjs"] });
 
   assert.equal(store.claimNextAssignment(tester.id)?.id, testAssignment.id);
 });
@@ -640,17 +700,17 @@ test("an assignment blocker queues triage without stopping sibling work or the t
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Assignment blocker", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Parallel work", description: "One item may need triage." });
-  const planner = store.connectAgent({ name: "Planner", provider: "test" });
-  const alice = store.connectAgent({ name: "Alice", provider: "test" });
-  const bob = store.connectAgent({ name: "Bob", provider: "test" });
+  const planner = store.connectAgent({ name: "Planner", provider: "test", freshTaskId: task.id });
+  const alice = store.connectAgent({ name: "Alice", provider: "test", freshTaskId: task.id });
+  const bob = store.connectAgent({ name: "Bob", provider: "test", freshTaskId: task.id });
   const plan = store.claimNextAssignment(planner.id);
   const risky = store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Risky", description: "May block.", requiresWrite: true, targetAgentName: "Alice", paths: ["src/risky"] });
   const sibling = store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Sibling", description: "Must continue.", requiresWrite: true, targetAgentName: "Bob", paths: ["src/sibling"] });
-  store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Plan complete." });
+  await store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Plan complete." });
   assert.equal(store.claimNextAssignment(alice.id).id, risky.id);
   assert.equal(store.claimNextAssignment(bob.id).id, sibling.id);
 
-  const outcome = store.completeAssignment({ agentId: alice.id, assignmentId: risky.id, message: "Needs a human choice.", status: "blocked" });
+  const outcome = await store.completeAssignment({ agentId: alice.id, assignmentId: risky.id, message: "Needs a human choice.", status: "blocked" });
   const detail = store.taskDetail(task.id);
   assert.equal(outcome.taskBlocked, false);
   assert.equal(detail.status, "planning", "the triage planner keeps the task active");
@@ -701,10 +761,10 @@ test("human acceptance requires finished review work and is labeled as an overri
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Human acceptance", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Accept me", description: "Human decides.", requiredApprovals: 2 });
-  const planner = store.connectAgent({ name: "Planner", provider: "test" });
+  const planner = store.connectAgent({ name: "Planner", provider: "test", freshTaskId: task.id });
   assert.throws(() => store.acceptTaskByHuman({ taskId: task.id, summary: "Too early." }), /ready for review/);
   const plan = store.claimNextAssignment(planner.id);
-  store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Planning is complete." });
+  await store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Planning is complete." });
 
   const accepted = store.acceptTaskByHuman({ taskId: task.id, summary: "I reviewed the delivered result." });
   const detail = store.taskDetail(task.id);
@@ -727,7 +787,7 @@ test("task and project deletion remove DevTeam history without touching project 
   });
   const project = store.ensureProject("Disposable project", projectRoot);
   const task = store.createTask({ projectId: project.id, title: "Disposable task", description: "Delete this history." });
-  const agent = store.connectAgent({ name: "Worker", provider: "test" });
+  const agent = store.connectAgent({ name: "Worker", provider: "test", freshTaskId: task.id });
   store.claimNextAssignment(agent.id);
   assert.throws(() => store.deleteTask(task.id, task.id), /Disconnect agents/);
   store.disconnectAgent(agent.id);
@@ -744,8 +804,8 @@ test("directed and broadcast messages are delivered once, then marked seen when 
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Message project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Talk to the team", description: "Exercise live messaging." });
-  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI" });
-  const claude = store.connectAgent({ name: "Claude", provider: "Anthropic" });
+  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI", freshTaskId: task.id });
+  const claude = store.connectAgent({ name: "Claude", provider: "Anthropic", freshTaskId: task.id });
 
   // A broadcast reaches every connected agent exactly once.
   store.humanMessage(task.id, "Standup in five minutes.", "all");
@@ -776,9 +836,9 @@ test("an agent can direct a message to a specific teammate", async (t) => {
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("DM project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Coordinate directly", description: "Agent to agent." });
-  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI" });
-  const claude = store.connectAgent({ name: "Claude", provider: "Anthropic" });
-  const other = store.connectAgent({ name: "Other", provider: "test" });
+  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI", freshTaskId: task.id });
+  const claude = store.connectAgent({ name: "Claude", provider: "Anthropic", freshTaskId: task.id });
+  const other = store.connectAgent({ name: "Other", provider: "test", freshTaskId: task.id });
 
   store.postMessage({ agentId: codex.id, taskId: task.id, message: "Claude, take the shader module.", type: "agent.progress", metadata: { target: "Claude" } });
 
@@ -801,8 +861,8 @@ test("listAgents reports per-agent unread (undelivered) message counts", async (
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Unread project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Count unread", description: "Track undelivered messages." });
-  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI" });
-  const claude = store.connectAgent({ name: "Claude", provider: "Anthropic" });
+  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI", freshTaskId: task.id });
+  const claude = store.connectAgent({ name: "Claude", provider: "Anthropic", freshTaskId: task.id });
 
   store.humanMessage(task.id, "Broadcast one.", "all");
   store.humanMessage(task.id, "Codex only.", "Codex");
@@ -823,7 +883,7 @@ test("messages posted before an agent's session are not live-delivered", async (
   const task = store.createTask({ projectId: project.id, title: "History task", description: "Old messages stay history." });
   const old = store.humanMessage(task.id, "This predates the agent.", "all");
   store.db.prepare("UPDATE events SET created_at = '2000-01-01T00:00:00.000Z' WHERE id = ?").run(old.eventId);
-  const late = store.connectAgent({ name: "Latecomer", provider: "test" });
+  const late = store.connectAgent({ name: "Latecomer", provider: "test", freshTaskId: task.id });
   assert.equal(store.deliverDirectedMessages(late.id).length, 0);
 });
 
@@ -835,10 +895,10 @@ test("teamActivity reports whether the room is still working", async (t) => {
   assert.equal(store.teamActivity().active, false, "an empty room is quiet");
   const task = store.createTask({ projectId: project.id, title: "Busy task", description: "Keep the team assembled." });
   assert.equal(store.teamActivity().active, true, "a queued assignment keeps the room active");
-  const agent = store.connectAgent({ name: "Worker", provider: "test" });
+  const agent = store.connectAgent({ name: "Worker", provider: "test", freshTaskId: task.id });
   const plan = store.claimNextAssignment(agent.id);
   assert.equal(store.teamActivity().busyAgents, 1, "a claimed assignment marks the agent busy");
-  store.completeAssignment({ agentId: agent.id, assignmentId: plan.id, message: "Plan done." });
+  await store.completeAssignment({ agentId: agent.id, assignmentId: plan.id, message: "Plan done." });
   assert.equal(store.teamActivity().active, false, "with no open work and no busy agent the room is quiet again");
 });
 
@@ -848,8 +908,8 @@ test("a role proposal is adopted by team agreement and creates the assignment", 
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Propose project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Negotiate roles", description: "Let the team organise." });
-  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI" });
-  const claude = store.connectAgent({ name: "Claude", provider: "Anthropic" });
+  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI", freshTaskId: task.id });
+  const claude = store.connectAgent({ name: "Claude", provider: "Anthropic", freshTaskId: task.id });
 
   const proposal = store.createProposal({ agentId: codex.id, taskId: task.id, kind: "role", summary: "Claude takes the security-reviewer role", details: { role: "security-reviewer", targetAgentName: "Claude", description: "Review auth and sessions." } });
   assert.equal(proposal.status, "open");
@@ -870,8 +930,8 @@ test("an objection declines a proposal and applies no change", async (t) => {
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Object project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Contested", description: "Someone disagrees." });
-  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI" });
-  const claude = store.connectAgent({ name: "Claude", provider: "Anthropic" });
+  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI", freshTaskId: task.id });
+  const claude = store.connectAgent({ name: "Claude", provider: "Anthropic", freshTaskId: task.id });
   const proposal = store.createProposal({ agentId: codex.id, taskId: task.id, kind: "role", summary: "Codex implements alone", details: { role: "implementer", targetAgentName: "Codex" } });
   const outcome = store.voteProposal({ agentId: claude.id, proposalId: proposal.id, vote: "object", comment: "We should pair-review." });
   assert.equal(outcome.status, "declined");
@@ -884,10 +944,10 @@ test("a handoff proposal reassigns a claimed assignment on adoption", async (t) 
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Handoff project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Hand it over", description: "Move work between agents." });
-  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI" });
-  const claude = store.connectAgent({ name: "Claude", provider: "Anthropic" });
+  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI", freshTaskId: task.id });
+  const claude = store.connectAgent({ name: "Claude", provider: "Anthropic", freshTaskId: task.id });
   const plan = store.claimNextAssignment(codex.id);
-  store.completeAssignment({ agentId: codex.id, assignmentId: plan.id, message: "Planned." });
+  await store.completeAssignment({ agentId: codex.id, assignmentId: plan.id, message: "Planned." });
   const work = store.createAssignment({ agentId: codex.id, taskId: task.id, title: "Build it", description: "Implement.", requiresWrite: true, targetAgentName: "Codex" });
   const claimed = store.claimNextAssignment(codex.id);
   assert.equal(claimed.id, work.id);
@@ -905,11 +965,11 @@ test("a late joiner cannot block a proposal decided by the voters present when i
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Snapshot project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Decide together", description: "Snapshot the voters." });
-  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI" });
-  const claude = store.connectAgent({ name: "Claude", provider: "Anthropic" });
+  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI", freshTaskId: task.id });
+  const claude = store.connectAgent({ name: "Claude", provider: "Anthropic", freshTaskId: task.id });
 
   const proposal = store.createProposal({ agentId: codex.id, taskId: task.id, kind: "decision", summary: "Ship plan A." });
-  const erin = store.connectAgent({ name: "Erin", provider: "test" }); // joins after the proposal was snapshotted
+  const erin = store.connectAgent({ name: "Erin", provider: "test", freshTaskId: task.id }); // joins after the proposal was snapshotted
 
   store.voteProposal({ agentId: erin.id, proposalId: proposal.id, vote: "object", comment: "I just got here." });
   assert.equal(store.getProposal(proposal.id).status, "open", "a late joiner's objection does not decide the proposal");
@@ -923,9 +983,9 @@ test("a quorum proposal adopts on a majority instead of unanimity", async (t) =>
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Quorum project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Majority rules", description: "Configurable quorum." });
-  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI" });
-  const claude = store.connectAgent({ name: "Claude", provider: "Anthropic" });
-  const dave = store.connectAgent({ name: "Dave", provider: "test" });
+  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI", freshTaskId: task.id });
+  const claude = store.connectAgent({ name: "Claude", provider: "Anthropic", freshTaskId: task.id });
+  const dave = store.connectAgent({ name: "Dave", provider: "test", freshTaskId: task.id });
 
   const proposal = store.createProposal({ agentId: codex.id, taskId: task.id, kind: "decision", summary: "Adopt convention X.", details: { quorum: 0.5 } });
   const outcome = store.voteProposal({ agentId: claude.id, proposalId: proposal.id, vote: "agree" });
@@ -939,8 +999,8 @@ test("a proposal left open past the decision window is escalated for a human onc
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Escalate project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Break the deadlock", description: "Escalate a stuck vote." });
-  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI" });
-  store.connectAgent({ name: "Claude", provider: "Anthropic" });
+  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI", freshTaskId: task.id });
+  store.connectAgent({ name: "Claude", provider: "Anthropic", freshTaskId: task.id });
   const proposal = store.createProposal({ agentId: codex.id, taskId: task.id, kind: "decision", summary: "Nobody will vote on this." });
   store.db.prepare("UPDATE proposals SET created_at = '2000-01-01T00:00:00.000Z' WHERE id = ?").run(proposal.id);
 
@@ -955,12 +1015,12 @@ test("no dead-end: a solo agent can complete a task that nominally needs two app
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Solo project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Solo run", description: "One agent, two approvals configured.", requiredApprovals: 2 });
-  const solo = store.connectAgent({ name: "Solo", provider: "test" });
+  const solo = store.connectAgent({ name: "Solo", provider: "test", freshTaskId: task.id });
   const plan = store.claimNextAssignment(solo.id);
   store.createAssignment({ agentId: solo.id, taskId: task.id, title: "Self review", description: "Review current version.", role: "reviewer", targetAgentName: "Solo" });
-  store.completeAssignment({ agentId: solo.id, assignmentId: plan.id, message: "Planned." });
+  await store.completeAssignment({ agentId: solo.id, assignmentId: plan.id, message: "Planned." });
   const review = store.claimNextAssignment(solo.id);
-  store.completeAssignment({ agentId: solo.id, assignmentId: review.id, message: "Reviewed, no changes." });
+  await store.completeAssignment({ agentId: solo.id, assignmentId: review.id, message: "Reviewed, no changes." });
   const outcome = store.approveTask({ agentId: solo.id, taskId: task.id, summary: "Looks good." });
   assert.equal(outcome.accepted, true, "with only one participant, one approval is enough");
   assert.equal(outcome.requiredApprovals, 1);
@@ -973,23 +1033,23 @@ test("the author of a version cannot approve it when a teammate could review ins
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Independent project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Review must be independent", description: "No self-approval when others exist.", requiredApprovals: 1 });
-  const planner = store.connectAgent({ name: "Planner", provider: "test" });
-  const alice = store.connectAgent({ name: "Alice", provider: "test" });
-  const bob = store.connectAgent({ name: "Bob", provider: "test" });
+  const planner = store.connectAgent({ name: "Planner", provider: "test", freshTaskId: task.id });
+  const alice = store.connectAgent({ name: "Alice", provider: "test", freshTaskId: task.id });
+  const bob = store.connectAgent({ name: "Bob", provider: "test", freshTaskId: task.id });
   const plan = store.claimNextAssignment(planner.id);
   store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Build", description: "Implement it.", role: "implementer", requiresWrite: true, targetAgentName: "Alice" });
   store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Alice review", description: "Review current version.", role: "reviewer", targetAgentName: "Alice" });
   store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Bob review", description: "Independent review.", role: "reviewer", targetAgentName: "Bob" });
-  store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Planned." });
+  await store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Planned." });
 
   const build = store.claimNextAssignment(alice.id);
-  store.completeAssignment({ agentId: alice.id, assignmentId: build.id, message: "Implemented.", changedFiles: ["package.json"] });
+  await store.completeAssignment({ agentId: alice.id, assignmentId: build.id, message: "Implemented.", changedFiles: ["package.json"] });
   const aliceReview = store.claimNextAssignment(alice.id);
-  store.completeAssignment({ agentId: alice.id, assignmentId: aliceReview.id, message: "Self review." });
+  await store.completeAssignment({ agentId: alice.id, assignmentId: aliceReview.id, message: "Self review." });
   assert.throws(() => store.approveTask({ agentId: alice.id, taskId: task.id, summary: "I approve my own change." }), /author of the current version cannot approve/);
 
   const bobReview = store.claimNextAssignment(bob.id);
-  store.completeAssignment({ agentId: bob.id, assignmentId: bobReview.id, message: "Independent review passed." });
+  await store.completeAssignment({ agentId: bob.id, assignmentId: bobReview.id, message: "Independent review passed." });
   const outcome = store.approveTask({ agentId: bob.id, taskId: task.id, summary: "Independently reviewed." });
   assert.equal(outcome.accepted, true, "an independent teammate can approve");
   assert.equal(outcome.selfReviewed, false, "and it is not labeled self-reviewed");
@@ -1001,18 +1061,18 @@ test("a disconnected historical teammate cannot dead-end the remaining solo auth
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Now-solo project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Finish after teammate leaves", description: "Current availability controls approvals.", requiredApprovals: 2 });
-  const former = store.connectAgent({ name: "Former teammate", provider: "test" });
-  const solo = store.connectAgent({ name: "Remaining author", provider: "test" });
+  const former = store.connectAgent({ name: "Former teammate", provider: "test", freshTaskId: task.id });
+  const solo = store.connectAgent({ name: "Remaining author", provider: "test", freshTaskId: task.id });
   const plan = store.claimNextAssignment(former.id);
   store.createAssignment({ agentId: former.id, taskId: task.id, title: "Build", description: "Implement it.", role: "implementer", requiresWrite: true, targetAgentName: solo.name });
   store.createAssignment({ agentId: former.id, taskId: task.id, title: "Review", description: "Review the current version.", role: "reviewer", targetAgentName: solo.name });
-  store.completeAssignment({ agentId: former.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+  await store.completeAssignment({ agentId: former.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
   store.disconnectAgent(former.id, "Left the task.");
 
   const build = store.claimNextAssignment(solo.id);
-  store.completeAssignment({ agentId: solo.id, assignmentId: build.id, claimToken: build.claimToken, message: "Built.", changedFiles: ["package.json"] });
+  await store.completeAssignment({ agentId: solo.id, assignmentId: build.id, claimToken: build.claimToken, message: "Built.", changedFiles: ["package.json"] });
   const review = store.claimNextAssignment(solo.id);
-  store.completeAssignment({ agentId: solo.id, assignmentId: review.id, claimToken: review.claimToken, message: "Self-reviewed." });
+  await store.completeAssignment({ agentId: solo.id, assignmentId: review.id, claimToken: review.claimToken, message: "Self-reviewed." });
   const outcome = store.approveTask({ agentId: solo.id, taskId: task.id, summary: "No independent teammate remains connected." });
   assert.equal(outcome.accepted, true);
   assert.equal(outcome.requiredApprovals, 1);
@@ -1025,29 +1085,29 @@ test("checkpoint successors share one approval lineage and cannot manufacture co
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Lineage project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Rotate one session", description: "A fresh session is not a fresh reviewer.", requiredApprovals: 2 });
-  const oldSession = store.connectAgent({ name: "Rotating agent", provider: "test" });
+  const oldSession = store.connectAgent({ name: "Rotating agent", provider: "test", freshTaskId: task.id });
   const plan = store.claimNextAssignment(oldSession.id);
   store.createAssignment({ agentId: oldSession.id, taskId: task.id, title: "Build", description: "Implement it.", role: "implementer", requiresWrite: true, targetAgentName: oldSession.name });
   store.createAssignment({ agentId: oldSession.id, taskId: task.id, title: "First review", description: "Review before rotation.", role: "reviewer", targetAgentName: oldSession.name });
   store.createAssignment({ agentId: oldSession.id, taskId: task.id, title: "Fresh-session review", description: "Review after rotation.", role: "reviewer", targetAgentName: "Fresh rotating agent" });
-  store.completeAssignment({ agentId: oldSession.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+  await store.completeAssignment({ agentId: oldSession.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
   const build = store.claimNextAssignment(oldSession.id);
-  store.completeAssignment({ agentId: oldSession.id, assignmentId: build.id, claimToken: build.claimToken, message: "Built.", changedFiles: ["package.json"] });
+  await store.completeAssignment({ agentId: oldSession.id, assignmentId: build.id, claimToken: build.claimToken, message: "Built.", changedFiles: ["package.json"] });
   const firstReview = store.claimNextAssignment(oldSession.id);
-  store.completeAssignment({ agentId: oldSession.id, assignmentId: firstReview.id, claimToken: firstReview.claimToken, message: "Reviewed before rotation." });
+  await store.completeAssignment({ agentId: oldSession.id, assignmentId: firstReview.id, claimToken: firstReview.claimToken, message: "Reviewed before rotation." });
   const beforeRotation = store.approveTask({ agentId: oldSession.id, taskId: task.id, summary: "Self-review before rotating." });
   assert.equal(beforeRotation.accepted, false, "the queued successor review keeps the task open");
 
-  const checkpoint = store.createSessionCheckpoint({ agentId: oldSession.id, taskId: task.id, nextAction: "Complete the queued review." });
-  const freshSession = store.connectAgent({ name: "Fresh rotating agent", provider: "test" });
-  store.takeoverSessionCheckpoint({
+  const checkpoint = await store.createSessionCheckpoint({ agentId: oldSession.id, taskId: task.id, nextAction: "Complete the queued review." });
+  const freshSession = store.connectAgent({ name: "Fresh rotating agent", provider: "test", freshTaskId: task.id });
+  await store.takeoverSessionCheckpoint({
     agentId: freshSession.id,
     taskId: task.id,
     checkpointId: checkpoint.checkpoint.id,
     handoffToken: checkpoint.handoffToken,
   });
   const freshReview = store.claimNextAssignment(freshSession.id);
-  store.completeAssignment({ agentId: freshSession.id, assignmentId: freshReview.id, claimToken: freshReview.claimToken, message: "Reviewed after rotation." });
+  await store.completeAssignment({ agentId: freshSession.id, assignmentId: freshReview.id, claimToken: freshReview.claimToken, message: "Reviewed after rotation." });
   const outcome = store.approveTask({ agentId: freshSession.id, taskId: task.id, summary: "Same participant, fresh session." });
   assert.equal(outcome.accepted, true);
   assert.equal(outcome.approvalCount, 1, "predecessor and successor approvals collapse to one lineage");
@@ -1061,16 +1121,16 @@ test("a solo acceptance is labeled selfReviewed; changed files that aren't on di
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Self review project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Solo but honest", description: "Label the lack of independent review.", requiredApprovals: 2 });
-  const solo = store.connectAgent({ name: "Solo", provider: "test" });
+  const solo = store.connectAgent({ name: "Solo", provider: "test", freshTaskId: task.id });
   const plan = store.claimNextAssignment(solo.id);
   store.createAssignment({ agentId: solo.id, taskId: task.id, title: "Self review", description: "Review current version.", role: "reviewer", targetAgentName: "Solo" });
-  const done = store.completeAssignment({ agentId: solo.id, assignmentId: plan.id, message: "Planned.", changedFiles: ["package.json", "does/not/exist.js"] });
+  const done = await store.completeAssignment({ agentId: solo.id, assignmentId: plan.id, message: "Planned.", changedFiles: ["package.json", "does/not/exist.js"] });
   assert.equal(done.completed, true);
   const completedEvent = store.taskDetail(task.id).events.find((e) => e.type === "assignment.completed");
   assert.deepEqual(completedEvent.metadata.unverifiedFiles, ["does/not/exist.js"], "a real file passes; a missing one is flagged, without blocking the report");
 
   const review = store.claimNextAssignment(solo.id);
-  store.completeAssignment({ agentId: solo.id, assignmentId: review.id, message: "Reviewed." });
+  await store.completeAssignment({ agentId: solo.id, assignmentId: review.id, message: "Reviewed." });
   const outcome = store.approveTask({ agentId: solo.id, taskId: task.id, summary: "Looks good." });
   assert.equal(outcome.accepted, true);
   assert.equal(outcome.selfReviewed, true, "a single-participant acceptance is labeled self-reviewed");
@@ -1106,7 +1166,7 @@ test("messages can reply to a specific timeline event (threads)", async (t) => {
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Thread project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Talk in threads", description: "Reply to messages." });
-  const agent = store.connectAgent({ name: "Codex", provider: "OpenAI" });
+  const agent = store.connectAgent({ name: "Codex", provider: "OpenAI", freshTaskId: task.id });
 
   const question = store.humanMessage(task.id, "Per-IP or per-account rate limit?", "all");
   store.postMessage({ agentId: agent.id, taskId: task.id, message: "Per-IP for now.", type: "agent.decision", metadata: { replyTo: question.eventId } });
@@ -1124,7 +1184,7 @@ test("listAgents surfaces the assignment an agent is currently working on", asyn
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Activity project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Show activity", description: "Track live work." });
-  const agent = store.connectAgent({ name: "Codex", provider: "OpenAI" });
+  const agent = store.connectAgent({ name: "Codex", provider: "OpenAI", freshTaskId: task.id });
   store.claimNextAssignment(agent.id);
   const busy = store.listAgents().find((a) => a.name === "Codex");
   assert.equal(busy.status, "busy");
@@ -1139,8 +1199,8 @@ test("the shared blackboard stores versioned team memory with optimistic concurr
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Blackboard project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Share a mind", description: "One working memory." });
-  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI" });
-  const claude = store.connectAgent({ name: "Claude", provider: "Anthropic" });
+  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI", freshTaskId: task.id });
+  const claude = store.connectAgent({ name: "Claude", provider: "Anthropic", freshTaskId: task.id });
 
   const first = store.noteSet({ agentId: codex.id, taskId: task.id, key: "decisions", value: "Use SQLite." });
   assert.equal(first.ok, true);
@@ -1171,13 +1231,13 @@ test("project memory persists across same-project tasks while membership isolate
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Persistent memory", process.cwd());
   const firstTask = store.createTask({ projectId: project.id, title: "First task", description: "Write project memory." });
-  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI" });
+  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI", freshTaskId: firstTask.id });
   const first = store.noteSet({ agentId: codex.id, taskId: firstTask.id, scope: "project", key: "conventions", value: "Use SQLite." });
   assert.equal(first.scope, "project");
   assert.equal(first.version, 1);
 
   const secondTask = store.createTask({ projectId: project.id, title: "Second task", description: "Read project memory." });
-  const claude = store.connectAgent({ name: "Claude", provider: "Anthropic" });
+  const claude = store.connectAgent({ name: "Claude", provider: "Anthropic", freshTaskId: secondTask.id });
   store.joinTask(claude.id, secondTask.id);
   const carried = store.noteGet(secondTask.id, "conventions", "project", claude.id);
   assert.equal(carried.value, "Use SQLite.", "a later task in the project sees durable memory");
@@ -1204,7 +1264,7 @@ test("taskBrief returns bounded actionable context without global agent secrets"
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Brief", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Brief me", description: "Keep context compact." });
-  const agent = store.connectAgent({ name: "Codex", provider: "test" });
+  const agent = store.connectAgent({ name: "Codex", provider: "test", freshTaskId: task.id });
   store.noteSet({ agentId: agent.id, taskId: task.id, key: "goal", value: "x".repeat(3_000) });
   store.noteSet({ agentId: agent.id, taskId: task.id, scope: "project", key: "convention", value: "local-first" });
   store.postMessage({ agentId: agent.id, taskId: task.id, type: "agent.question", message: "Which API shape?" });
@@ -1229,10 +1289,10 @@ test("opening an existing database repairs stale nonterminal task status", async
   const firstStore = new DevTeamStore(dataDir);
   const project = firstStore.ensureProject("Status project", process.cwd());
   const task = firstStore.createTask({ projectId: project.id, title: "Repair status", description: "Restore active state." });
-  const planner = firstStore.connectAgent({ name: "Planner", provider: "test" });
+  const planner = firstStore.connectAgent({ name: "Planner", provider: "test", freshTaskId: task.id });
   const plan = firstStore.claimNextAssignment(planner.id);
   firstStore.createAssignment({ agentId: planner.id, taskId: task.id, title: "Implement", description: "Pending implementation.", requiresWrite: true });
-  firstStore.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Plan complete." });
+  await firstStore.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Plan complete." });
   firstStore.db.prepare("UPDATE tasks SET status = 'review' WHERE id = ?").run(task.id);
   firstStore.close();
 
@@ -1241,7 +1301,7 @@ test("opening an existing database repairs stale nonterminal task status", async
   reopened.close();
 });
 
-test("a targeted assignment invites an agent into a new task's room across a multi-task server", async (t) => {
+test("a targeted assignment invites an agent into a task room it never joined", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-invite-"));
   const store = new DevTeamStore(dataDir);
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
@@ -1252,7 +1312,7 @@ test("a targeted assignment invites an agent into a new task's room across a mul
   const claude = store.connectAgent({ name: "Claude", provider: "test" });
   const bob = store.connectAgent({ name: "Bob", provider: "test" });
 
-  // With two active tasks and no join, neither agent has an implicit room: nothing is claimable.
+  // Neither agent joined anything, so neither has a room: nothing is claimable.
   assert.equal(store.claimNextAssignment(claude.id), null, "no invitation, no room, no claim");
 
   // The human (control plane) targets a Task B assignment at Claude — an explicit invitation.
@@ -1263,7 +1323,7 @@ test("a targeted assignment invites an agent into a new task's room across a mul
   assert.equal(store.taskDetail(taskB.id).members.some((m) => m.agent_name === "Claude"), true, "the invitation auto-joined the room");
 
   // Untargeted work (Task B's own planner assignment) is not reachable by an uninvited agent.
-  assert.equal(store.claimNextAssignment(bob.id), null, "an uninvited agent still cannot claim on a multi-task server");
+  assert.equal(store.claimNextAssignment(bob.id), null, "an uninvited agent that joined no room still cannot claim");
 });
 
 test("a plain reconnect replays messages missed while the agent was disconnected", async (t) => {
@@ -1272,7 +1332,7 @@ test("a plain reconnect replays messages missed while the agent was disconnected
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Reconnect project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Stay in sync", description: "Do not lose messages." });
-  const first = store.connectAgent({ name: "Claude", provider: "Anthropic" });
+  const first = store.connectAgent({ name: "Claude", provider: "Anthropic", freshTaskId: task.id });
   store.deliverDirectedMessages(first.id); // drain anything already waiting
   store.disconnectAgent(first.id, "Desktop closed.");
 
@@ -1280,7 +1340,7 @@ test("a plain reconnect replays messages missed while the agent was disconnected
   store.humanMessage(task.id, "Please pick this up when you return.", "all");
 
   // A fresh session for the same identity reconnects — no resume token, plain devteam_connect.
-  const second = store.connectAgent({ name: "Claude", provider: "Anthropic" });
+  const second = store.connectAgent({ name: "Claude", provider: "Anthropic", freshTaskId: task.id });
   const inbox = store.deliverDirectedMessages(second.id);
   assert.ok(inbox.some((m) => /pick this up/.test(m.message)), "the message sent while away replays on a plain reconnect");
 });
@@ -1291,10 +1351,10 @@ test("an open unanimity vote reports only the voters still able to decide it", a
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Needed project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Count the voters", description: "Honest requirements." });
-  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI" });
-  const claude = store.connectAgent({ name: "Claude", provider: "Anthropic" });
-  const dave = store.connectAgent({ name: "Dave", provider: "test" });
-  const erin = store.connectAgent({ name: "Erin", provider: "test" });
+  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI", freshTaskId: task.id });
+  const claude = store.connectAgent({ name: "Claude", provider: "Anthropic", freshTaskId: task.id });
+  const dave = store.connectAgent({ name: "Dave", provider: "test", freshTaskId: task.id });
+  const erin = store.connectAgent({ name: "Erin", provider: "test", freshTaskId: task.id });
 
   const proposal = store.createProposal({ agentId: codex.id, taskId: task.id, kind: "decision", summary: "Decide together." });
   // Erin was a snapshot voter but leaves before voting: it must no longer count toward the requirement.
@@ -1313,12 +1373,12 @@ test("continueTask reopens an accepted task, bumps the version, clears approvals
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Continue project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Ship then continue", description: "Same-conversation follow-up.", requiredApprovals: 1 });
-  const solo = store.connectAgent({ name: "Solo", provider: "test" });
+  const solo = store.connectAgent({ name: "Solo", provider: "test", freshTaskId: task.id });
   const plan = store.claimNextAssignment(solo.id);
   store.createAssignment({ agentId: solo.id, taskId: task.id, title: "Review", description: "Review v1.", role: "reviewer", targetAgentName: "Solo" });
-  store.completeAssignment({ agentId: solo.id, assignmentId: plan.id, message: "Planned." });
+  await store.completeAssignment({ agentId: solo.id, assignmentId: plan.id, message: "Planned." });
   const review = store.claimNextAssignment(solo.id);
-  store.completeAssignment({ agentId: solo.id, assignmentId: review.id, message: "Reviewed." });
+  await store.completeAssignment({ agentId: solo.id, assignmentId: review.id, message: "Reviewed." });
   assert.equal(store.approveTask({ agentId: solo.id, taskId: task.id, summary: "Good." }).accepted, true);
   assert.equal(store.getTask(task.id).status, "accepted");
   assert.equal(store.getAgent(solo.id).status, "waiting", "the agent stays assembled after acceptance");
@@ -1347,12 +1407,12 @@ test("an accepted task keeps the room active within the continuation window, the
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Window project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Stay a moment", description: "Continuation window.", requiredApprovals: 1 });
-  const solo = store.connectAgent({ name: "Solo", provider: "test" });
+  const solo = store.connectAgent({ name: "Solo", provider: "test", freshTaskId: task.id });
   const plan = store.claimNextAssignment(solo.id);
   store.createAssignment({ agentId: solo.id, taskId: task.id, title: "Review", description: "Review.", role: "reviewer", targetAgentName: "Solo" });
-  store.completeAssignment({ agentId: solo.id, assignmentId: plan.id, message: "Planned." });
+  await store.completeAssignment({ agentId: solo.id, assignmentId: plan.id, message: "Planned." });
   const review = store.claimNextAssignment(solo.id);
-  store.completeAssignment({ agentId: solo.id, assignmentId: review.id, message: "Reviewed." });
+  await store.completeAssignment({ agentId: solo.id, assignmentId: review.id, message: "Reviewed." });
   store.approveTask({ agentId: solo.id, taskId: task.id, summary: "Good." });
   assert.equal(store.getTask(task.id).status, "accepted");
   assert.equal(store.teamActivity().active, true, "a just-accepted room stays assembled for the follow-up window");
@@ -1368,8 +1428,8 @@ test("a human Agree adopts a proposal outright; a human Object declines it", asy
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Human vote project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Owner decides", description: "Human is authoritative." });
-  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI" });
-  const claude = store.connectAgent({ name: "Claude", provider: "Anthropic" });
+  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI", freshTaskId: task.id });
+  const claude = store.connectAgent({ name: "Claude", provider: "Anthropic", freshTaskId: task.id });
 
   // Without the human, adoption would wait on Claude; the human's own click decides it.
   const p1 = store.createProposal({ agentId: codex.id, taskId: task.id, kind: "decision", summary: "Adopt plan A." });
@@ -1385,9 +1445,9 @@ test("re-casting the same vote is idempotent and emits no duplicate events", asy
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Idempotent project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "No spam", description: "Repeated clicks are safe." });
-  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI" });
-  const claude = store.connectAgent({ name: "Claude", provider: "Anthropic" });
-  const dave = store.connectAgent({ name: "Dave", provider: "test" });
+  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI", freshTaskId: task.id });
+  const claude = store.connectAgent({ name: "Claude", provider: "Anthropic", freshTaskId: task.id });
+  const dave = store.connectAgent({ name: "Dave", provider: "test", freshTaskId: task.id });
   const proposal = store.createProposal({ agentId: codex.id, taskId: task.id, kind: "decision", summary: "Adopt X." });
   store.voteProposal({ agentId: claude.id, proposalId: proposal.id, vote: "agree" }); // stays open: Dave hasn't voted
   const voteEvents = () => store.taskDetail(task.id).events.filter((e) => e.type === "proposal.vote" && e.agent_id === claude.id).length;
@@ -1404,7 +1464,7 @@ test("a dashboard-created proposal has no implicit vote and is adopted once by a
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Human propose project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Human proposes", description: "Owner-authored proposal." });
-  store.connectAgent({ name: "Codex", provider: "OpenAI" }); // a teammate is present in the room
+  store.connectAgent({ name: "Codex", provider: "OpenAI", freshTaskId: task.id }); // a teammate is present in the room
   const proposal = store.createProposal({ agentId: null, taskId: task.id, kind: "decision", summary: "Human decision." });
   assert.equal(store.getProposal(proposal.id).votes.length, 0, "a human-created proposal starts with no implicit vote");
   assert.equal(store.voteProposal({ agentId: null, proposalId: proposal.id, vote: "agree" }).status, "adopted", "one explicit human Agree adopts it");
@@ -1417,7 +1477,7 @@ test("a legacy proposal already carrying the human's agree adopts on the next id
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Legacy vote project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Legacy adopt", description: "Pre-seeded human vote." });
-  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI" });
+  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI", freshTaskId: task.id });
   const proposal = store.createProposal({ agentId: codex.id, taskId: task.id, kind: "decision", summary: "Legacy decision." });
   // Simulate a legacy pre-seeded human agree recorded without triggering evaluation; still open.
   store.db.prepare("INSERT OR REPLACE INTO proposal_votes (proposal_id, voter_id, voter_name, vote, comment, created_at) VALUES (?, 'human', 'You', 'agree', NULL, ?)").run(proposal.id, new Date().toISOString());
@@ -1431,17 +1491,17 @@ test("continueTask during review advances the version and clears the in-progress
   t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
   const project = store.ensureProject("Continue-review project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Review then continue", description: "Follow-up mid-review.", requiredApprovals: 2 });
-  const planner = store.connectAgent({ name: "Planner", provider: "Codex" });
-  const reviewer = store.connectAgent({ name: "Reviewer", provider: "Claude" });
-  store.connectAgent({ name: "Second reviewer", provider: "test" });
+  const planner = store.connectAgent({ name: "Planner", provider: "Codex", freshTaskId: task.id });
+  const reviewer = store.connectAgent({ name: "Reviewer", provider: "Claude", freshTaskId: task.id });
+  store.connectAgent({ name: "Second reviewer", provider: "test", freshTaskId: task.id });
   const plan = store.claimNextAssignment(planner.id);
   store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Write", description: "Change a file.", role: "implementer", requiresWrite: true, targetAgentName: "Planner" });
   store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Review", description: "Review.", role: "reviewer", targetAgentName: "Reviewer" });
-  store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Planned." });
+  await store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Planned." });
   const write = store.claimNextAssignment(planner.id);
-  store.completeAssignment({ agentId: planner.id, assignmentId: write.id, message: "Wrote it.", changedFiles: ["src/x.js"] });
+  await store.completeAssignment({ agentId: planner.id, assignmentId: write.id, message: "Wrote it.", changedFiles: ["src/x.js"] });
   const review = store.claimNextAssignment(reviewer.id);
-  store.completeAssignment({ agentId: reviewer.id, assignmentId: review.id, message: "Reviewed." });
+  await store.completeAssignment({ agentId: reviewer.id, assignmentId: review.id, message: "Reviewed." });
   assert.equal(store.approveTask({ agentId: reviewer.id, taskId: task.id, summary: "One of two." }).accepted, false);
   assert.equal(store.getTask(task.id).status, "review");
   assert.equal(store.taskDetail(task.id).approvals.length, 1, "a partial approval exists during review");
@@ -1460,13 +1520,13 @@ test("forgetAgent removes an unresponsive ghost, returns its work, and refuses a
   const project = store.ensureProject("Ghost project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Hold a lease", description: "Exercise ghost removal." });
 
-  const live = store.connectAgent({ name: "Live", provider: "Claude" });
+  const live = store.connectAgent({ name: "Live", provider: "Claude", freshTaskId: task.id });
   assert.throws(() => store.forgetAgent(live.id), /still connected/, "a connected agent is protected from removal");
 
-  const writer = store.connectAgent({ name: "Writer", provider: "Codex" });
+  const writer = store.connectAgent({ name: "Writer", provider: "Codex", freshTaskId: task.id });
   const plan = store.claimNextAssignment(writer.id);
   store.createAssignment({ agentId: writer.id, taskId: task.id, title: "Edit core", description: "Change files.", role: "implementer", requiresWrite: true, targetAgentName: "Writer" });
-  store.completeAssignment({ agentId: writer.id, assignmentId: plan.id, message: "Planned." });
+  await store.completeAssignment({ agentId: writer.id, assignmentId: plan.id, message: "Planned." });
   const write = store.claimNextAssignment(writer.id);
   assert.equal(write.requires_write, 1, "the writer holds a write lease");
 
@@ -1489,11 +1549,11 @@ test("long-gone agents are auto-purged, but a ghost still holding a write lease 
   const project = store.ensureProject("Purge project", process.cwd());
   const task = store.createTask({ projectId: project.id, title: "Reap the ghosts", description: "Exercise auto-purge." });
 
-  const writer = store.connectAgent({ name: "Writer", provider: "Codex" });
-  const idler = store.connectAgent({ name: "Idler", provider: "Claude" });
+  const writer = store.connectAgent({ name: "Writer", provider: "Codex", freshTaskId: task.id });
+  const idler = store.connectAgent({ name: "Idler", provider: "Claude", freshTaskId: task.id });
   const plan = store.claimNextAssignment(writer.id);
   store.createAssignment({ agentId: writer.id, taskId: task.id, title: "Edit core", description: "Change files.", role: "implementer", requiresWrite: true, targetAgentName: "Writer" });
-  store.completeAssignment({ agentId: writer.id, assignmentId: plan.id, message: "Planned." });
+  await store.completeAssignment({ agentId: writer.id, assignmentId: plan.id, message: "Planned." });
   store.claimNextAssignment(writer.id); // Writer now holds a write lease.
   store.disconnectAgent(idler.id); // Idler leaves for good, holding nothing.
 
@@ -1587,9 +1647,9 @@ async function schedulerFixture(t, { knowledge = false } = {}) {
   });
   const project = store.ensureProject("Scheduler project", projectRoot);
   const task = store.createTask({ projectId: project.id, title: "Scheduler", description: "Exercise claim scheduling." });
-  const agent = store.connectAgent({ name: "Worker", provider: "fixture" });
+  const agent = store.connectAgent({ name: "Worker", provider: "fixture", freshTaskId: task.id });
   const plan = store.claimNextAssignment(agent.id);
-  store.completeAssignment({ agentId: agent.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+  await store.completeAssignment({ agentId: agent.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
   return { store, project, task, agent };
 }
 
@@ -1605,7 +1665,7 @@ test("a verifier that declares write access is not treated as the writer it wait
   });
   const claim = store.claimNextAssignment(agent.id);
   assert.equal(claim?.id, writingTester.id, "a write-requiring tester must not block itself out of every scan");
-  store.completeAssignment({ agentId: agent.id, assignmentId: claim.id, claimToken: claim.claimToken, message: "Tests written." });
+  await store.completeAssignment({ agentId: agent.id, assignmentId: claim.id, claimToken: claim.claimToken, message: "Tests written." });
   // The real rule still holds: a verifier waits for a genuinely separate pending writer.
   store.createAssignment({
     taskId: task.id, title: "Ship the feature", description: "Edit source.",
@@ -1635,7 +1695,7 @@ test("an agent that goes quiet while holding a claim still counts as working", a
   assert.equal(activity.busyAgents, 0, "responsiveness is reported honestly");
   assert.equal(activity.workingAgents, 1, "but a claim holder is still reported as working");
   assert.equal(activity.active, true);
-  store.completeAssignment({ agentId: agent.id, assignmentId: claim.id, claimToken: claim.claimToken, message: "Done." });
+  await store.completeAssignment({ agentId: agent.id, assignmentId: claim.id, claimToken: claim.claimToken, message: "Done." });
   assert.equal(store.teamActivity([task.id]).workingAgents, 0, "the count clears once the claim is released");
 });
 
@@ -1661,7 +1721,7 @@ test("purging an agent removes it from the roster without rewriting who spoke", 
 
 test("targeting routes work to a teammate without outliving them", async (t) => {
   const { store, task, agent } = await schedulerFixture(t);
-  const other = store.connectAgent({ name: "Other", provider: "fixture" });
+  const other = store.connectAgent({ name: "Other", provider: "fixture", freshTaskId: task.id });
   store.joinTask(other.id, task.id, "contributor");
   const targeted = store.createAssignment({
     taskId: task.id, title: "Work for Worker", description: "Targeted work.",

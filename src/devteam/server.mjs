@@ -356,7 +356,7 @@ export async function startDevTeamServer({
     if (!advertisedModel || !advertisedEffort) throw new Error("Managed selection must exactly match the host-advertised profile.");
     const selectedProfile = { ...profile, currentModel: advertisedModel.id, currentEffort: advertisedEffort.id, currentModelClass: advertisedModel.class, currentEffortClass: advertisedEffort.class };
     if (!resolveRuntimeRequirement(assessment.requirements, selectedProfile).satisfied) throw new Error("The selected managed runtime does not satisfy the current assessment.");
-    const checkpointResult = store.createSessionCheckpoint({ agentId: req.body.agentId, taskId: task.id, assignmentId: assignment.id, nextAction: "Managed runner should connect and take over this checkpoint." });
+    const checkpointResult = await store.createSessionCheckpoint({ agentId: req.body.agentId, taskId: task.id, assignmentId: assignment.id, nextAction: "Managed runner should connect and take over this checkpoint." });
     const invitation = checkpointInvitation(task, checkpointResult);
     try {
       const launched = await supervisor.launch({
@@ -374,7 +374,7 @@ export async function startDevTeamServer({
       throw error;
     }
   }));
-  app.post("/api/tasks/:taskId/checkpoints", (req, res) => {
+  app.post("/api/tasks/:taskId/checkpoints", asyncRoute(async (req, res) => {
     const task = store.getTask(req.params.taskId);
     if (!task) return res.status(404).json({ error: "Task not found." });
     const assignmentId = typeof req.body?.assignmentId === "string" ? req.body.assignmentId : null;
@@ -385,7 +385,7 @@ export async function startDevTeamServer({
     const fromAgentId = assignment?.agent_id || (typeof req.body?.fromAgentId === "string" ? req.body.fromAgentId : null);
     if (!fromAgentId) throw new Error("Choose an active agent or claimed assignment to checkpoint.");
     const expiresInMinutes = Math.max(1, Math.min(1440, Number(req.body?.expiresInMinutes) || 30));
-    const result = store.createSessionCheckpoint({
+    const result = await store.createSessionCheckpoint({
       agentId: fromAgentId,
       taskId: task.id,
       assignmentId,
@@ -397,7 +397,7 @@ export async function startDevTeamServer({
       expiresInMs: expiresInMinutes * 60_000,
     });
     res.status(201).json({ ...result, invitation: checkpointInvitation(task, result) });
-  });
+  }));
   app.get("/api/tasks/:taskId/checkpoints/:checkpointId", requireControlAuth, (req, res) => {
     res.json(store.sessionCheckpointGet({ taskId: req.params.taskId, checkpointId: req.params.checkpointId }));
   });

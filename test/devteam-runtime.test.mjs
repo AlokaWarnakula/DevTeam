@@ -141,9 +141,9 @@ test("runtime profiles persist per session with source trust and TTL behavior", 
 
 test("the runtime gate returns before lease acquisition and continue/switch/reassign decisions unblock deterministically", async (t) => {
   const { store, task } = await fixture(t);
-  const planner = store.connectAgent({ name: "Planner", provider: "fixture" });
+  const planner = store.connectAgent({ name: "Planner", provider: "fixture", freshTaskId: task.id });
   const plan = store.claimNextAssignment(planner.id);
-  store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+  await store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
   const work = store.createAssignment({
     taskId: task.id,
     title: "Audit access",
@@ -152,7 +152,7 @@ test("the runtime gate returns before lease acquisition and continue/switch/reas
     requiresWrite: true,
     paths: ["src/auth.mjs"],
   });
-  const agent = store.connectAgent({ name: "Runtime agent", provider: "fixture", runtimeProfile: balancedProfile() });
+  const agent = store.connectAgent({ name: "Runtime agent", provider: "fixture", runtimeProfile: balancedProfile(), freshTaskId: task.id });
   const gate = store.claimNextAssignment(agent.id);
   assert.equal(gate.status, "runtime_action_required");
   assert.equal(gate.leaseAcquired, false);
@@ -161,7 +161,7 @@ test("the runtime gate returns before lease acquisition and continue/switch/reas
   store.runtimeDecision({ agentId: agent.id, assignmentId: work.id, assessmentId: gate.assessment.id, choice: "continue", reason: "Human prioritizes continuity." });
   const continuedClaim = store.claimNextAssignment(agent.id);
   assert.equal(continuedClaim.id, work.id);
-  store.completeAssignment({ agentId: agent.id, assignmentId: work.id, claimToken: continuedClaim.claimToken, message: "Finished first critical fixture." });
+  await store.completeAssignment({ agentId: agent.id, assignmentId: work.id, claimToken: continuedClaim.claimToken, message: "Finished first critical fixture." });
 
   const switchedWork = store.createAssignment({ taskId: task.id, title: "Protect credentials", description: "Implement authentication and schema migration safety.", role: "implementer" });
   const gateAgain = store.claimNextAssignment(agent.id);
@@ -170,22 +170,22 @@ test("the runtime gate returns before lease acquisition and continue/switch/reas
   store.runtimeDecision({ agentId: agent.id, assignmentId: switchedWork.id, assessmentId: gateAgain.assessment.id, choice: "switched" });
   const switchedClaim = store.claimNextAssignment(agent.id);
   assert.equal(switchedClaim.id, switchedWork.id);
-  store.completeAssignment({ agentId: agent.id, assignmentId: switchedWork.id, claimToken: switchedClaim.claimToken, message: "Finished switched fixture." });
+  await store.completeAssignment({ agentId: agent.id, assignmentId: switchedWork.id, claimToken: switchedClaim.claimToken, message: "Finished switched fixture." });
 
   const reassignedWork = store.createAssignment({ taskId: task.id, title: "Secure authorization", description: "Implement authentication and schema migration controls.", role: "implementer" });
   store.updateRuntimeProfile({ agentId: agent.id, profile: balancedProfile() });
   const reassignGate = store.claimNextAssignment(agent.id);
   store.runtimeDecision({ agentId: agent.id, assignmentId: reassignedWork.id, assessmentId: reassignGate.assessment.id, choice: "reassign" });
   assert.equal(store.claimNextAssignment(agent.id), null);
-  const compatible = store.connectAgent({ name: "Compatible", provider: "fixture", runtimeProfile: balancedProfile({ currentModel: "fixture-frontier", currentEffort: "fixture-high" }) });
+  const compatible = store.connectAgent({ name: "Compatible", provider: "fixture", runtimeProfile: balancedProfile({ currentModel: "fixture-frontier", currentEffort: "fixture-high" }), freshTaskId: task.id });
   assert.equal(store.claimNextAssignment(compatible.id).id, reassignedWork.id);
 });
 
 test("a gated queue head does not hide a later compatible assignment", async (t) => {
   const { store, task } = await fixture(t);
-  const planner = store.connectAgent({ name: "Planner", provider: "fixture" });
+  const planner = store.connectAgent({ name: "Planner", provider: "fixture", freshTaskId: task.id });
   const plan = store.claimNextAssignment(planner.id);
-  store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+  await store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
   const gated = store.createAssignment({
     taskId: task.id,
     title: "Secure migration",
@@ -198,10 +198,10 @@ test("a gated queue head does not hide a later compatible assignment", async (t)
     description: "Edit one paragraph.",
     role: "implementer",
   });
-  const agent = store.connectAgent({ name: "Balanced worker", provider: "fixture", runtimeProfile: balancedProfile() });
+  const agent = store.connectAgent({ name: "Balanced worker", provider: "fixture", runtimeProfile: balancedProfile(), freshTaskId: task.id });
   const claim = store.claimNextAssignment(agent.id);
   assert.equal(claim.id, compatible.id, "the scan continues past the first runtime gate");
-  store.completeAssignment({ agentId: agent.id, assignmentId: claim.id, claimToken: claim.claimToken, message: "Docs done." });
+  await store.completeAssignment({ agentId: agent.id, assignmentId: claim.id, claimToken: claim.claimToken, message: "Docs done." });
   const remainingGate = store.claimNextAssignment(agent.id);
   assert.equal(remainingGate.assignment.id, gated.id);
   assert.equal(remainingGate.alreadyRecommended, false, "a scanned gate is surfaced only after compatible work is exhausted");
@@ -234,23 +234,23 @@ test("assignment and task evidence changes invalidate assessments; exceptional d
   assert.notEqual(second.id, first.id);
   assert.ok(store.db.prepare("SELECT invalidated_at FROM complexity_assessments WHERE id = ?").get(first.id).invalidated_at);
   const exceptional = store.setAssignmentComplexityOverride({ assignmentId: assignment.id, override: { level: "exceptional" } });
-  const agent = store.connectAgent({ name: "Exceptional", provider: "fixture", runtimeProfile: balancedProfile({ currentModel: "fixture-frontier", currentEffort: "fixture-max" }) });
+  const agent = store.connectAgent({ name: "Exceptional", provider: "fixture", runtimeProfile: balancedProfile({ currentModel: "fixture-frontier", currentEffort: "fixture-max" }), freshTaskId: task.id });
   assert.throws(() => store.runtimeDecision({ agentId: agent.id, assignmentId: assignment.id, assessmentId: exceptional.id, choice: "switched" }), /human approval/i);
   assert.equal(store.runtimeDecision({ agentId: agent.id, assignmentId: assignment.id, assessmentId: exceptional.id, choice: "switched", actor: "human", humanApproved: true }).humanApproved, true);
 });
 
 test("a prior switched decision does not bypass the gate after the advertised runtime is downgraded", async (t) => {
   const { store, task } = await fixture(t);
-  const planner = store.connectAgent({ name: "Planner", provider: "fixture" });
+  const planner = store.connectAgent({ name: "Planner", provider: "fixture", freshTaskId: task.id });
   const plan = store.claimNextAssignment(planner.id);
-  store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+  await store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
   const work = store.createAssignment({
     taskId: task.id,
     title: "Protect credentials",
     description: "Implement authentication and schema migration safety.",
     role: "implementer",
   });
-  const agent = store.connectAgent({ name: "Switch then downgrade", provider: "fixture", runtimeProfile: balancedProfile() });
+  const agent = store.connectAgent({ name: "Switch then downgrade", provider: "fixture", runtimeProfile: balancedProfile(), freshTaskId: task.id });
   const gate = store.claimNextAssignment(agent.id);
   store.updateRuntimeProfile({ agentId: agent.id, profile: balancedProfile({ currentModel: "fixture-frontier", currentEffort: "fixture-high" }) });
   store.runtimeDecision({ agentId: agent.id, assignmentId: work.id, assessmentId: gate.assessment.id, choice: "switched" });
@@ -261,8 +261,8 @@ test("a prior switched decision does not bypass the gate after the advertised ru
 });
 
 test("runtime schema and decisions survive a restart without manufacturing disconnected profiles", async (t) => {
-  const { store, dataDir } = await fixture(t);
-  const agent = store.connectAgent({ name: "Restart", provider: "fixture", runtimeProfile: balancedProfile() });
+  const { store, dataDir, task } = await fixture(t);
+  const agent = store.connectAgent({ name: "Restart", provider: "fixture", runtimeProfile: balancedProfile(), freshTaskId: task.id });
   const assignment = store.db.prepare("SELECT id FROM assignments LIMIT 1").get();
   const assessment = store.assignmentAssessment({ assignmentId: assignment.id });
   store.runtimeDecision({ agentId: agent.id, assignmentId: assignment.id, assessmentId: assessment.id, choice: "continue" });
@@ -304,9 +304,9 @@ async function baseProfileFixture(t, baseRuntimeProfile) {
   const context = await fixture(t);
   const { store, task } = context;
   store.updateTask(task.id, { baseRuntimeProfile });
-  const agent = store.connectAgent({ name: "Unprofiled", provider: "fixture" });
+  const agent = store.connectAgent({ name: "Unprofiled", provider: "fixture", freshTaskId: task.id });
   const plan = store.claimNextAssignment(agent.id);
-  store.completeAssignment({ agentId: agent.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+  await store.completeAssignment({ agentId: agent.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
   const demanding = store.createAssignment({
     taskId: task.id,
     title: "Rotate credentials",
@@ -317,7 +317,7 @@ async function baseProfileFixture(t, baseRuntimeProfile) {
 }
 
 test("a task base runtime profile gates a session that advertises nothing, and never outranks a live profile", async (t) => {
-  const { store, agent, demanding } = await baseProfileFixture(t, balancedProfile({ source: "user" }));
+  const { store, task, agent, demanding } = await baseProfileFixture(t, balancedProfile({ source: "user" }));
   const gate = store.claimNextAssignment(agent.id);
   assert.equal(gate.runtimeActionRequired, true, "the base profile makes the gate active for a session that advertises nothing");
   assert.equal(gate.assignment.id, demanding.id);
@@ -329,6 +329,7 @@ test("a task base runtime profile gates a session that advertises nothing, and n
     name: "Profiled",
     provider: "fixture",
     runtimeProfile: balancedProfile({ currentModel: "fixture-frontier", currentEffort: "fixture-high" }),
+    freshTaskId: task.id,
   });
   const claim = store.claimNextAssignment(profiled.id);
   assert.equal(claim.id, demanding.id, "a sufficient live profile satisfies the requirement");

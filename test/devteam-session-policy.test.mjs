@@ -38,7 +38,7 @@ test("per-task policy recommends one fresh profiled session but not rotation bet
   const fresh = store.connectAgent({ name: "Fresh", provider: "fixture", runtimeProfile: profile, freshTaskId: task.id, sessionGeneration: 3 });
   assert.equal(store.sessionRotationRecommendation(fresh.id), null);
   const first = store.claimNextAssignment(fresh.id);
-  store.completeAssignment({ agentId: fresh.id, assignmentId: first.id, claimToken: first.claimToken, message: "Plan done." });
+  await store.completeAssignment({ agentId: fresh.id, assignmentId: first.id, claimToken: first.claimToken, message: "Plan done." });
   store.createAssignment({ taskId: task.id, title: "Related work", description: "Small implementation.", role: "implementer" });
   assert.equal(store.sessionRotationRecommendation(fresh.id), null, "related assignments stay in the task session");
 
@@ -62,13 +62,13 @@ test("per-assignment policy honors a fresh session or one explicit continuation,
   const agent = store.connectAgent({ name: "Fresh", provider: "fixture", runtimeProfile: profile, freshTaskId: task.id });
   assert.equal(store.sessionRotationRecommendation(agent.id), null, "the task-specific fresh session can claim its first assignment");
   const first = store.claimNextAssignment(agent.id);
-  store.completeAssignment({ agentId: agent.id, assignmentId: first.id, claimToken: first.claimToken, message: "First assignment done." });
+  await store.completeAssignment({ agentId: agent.id, assignmentId: first.id, claimToken: first.claimToken, message: "First assignment done." });
   store.createAssignment({ taskId: task.id, title: "Second", description: "Second assignment.", role: "implementer" });
   assert.equal(store.sessionRotationRecommendation(agent.id).status, "session_rotation_recommended");
   store.continueCurrentSession({ agentId: agent.id, taskId: task.id });
   assert.equal(store.sessionRotationRecommendation(agent.id), null, "the explicit continuation is honored once");
   const second = store.claimNextAssignment(agent.id);
-  store.completeAssignment({ agentId: agent.id, assignmentId: second.id, claimToken: second.claimToken, message: "Second assignment done." });
+  await store.completeAssignment({ agentId: agent.id, assignmentId: second.id, claimToken: second.claimToken, message: "Second assignment done." });
   store.createAssignment({ taskId: task.id, title: "Third", description: "Third assignment.", role: "implementer" });
   assert.equal(store.sessionRotationRecommendation(agent.id).status, "session_rotation_recommended", "the next boundary recommends rotation again");
 });
