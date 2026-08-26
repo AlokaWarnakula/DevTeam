@@ -398,6 +398,12 @@ export function runVerifiedCheck({ argv, cwd, timeoutMs = DEFAULT_CHECK_TIMEOUT_
     if (!runtime) {
       return unavailable(`This project runs checks in a container, and no container runtime (${CONTAINER_RUNTIMES.join(" or ")}) is available on this host. "${program}" was not run — DevTeam will not fall back to running it unconfined.`);
     }
+    // `--mount` fields are comma-separated, so a comma in the project path would end the source
+    // early and mount something other than what was asked for. Refusing is the only safe answer:
+    // a half-parsed mount spec is how a sandbox ends up exposing a different directory.
+    if (String(cwd).includes(",")) {
+      return unavailable(`This project runs checks in a container, and its path contains a comma, which cannot be expressed as a bind mount. Move the project somewhere without one. "${program}" was not run.`);
+    }
     const command = containerRunCommand({ runtime, argv, cwd, container });
     return spawnCheck({ executable: command.executable, args: command.args, cwd, timeoutMs, env: scrubbedEnvironment() })
       .then((result) => gradeContainerResult(result, { runtime, program }));
