@@ -40,6 +40,15 @@
         <div class="header-actions"><span id="task-version" class="version">v1</span><button id="open-task-brief" class="secondary hidden" type="button" data-dialog="task-brief-dialog" aria-haspopup="dialog">Task brief</button><button id="copy-task-invite" class="secondary" title="Copy a task-specific agent prompt">Invite agent</button><button id="edit-task-runtime" class="secondary hidden" type="button" title="Set the real model and effort options normally used for this task">Task runtime</button><button id="edit-task" class="secondary hidden" type="button" title="Edit this task's title, description, or approvals">Edit task</button><button class="secondary" data-dialog="task-dialog">New task</button><button id="toggle-team" class="panel-toggle" type="button" aria-label="Toggle team panel" aria-expanded="true" aria-controls="team-panel" title="Toggle team panel">◧</button></div>
       </header>
 
+      <section id="blocked-banner" class="blocked-banner hidden" role="status">
+        <div class="blocked-banner-text">
+          <strong>Task blocked — only you can resume it</strong>
+          <p id="blocked-reason"></p>
+          <small id="blocked-meta"></small>
+        </div>
+        <button id="resume-task" class="primary" type="button">Resume task</button>
+      </section>
+
       <section id="empty-state" class="empty-state">
         <div class="orb"><span>⌁</span></div>
         <h2>Your team room is ready</h2>
@@ -155,6 +164,17 @@
       <label>Independent approvals<select name="requiredApprovals"><option value="2">2 reviewers (recommended)</option><option value="1">1 reviewer</option><option value="3">3 reviewers</option></select></label>
       <label>Session policy<select name="sessionPolicy"><option value="per_task" selected>Fresh session per task (recommended)</option><option value="adaptive">Adaptive</option><option value="manual">Manual</option><option value="per_assignment">Per assignment (experimental)</option></select></label>
       <div class="dialog-actions"><button type="button" class="secondary close">Cancel</button><button class="primary" value="submit">Start task</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="resume-dialog">
+    <form id="resume-form" method="dialog">
+      <div class="dialog-head"><div><span class="eyebrow">RESUME</span><h2>Resume this blocked task</h2></div><button type="button" class="close" aria-label="Cancel">×</button></div>
+      <p class="hint" id="resume-context"></p>
+      <label>Why is it ready to resume?<textarea name="reason" rows="3" maxlength="600" placeholder="Review is finished and approved — reopening to record formal closure." required></textarea></label>
+      <label>Send the fresh plan to<select name="targetAgentName" id="resume-target"><option value="">Whoever is available</option></select></label>
+      <p class="hint">Resuming reopens the task at the next version and queues one planning assignment. Approvals recorded against the current version are cleared, so review is collected again.</p>
+      <div class="dialog-actions"><button type="button" class="secondary close">Cancel</button><button class="primary" value="submit">Resume task</button></div>
     </form>
   </dialog>
 

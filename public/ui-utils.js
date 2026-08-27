@@ -129,3 +129,21 @@ export function unreadTimelineCount(events = [], lastReadId = 0) {
   const marker = Number(lastReadId) || 0;
   return events.filter((event) => event.agent_id && Number(event.id) > marker).length;
 }
+
+// The banner copy for a blocked task. Kept out of the DOM code so the one sentence a stuck human
+// reads is testable: this is the wording that replaces a Resume button buried ~4,800px down the
+// team panel, where it went unfound for a whole session.
+export function blockedBannerCopy(recovery = null) {
+  if (!recovery) return null;
+  const reason = String(recovery.reason || "").trim();
+  const who = recovery.blockedBy ? `Blocked by ${recovery.blockedBy}` : "Blocked";
+  const stranded = Number(recovery.strandedAssignments) || 0;
+  const parts = [who];
+  if (stranded) parts.push(`${stranded} assignment${stranded === 1 ? "" : "s"} stopped mid-flight`);
+  parts.push(`v${recovery.version}`);
+  return {
+    reason: reason || "No reason was recorded.",
+    meta: `${parts.join(" · ")} — agents cannot lift this; resuming reopens the task at v${Number(recovery.version) + 1} and clears its approvals.`,
+    targets: Array.isArray(recovery.resumableBy) ? recovery.resumableBy : [],
+  };
+}

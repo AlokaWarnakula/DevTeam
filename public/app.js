@@ -1,4 +1,4 @@
-import { escapeHtml, eventMatchesTimelineFilter, renderSafeMarkdown, unreadTimelineCount } from "/ui-utils.js";
+import { blockedBannerCopy, escapeHtml, eventMatchesTimelineFilter, renderSafeMarkdown, unreadTimelineCount } from "/ui-utils.js";
 
 const $ = (selector) => document.querySelector(selector);
 const time = (stamp) => new Intl.DateTimeFormat([], { hour: "numeric", minute: "2-digit" }).format(new Date(stamp));
@@ -268,6 +268,7 @@ function render() {
   $("#edit-task").classList.toggle("hidden", !task || task.status === "cancelled");
   $("#block-task").classList.toggle("hidden", !task || ["accepted", "blocked", "cancelled"].includes(task.status));
   $("#unblock-task").classList.toggle("hidden", !task || task.status !== "blocked");
+  renderBlockedBanner(task);
   if (task) renderTask(task);
   else document.title = "DevTeam — Local AI collaboration";
   renderAgents();
@@ -414,6 +415,19 @@ function renderMessageAttachment(attachment) {
     : `<span class="attachment-type">PDF</span>`;
   const open = localPreview ? `<a href="${escapeHtml(previewUrl)}" target="_blank" rel="noopener">Open</a>` : "";
   return `<div class="message-attachment">${image}<div><strong>${escapeHtml(attachment.name)}</strong><code title="${escapeHtml(attachment.path)}">${escapeHtml(attachment.path)}</code>${open}</div></div>`;
+}
+
+// The Resume control used to live only at the foot of the team panel, below the roster, the whole
+// work queue, the knowledge vault and consensus — on a busy task roughly 4,800px down a scrolling
+// panel. A human looking for it found more assignment cards and concluded DevTeam could not reopen
+// the task at all. The banner puts the same action where the eye already is.
+function renderBlockedBanner(task) {
+  const banner = $("#blocked-banner");
+  const copy = task ? blockedBannerCopy(task.blockedRecovery) : null;
+  banner.classList.toggle("hidden", !copy);
+  if (!copy) return;
+  $("#blocked-reason").textContent = copy.reason;
+  $("#blocked-meta").textContent = copy.meta;
 }
 
 function renderTask(task) {
@@ -1528,9 +1542,35 @@ $("#accept-task").addEventListener("click", async () => {
   try { await api(`/api/tasks/${selectedTaskId}/accept`, { method: "POST", body: JSON.stringify({ summary: summary || "Human accepted from dashboard" }) }); await refresh(); toast("Task accepted"); } catch (error) { toast(error.message); }
 });
 
-$("#unblock-task").addEventListener("click", async () => {
-  const reason = prompt("Why is the task ready to resume?"); if (!reason) return;
-  try { await api(`/api/tasks/${selectedTaskId}/unblock`, { method: "POST", body: JSON.stringify({ reason }) }); await refresh(); toast("Task unblocked — agents can resume"); } catch (error) { toast(error.message); }
+// Both the banner button and the old team-panel link open the same dialog. A plain prompt() could
+// not offer the target list, and routing the replan to one agent by name is the whole reason the
+// dialog exists: dropping it back into the open queue is how the work reached the wrong agent.
+function openResumeDialog() {
+  const task = state.selectedTask;
+  const copy = task ? blockedBannerCopy(task.blockedRecovery) : null;
+  if (!copy) { toast("This task is not blocked"); return; }
+  $("#resume-context").textContent = `"${task.title}" was blocked: ${copy.reason}`;
+  $("#resume-target").innerHTML = `<option value="">Whoever is available</option>`
+    + copy.targets.map((name) => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join("");
+  $("#resume-dialog").showModal();
+}
+
+$("#unblock-task").addEventListener("click", openResumeDialog);
+$("#resume-task").addEventListener("click", openResumeDialog);
+
+$("#resume-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const values = Object.fromEntries(new FormData(event.target));
+  try {
+    const result = await api(`/api/tasks/${selectedTaskId}/unblock`, {
+      method: "POST",
+      body: JSON.stringify({ reason: values.reason, targetAgentName: values.targetAgentName || null }),
+    });
+    event.target.reset(); event.target.closest("dialog").close(); await refresh();
+    toast(result.targetAgentName
+      ? `Resumed at v${result.version} — replan addressed to ${result.targetAgentName}`
+      : `Resumed at v${result.version} — the team can plan again`);
+  } catch (error) { toast(error.message); }
 });
 
 $("#block-task").addEventListener("click", async () => {

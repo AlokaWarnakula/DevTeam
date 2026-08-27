@@ -1251,7 +1251,7 @@ export class DevTeamStore extends EventEmitter {
     const task = this.getTask(taskId);
     if (!task) throw new Error("Task not found.");
     this.assertMembership(agentId, taskId);
-    if (["accepted", "blocked", "cancelled"].includes(task.status)) throw new Error(`Task is already ${task.status}.`);
+    if (["accepted", "blocked", "cancelled"].includes(task.status)) throw new Error(this.closedTaskError(task, "open a proposal on it"));
     if (!DevTeamStore.PROPOSAL_KINDS.includes(kind)) throw new Error(`Unknown proposal kind: ${kind}.`);
     const proposer = agentId ? this.getAgent(agentId) : null;
     const proposerName = proposer ? proposer.name : "You";
@@ -2952,7 +2952,7 @@ export class DevTeamStore extends EventEmitter {
   createAssignment({ agentId = null, taskId, title, description, role = "implementer", requiresWrite = false, targetAgentName = null, checklist = undefined, paths = undefined, dependsOn = undefined }) {
     const task = this.getTask(taskId);
     if (!task) throw new Error("Task not found.");
-    if (["accepted", "blocked", "cancelled"].includes(task.status)) throw new Error(`Task is already ${task.status}.`);
+    if (["accepted", "blocked", "cancelled"].includes(task.status)) throw new Error(this.closedTaskError(task, "create an assignment on it"));
     if (agentId) { this.getAgent(agentId); this.assertMembership(agentId, taskId); }
     const assignment = {
       id: randomUUID(), taskId, title: title.trim(), description: description.trim(), role: role.trim(),
@@ -3510,10 +3510,15 @@ export class DevTeamStore extends EventEmitter {
     // An agent in no room sees an empty board even when the server is busy. Without this the answer
     // to "why is there nothing for me?" is an empty list, which reads as "the team has no work".
     const roomStatus = rooms.length ? null : this.roomStatusForAgent(agentId);
+    // A blocked room has no queued rows at all, so the honest answer to "why is there nothing for
+    // me?" used to be an empty list — indistinguishable from a finished team. Name the block and who
+    // can lift it, or the agent starts inventing workarounds for it.
+    const blockedRooms = rooms.map((room) => this.blockedRecovery(room)).filter(Boolean);
     return {
       agentId,
       agentName: agent.name,
       rooms,
+      ...(blockedRooms.length ? { blockedRooms, next: blockedRooms[0].agentAction } : {}),
       ...(roomStatus && roomStatus.activeTasks.length
         ? {
             membershipRequired: true,
@@ -5149,35 +5154,100 @@ export class DevTeamStore extends EventEmitter {
     return { blocked: true, taskId, reason: reason.trim() };
   }
 
-  unblockTask({ taskId, reason }) {
+  // A blocked task is the one dead end that genuinely needs the human: no MCP tool can reopen it.
+  // Nothing used to say so, so agents inferred the capability was missing from DevTeam entirely and
+  // advised deleting and recreating the task — losing its whole ledger to work around a button they
+  // could not see. The dashboard banner and every agent-facing surface read this one descriptor, so
+  // the way out is stated in the same words wherever someone hits the wall.
+  blockedRecovery(taskId) {
+    const task = this.getTask(taskId);
+    if (!task || task.status !== "blocked") return null;
+    const blockEvent = this.db.prepare(`
+      SELECT message, created_at, author_name, author_kind FROM events
+      WHERE task_id = ? AND type = 'task.blocked' ORDER BY id DESC LIMIT 1
+    `).get(taskId);
+    const strandedWork = this.db.prepare(`
+      SELECT COUNT(*) AS count FROM assignments WHERE task_id = ? AND status = 'blocked'
+    `).get(taskId).count;
+    return {
+      taskId,
+      taskTitle: task.title,
+      version: task.version,
+      reason: blockEvent?.message || null,
+      blockedBy: blockEvent?.author_kind === "human" ? "the human" : (blockEvent?.author_name || null),
+      blockedAt: blockEvent?.created_at || null,
+      strandedAssignments: Number(strandedWork),
+      resumableBy: this.taskMemberNames(taskId),
+      humanAction: 'Resume this task from the DevTeam dashboard — the "Task blocked" banner at the top of the task, or the "Resume blocked task" button at the foot of the team panel. Resuming reopens the task at the next version and queues one fresh planning assignment; name an agent to send that plan straight to them.',
+      agentAction: "Only the human can resume a blocked task; no MCP tool can. Say which task needs resuming and why, then stop and wait. Do not delete and recreate the task, do not open a duplicate for the same work, and do not approve or accept anything to route around the block.",
+    };
+  }
+
+  // The error an agent hits when it tries to work around a block — filing a fresh assignment, a
+  // proposal, a continuation. A bare "Task is already blocked." is what sent one agent looking for a
+  // capability that exists, so the refusal names the one move that works instead.
+  closedTaskError(task, action) {
+    if (task.status !== "blocked") return `Task is already ${task.status}.`;
+    return `Task "${task.title}" is blocked, so you cannot ${action}. Only the human can resume it, from the DevTeam dashboard — no MCP tool can, and this is not a missing feature to route around. Ask them to resume this task and say why; do not delete and recreate it, and do not open a duplicate task for the same work.`;
+  }
+
+  blockedRoomsForAgent(agentId) {
+    return this.#memberTaskIds(agentId).map((room) => this.blockedRecovery(room)).filter(Boolean);
+  }
+
+  taskMemberNames(taskId) {
+    return this.db.prepare(`
+      SELECT ag.name FROM task_members m JOIN agents ag ON ag.id = m.agent_id
+      WHERE m.task_id = ? ORDER BY m.joined_at ASC
+    `).all(taskId).map((row) => row.name);
+  }
+
+  // Resuming with a target answers the case that produced this feature: the review had to go back to
+  // one specific agent, and dropping the fresh plan into the open queue is how it went to the wrong
+  // one in the first place. An unmatched name is refused rather than stored, since the scheduler
+  // matches targets by name and a typo would strand the plan nobody can claim.
+  unblockTask({ taskId, reason, targetAgentName = null }) {
     const task = this.getTask(taskId);
     if (!task) throw new Error("Task not found.");
     if (task.status !== "blocked") throw new Error("Only a blocked task can be resumed.");
     const cleanReason = String(reason || "").trim();
     if (!cleanReason) throw new Error("A resume reason is required.");
+    const requestedTarget = String(targetAgentName || "").trim();
+    let target = null;
+    if (requestedTarget) {
+      target = this.db.prepare("SELECT name FROM agents WHERE lower(name) = lower(?)").get(requestedTarget)?.name || null;
+      if (!target) {
+        const known = this.db.prepare("SELECT name FROM agents ORDER BY name ASC").all().map((row) => row.name);
+        throw new Error(`No agent named "${requestedTarget}" is known to DevTeam.${known.length ? ` Known agents: ${known.join(", ")}.` : ""}`);
+      }
+    }
     const stamp = now();
     const assignmentId = randomUUID();
     const planningRoleName = this.planningRoleFor(task.project_id);
+    const routing = target
+      ? ` This plan is addressed to ${target}: route the work it creates to ${target} unless the project state makes that impossible, and say so if it does.`
+      : "";
     let version;
     this.#transaction(() => {
       this.db.prepare("UPDATE tasks SET status = 'planning', version = version + 1, updated_at = ? WHERE id = ?")
         .run(stamp, taskId);
       this.db.prepare("DELETE FROM approvals WHERE task_id = ?").run(taskId);
       this.db.prepare(`
-        INSERT INTO assignments (id, task_id, title, description, role, requires_write, status, created_at, plans)
-        VALUES (?, ?, 'Plan resumed task', ?, ?, 0, 'queued', ?, 1)
-      `).run(assignmentId, taskId, `The human resumed this blocked task: ${cleanReason}. Inspect the current project state and create fresh implementation and review assignments; do not revive stale claims.`, planningRoleName, stamp);
+        INSERT INTO assignments (id, task_id, title, description, role, requires_write, target_agent_name, status, created_at, plans)
+        VALUES (?, ?, 'Plan resumed task', ?, ?, 0, ?, 'queued', ?, 1)
+      `).run(assignmentId, taskId, `The human resumed this blocked task: ${cleanReason}. Inspect the current project state and create fresh implementation and review assignments; do not revive stale claims.${routing}`, planningRoleName, target, stamp);
       version = this.db.prepare("SELECT version FROM tasks WHERE id = ?").get(taskId).version;
-      this.#event(taskId, null, "task.unblocked", `Human resumed the task: ${cleanReason}`, { reason: cleanReason, version });
+      this.#event(taskId, null, "task.unblocked", `Human resumed the task: ${cleanReason}`, { reason: cleanReason, version, targetAgentName: target });
       this.#event(taskId, null, "assignment.created", "Plan resumed task", {
         assignmentId,
         role: planningRoleName,
         requiresWrite: false,
+        targetAgentName: target,
         resumed: true,
       });
     });
     this.#changed("task.unblocked", taskId);
-    return { resumed: true, taskId, assignmentId, version, status: "planning" };
+    return { resumed: true, taskId, assignmentId, version, status: "planning", targetAgentName: target };
   }
 
   acceptTaskByHuman({ taskId, summary }) {
@@ -5248,7 +5318,7 @@ export class DevTeamStore extends EventEmitter {
     if (byAgentId) this.assertMembership(byAgentId, taskId);
     const task = this.getTask(taskId);
     if (!task) throw new Error("Task not found.");
-    if (["blocked", "cancelled"].includes(task.status)) throw new Error(`Task is ${task.status}; unblock it before continuing.`);
+    if (["blocked", "cancelled"].includes(task.status)) throw new Error(this.closedTaskError(task, "continue it"));
     const cleanMessage = String(message || "").trim();
     if (!cleanMessage) throw new Error("A continuation message is required.");
     const normalized = String(target || "all").trim() || "all";
@@ -5598,6 +5668,7 @@ export class DevTeamStore extends EventEmitter {
     const sessionCheckpoints = this.sessionCheckpointsForTask(taskId);
     return {
       ...task, assignments, approvals, events, proposals, blackboard, projectBlackboard, knowledge, members, sessionCheckpoints, roleCatalogue,
+      blockedRecovery: this.blockedRecovery(taskId),
       regressions: this.openRegressions(taskId), checkBaseline: this.checkBaseline(taskId),
       reliability: this.teamReliability(), budget: this.taskBudgetState(taskId), usage: this.taskUsage(taskId),
       // What this server has been running for the task, including anything a restart cut short.

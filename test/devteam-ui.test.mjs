@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { eventMatchesTimelineFilter, renderSafeMarkdown, timelineCategory, unreadTimelineCount } from "../public/ui-utils.js";
+import { blockedBannerCopy, eventMatchesTimelineFilter, renderSafeMarkdown, timelineCategory, unreadTimelineCount } from "../public/ui-utils.js";
 
 test("safe timeline Markdown preserves useful structure without allowing scriptable markup", () => {
   const rendered = renderSafeMarkdown(`# Plan\n\n- item\n- [x] done\n\n\`inline\` and **bold**\n\n[docs](https://example.com/path)\n\n\`\`\`js\nalert('text only')\n\`\`\`\n<img src=x onerror=alert(1)>\n[bad](javascript:alert(1))`);
@@ -41,4 +41,27 @@ test("unread counts include only newer agent-authored events", () => {
   assert.equal(unreadTimelineCount(events, 10), 1);
   assert.equal(unreadTimelineCount(events, 0), 2);
   assert.equal(unreadTimelineCount(events, 12), 0);
+});
+
+test("the blocked banner states the reason, the cost of resuming, and who can take the replan", () => {
+  const copy = blockedBannerCopy({
+    version: 2,
+    reason: "Review was misrouted to its own author.",
+    blockedBy: "Codex",
+    strandedAssignments: 3,
+    resumableBy: ["Codex", "Claude"],
+  });
+  assert.match(copy.reason, /misrouted/);
+  assert.match(copy.meta, /Blocked by Codex/);
+  assert.match(copy.meta, /3 assignments stopped mid-flight/);
+  assert.match(copy.meta, /agents cannot lift this/);
+  assert.match(copy.meta, /reopens the task at v3 and clears its approvals/);
+  assert.deepEqual(copy.targets, ["Codex", "Claude"]);
+
+  const sparse = blockedBannerCopy({ version: 1, strandedAssignments: 1 });
+  assert.equal(sparse.reason, "No reason was recorded.");
+  assert.match(sparse.meta, /^Blocked · 1 assignment stopped mid-flight · v1/);
+  assert.deepEqual(sparse.targets, []);
+
+  assert.equal(blockedBannerCopy(null), null, "an unblocked task renders no banner");
 });

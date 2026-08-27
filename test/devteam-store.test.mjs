@@ -755,6 +755,88 @@ test("a human can safely resume a blocked task with a fresh version and planner"
   assert.throws(() => store.unblockTask({ taskId: task.id, reason: "Again" }), /Only a blocked task/);
 });
 
+test("a blocked task states its own recovery path everywhere an agent or human can hit it", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-blocked-recovery-"));
+  const store = new DevTeamStore(dataDir);
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Recovery", process.cwd());
+  const task = store.createTask({ projectId: project.id, title: "Review the limiter", description: "Needs an independent review." });
+  const author = store.connectAgent({ name: "Codex", provider: "OpenAI", freshTaskId: task.id });
+  const reviewer = store.connectAgent({ name: "Claude", provider: "Anthropic", freshTaskId: task.id });
+  store.joinTask(reviewer.id, task.id, "contributor");
+  store.blockTask({ agentId: author.id, taskId: task.id, reason: "Review was misrouted to its own author." });
+
+  const recovery = store.blockedRecovery(task.id);
+  assert.equal(recovery.taskId, task.id);
+  assert.equal(recovery.reason, "Review was misrouted to its own author.");
+  assert.equal(recovery.blockedBy, "Codex");
+  assert.ok(recovery.strandedAssignments >= 1, "the planner assignment the block closed is counted");
+  assert.deepEqual(new Set(recovery.resumableBy), new Set(["Codex", "Claude"]));
+  assert.match(recovery.humanAction, /Resume/);
+  assert.match(recovery.agentAction, /Only the human can resume/);
+  assert.match(recovery.agentAction, /do not delete and recreate/i);
+
+  // The dashboard and devteam_state read the same descriptor.
+  assert.deepEqual(store.taskDetail(task.id).blockedRecovery, recovery);
+
+  // An idle agent asking why the board is empty is told about the block, not handed an empty list.
+  const explained = store.whyNoClaimableWork(reviewer.id);
+  assert.equal(explained.queuedCount, 0);
+  assert.equal(explained.blockedRooms.length, 1);
+  assert.equal(explained.blockedRooms[0].taskId, task.id);
+  assert.match(explained.next, /Only the human can resume/);
+  assert.equal(store.blockedRoomsForAgent(reviewer.id).length, 1);
+
+  // Every route an agent might take to work around the block names the one move that works.
+  assert.throws(
+    () => store.createAssignment({ agentId: reviewer.id, taskId: task.id, title: "Replacement review", description: "Route around the block." }),
+    /Only the human can resume it.*do not open a duplicate task/s,
+  );
+  assert.throws(
+    () => store.createProposal({ agentId: reviewer.id, taskId: task.id, kind: "plan", summary: "Recreate the task" }),
+    /Only the human can resume it/,
+  );
+  assert.throws(
+    () => store.continueTask({ taskId: task.id, message: "carry on" }),
+    /Only the human can resume it/,
+  );
+
+  // A healthy task carries no recovery block, and closed-for-other-reasons keeps its old wording.
+  const other = store.createTask({ projectId: project.id, title: "Healthy", description: "Nothing wrong here." });
+  assert.equal(store.blockedRecovery(other.id), null);
+  assert.equal(store.taskDetail(other.id).blockedRecovery, null);
+  assert.equal(store.closedTaskError({ status: "cancelled", title: "x" }, "continue it"), "Task is already cancelled.");
+});
+
+test("resuming a blocked task can address the fresh plan to one named agent", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-targeted-resume-"));
+  const store = new DevTeamStore(dataDir);
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Routing", process.cwd());
+  const task = store.createTask({ projectId: project.id, title: "Route me back", description: "Review must return to Claude." });
+  const codex = store.connectAgent({ name: "Codex", provider: "OpenAI", freshTaskId: task.id });
+  const claude = store.connectAgent({ name: "Claude", provider: "Anthropic", freshTaskId: task.id });
+  store.joinTask(claude.id, task.id, "contributor");
+  store.blockTask({ taskId: task.id, reason: "Claim stuck with the author." });
+
+  assert.throws(
+    () => store.unblockTask({ taskId: task.id, reason: "Reopen", targetAgentName: "Claud" }),
+    /No agent named "Claud" is known/,
+  );
+  assert.equal(store.getTask(task.id).status, "blocked", "a bad target must not half-resume the task");
+
+  // Case-insensitive, and the stored target is the agent's canonical name.
+  const resumed = store.unblockTask({ taskId: task.id, reason: "Review is done; record closure.", targetAgentName: "claude" });
+  assert.equal(resumed.targetAgentName, "Claude");
+  const plan = store.taskDetail(task.id).assignments.find((item) => item.id === resumed.assignmentId);
+  assert.equal(plan.target_agent_name, "Claude");
+  assert.match(plan.description, /addressed to Claude/);
+
+  // The scheduler honours the target: the untargeted agent may not take it, the named one may.
+  assert.equal(store.claimNextAssignment(codex.id), null);
+  assert.equal(store.claimNextAssignment(claude.id)?.id, resumed.assignmentId);
+});
+
 test("human acceptance requires finished review work and is labeled as an override", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-human-accept-"));
   const store = new DevTeamStore(dataDir);

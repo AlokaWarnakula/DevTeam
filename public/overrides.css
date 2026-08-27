@@ -1718,3 +1718,43 @@ body.resizing-panel { cursor: col-resize; user-select: none; }
   .search-scope { align-items: flex-start; flex-direction: column; }
 }
 .runtime-actions { flex-wrap: wrap; }
+
+/* ── Blocked-task banner ──
+   Sits directly under the sticky task header so the one action that can restart a stopped task is
+   the first thing on screen, not the last thing in the team panel. */
+.blocked-banner {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  margin: 0;
+  padding: 15px 34px;
+  border-bottom: 1px solid #4a2f2f;
+  background: linear-gradient(180deg, #241618, #1a1315);
+}
+.blocked-banner-text { flex: 1 1 auto; min-width: 0; }
+.blocked-banner strong {
+  display: block;
+  color: var(--red);
+  font-size: 13px;
+  letter-spacing: -0.1px;
+}
+.blocked-banner p {
+  margin: 5px 0 0;
+  color: #d6c3c3;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.blocked-banner small {
+  display: block;
+  margin-top: 6px;
+  color: #97848a;
+  font-size: 11px;
+  line-height: 1.45;
+}
+.blocked-banner .primary { flex: 0 0 auto; }
+
+@media (max-width: 720px) {
+  .blocked-banner { flex-wrap: wrap; padding: 13px 18px; gap: 11px; }
+  .blocked-banner .primary { width: 100%; text-align: center; }
+}

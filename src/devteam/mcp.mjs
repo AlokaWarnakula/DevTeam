@@ -196,10 +196,25 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
       await sleep(Math.min(750, Math.max(0, deadline - Date.now())));
     } while (Date.now() < deadline);
     const activity = store.teamActivityForAgent(agentId);
+    // A room the human blocked looks exactly like a finished one from here: no work, no busy
+    // teammates. Say which task is stopped and that only the human can restart it, so the idle
+    // answer cannot be read as "the team is done" or as licence to recreate the task elsewhere.
+    const blockedRooms = store.blockedRoomsForAgent(agentId);
+    if (blockedRooms.length && !activity.active) {
+      return {
+        status: "idle",
+        keepWaiting: false,
+        activity,
+        blockedRooms,
+        message: `Nothing is claimable because ${blockedRooms.length === 1 ? "this task is blocked" : "these tasks are blocked"}: ${blockedRooms.map((room) => `"${room.taskTitle}"${room.reason ? ` — ${room.reason}` : ""}`).join("; ")}.`,
+        next: blockedRooms[0].agentAction,
+      };
+    }
     return {
       status: "idle",
       keepWaiting: activity.active,
       activity,
+      ...(blockedRooms.length ? { blockedRooms } : {}),
       message: activity.active
         ? "No work for you yet, but the team is still active (work is in flight or teammates are busy). Call devteam_wait again to stay assembled. If you have been idle with no assignment or message for about five minutes straight, disconnect and tell the user to invoke $devteam again when there is new work."
         : "The room is quiet: no open assignments and no busy teammates. Disconnect to save the session; the user can reconnect this agent when new work is ready.",

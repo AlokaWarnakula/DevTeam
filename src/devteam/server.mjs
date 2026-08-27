@@ -556,7 +556,11 @@ export async function startDevTeamServer({
   });
   app.post("/api/tasks/:taskId/unblock", (req, res) => {
     requireFields(req.body, ["reason"]);
-    res.json(store.unblockTask({ taskId: req.params.taskId, reason: req.body.reason }));
+    res.json(store.unblockTask({
+      taskId: req.params.taskId,
+      reason: req.body.reason,
+      targetAgentName: req.body.targetAgentName || null,
+    }));
   });
   app.post("/api/tasks/:taskId/accept", (req, res) => {
     requireFields(req.body, ["summary"]);
