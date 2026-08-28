@@ -1,6 +1,6 @@
 # DevTeam v2 — the queue and the conversation
 
-**Status:** correctness and memory work shipped; the tool collapse (section 3) is not started.
+**Status:** correctness, memory and the tool collapse all shipped. Remaining: deleting the retired store internals (15), and the domain-neutral vocabulary.
 **Written:** 2026-08-28. Progress and what remains are in section 9.
 **Supersedes:** `ROADMAP.md` as the forward-looking document. ROADMAP is now history — all 20 of its
 items are done, and it describes how DevTeam got here, not where it goes.
@@ -317,9 +317,9 @@ New to this list:
 | Memory: 3x more of the vault per brief | **done** (see 12) |
 | Removal list from usage data | **ready to cut** (see 13) |
 | Architecture notes | **deliberately not automated** — hand-written (6.3) |
-| **Tool collapse 39 to 9** | **not started — the big one, and the whole point of "simpler"** |
+| **Tool collapse 39 to 9** | **done** (see 15) |
 | Domain-neutral vocabulary | not started |
-| `SKILL.md` rewrite | not started (follows the tool collapse) |
+| `SKILL.md` rewrite | **done** — 34,321 to 9,857 bytes |
 
 **Where this stands overall:** the correctness work is done — review is genuinely independent,
 `block` means one thing, and the memory is both protected and now fills its last empty category on
@@ -533,3 +533,47 @@ few hundred bytes and cost real context.
 17 KB to roughly 5 KB, and a `SKILL.md` written for nine verbs instead of thirty-nine should land
 near 8 KB rather than 34 KB. That is a **~40 KB saving on every session of every agent** — more than
 two entire briefs, recovered before the first assignment is claimed.
+
+---
+
+## 15. The barefoot cut, as built
+
+| | before | after |
+|---|---|---|
+| MCP tools | 39 | **9** |
+| Schema prose | 17,283 chars | **10,996** |
+| `SKILL.md` | 34,321 bytes | **9,857** |
+| **Session tax** | **~60 KB** | **~24 KB** |
+
+The nine: `join`, `next`, `plan`, `report`, `verdict`, `stuck`, `memory`, `message`, `leave`.
+
+Two of the merges changed behaviour rather than packaging. `verdict` makes the judgement a required
+field, where `approve` used to be the shortest schema and therefore the default — 264 completed
+assignments had produced two requests for changes. `stuck` requires a kind, and none of the kinds
+means "finished".
+
+Removed outright, every one with zero rows in 17 days across four projects: session checkpoints,
+managed launch, the runtime gate's two tools, spend accounting, regressions, reliability, split, and
+six of the ten memory tools.
+
+### What was deliberately left in the store
+
+Checkpoints (118 references), the runtime gate, and the budget cap still exist inside `store.mjs`.
+Nothing outside can reach them — no tool, no route, no dashboard control — so they cost zero tokens
+and cannot be invoked. They are not deleted because each one threads through a live path:
+`#participantLineage` follows claimed checkpoints, and the author-cannot-verify-own-work invariant
+depends on that lineage; the runtime gate sits inside candidate selection; the budget feeds the
+steering signal that carries "stop, this is no longer worth doing" to a busy agent.
+
+Deleting them is a mechanical cleanup that deserves its own pass with the property suite watching,
+not the tail end of a long session. An attempt during this one spliced the wrong lines twice and was
+reverted both times — which is the argument for doing it separately, made concrete.
+
+### What was kept despite zero rows
+
+- **Named access tokens.** Still reachable from the CLI, and the answer for reaching DevTeam from
+  anywhere but localhost. Zero rows means one token has been enough, not that the feature is dead.
+- **Verified checks.** `project_check_commands` is empty, which is why all 50 reported checks are
+  agent assertions DevTeam never ran. That is a missing `.devteam/checks.json`, not a dead feature —
+  and it is the difference between "the tests pass" and "an agent said the tests pass".
+- **Project-scoped memory.** One column's difference from task memory, and a real capability.
