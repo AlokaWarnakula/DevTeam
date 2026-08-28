@@ -256,6 +256,13 @@ function render() {
   const visibleTasks = selectedProjectId ? state.tasks.filter((item) => item.project_id === selectedProjectId) : state.tasks;
   $("#task-count").textContent = visibleTasks.length;
   $("#task-list").innerHTML = visibleTasks.map((item) => `<div class="nav-row"><button class="task-item ${task?.id === item.id ? "active" : ""}" data-task="${item.id}" title="Open task history"><span class="dot"></span><span>${escapeHtml(item.title)}<small>${escapeHtml(item.status)} · ${item.open_assignments} open</small></span></button><button class="row-delete" data-delete-task="${item.id}" title="Delete task history" aria-label="Delete task history for ${escapeHtml(item.title)}">×</button></div>`).join("") || `<p class="hint">No tasks yet</p>`;
+  // What a collapsed section still shows. Kept in step with the lists so the sidebar never hides
+  // which project and task you are looking at — that is the one thing it exists to tell you.
+  const currentProject = state.projects.find((project) => project.id === selectedProjectId);
+  $("#project-current").textContent = currentProject ? currentProject.name : "";
+  $("#task-current").innerHTML = task
+    ? `${escapeHtml(task.title)}<small>${escapeHtml(task.status)}</small>`
+    : "";
   $("#project-select").innerHTML = state.projects.map((project) => `<option value="${project.id}" ${project.id === selectedProjectId ? "selected" : ""}>${escapeHtml(project.name)}</option>`).join("");
 
   $("#empty-state").classList.toggle("hidden", Boolean(task));
@@ -1451,3 +1458,33 @@ async function boot() {
   } catch (error) { toast(error.message); }
 }
 boot();
+
+// Collapsing a nav section. The state is remembered per browser, and a collapsed section keeps
+// showing the selected project or task above the fold — see #project-current / #task-current.
+function applyNavCollapse(section, collapsed) {
+  const nav = document.querySelector(".sidebar nav");
+  if (!nav) return;
+  nav.classList.toggle(`${section}-collapsed`, collapsed);
+  const toggle = document.querySelector(`[data-collapse="${section}"]`);
+  if (toggle) {
+    toggle.setAttribute("aria-expanded", collapsed ? "false" : "true");
+    toggle.title = collapsed
+      ? `Expand ${section === "projects" ? "projects" : "task history"}`
+      : `Collapse ${section === "projects" ? "projects" : "task history"}`;
+  }
+  // A private convenience, so it is fine for this to be unavailable or to throw.
+  try { localStorage.setItem(`devteam.nav.${section}`, collapsed ? "collapsed" : "open"); } catch { /* ignore */ }
+}
+
+for (const section of ["projects", "tasks"]) {
+  let collapsed = false;
+  try { collapsed = localStorage.getItem(`devteam.nav.${section}`) === "collapsed"; } catch { collapsed = false; }
+  applyNavCollapse(section, collapsed);
+}
+
+document.addEventListener("click", (event) => {
+  const toggle = event.target.closest("[data-collapse]");
+  if (!toggle) return;
+  const section = toggle.dataset.collapse;
+  applyNavCollapse(section, toggle.getAttribute("aria-expanded") === "true");
+});

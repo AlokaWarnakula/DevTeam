@@ -16,9 +16,11 @@
       <button class="primary full" data-dialog="task-dialog"><span>＋</span> New task</button>
       <button id="open-search" class="secondary search-trigger" type="button" data-dialog="search-dialog"><span>⌕ Search workspace</span><kbd>Ctrl K</kbd></button>
       <nav>
-        <div class="section-label"><span>Projects</span><button class="icon-button" title="Add project" data-dialog="project-dialog">＋</button></div>
+        <div class="section-label"><button class="section-toggle" type="button" data-collapse="projects" aria-expanded="true" aria-controls="project-list" title="Collapse projects">▾</button><span>Projects</span><button class="icon-button" title="Add project" data-dialog="project-dialog">＋</button></div>
+        <div id="project-current" class="section-current"></div>
         <div id="project-list" class="project-list"></div>
-        <div class="section-label"><span>Task history</span><span id="task-count" class="count">0</span></div>
+        <div class="section-label"><button class="section-toggle" type="button" data-collapse="tasks" aria-expanded="true" aria-controls="task-list" title="Collapse task history">▾</button><span>Task history</span><span id="task-count" class="count">0</span></div>
+        <div id="task-current" class="section-current"></div>
         <div id="task-list" class="task-list"></div>
       </nav>
       <div class="local-card">
@@ -101,8 +103,6 @@
       <div id="regressions" class="regressions hidden"></div>
       <div id="assignment-list" class="assignment-list"></div>
       <div class="divider"></div>
-
-      </div>
       <div id="project-blackboard-section" class="blackboard-section hidden">
         <div class="panel-title"><h3>Project memory</h3><span id="project-blackboard-count" class="count">0</span></div>
         <p class="memory-scope">Shared by every DevTeam task in this project.</p>
