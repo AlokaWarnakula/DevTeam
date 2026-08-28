@@ -274,6 +274,19 @@ export const consensusMethods = {
     return new Set(members.map((member) => member.agent_id));
   },
 
+  // Who wrote the version under review — as *people*, not as sessions.
+  //
+  // An agent row is one connection. Reconnect and you are a new row with a new id, so a set of
+  // author ids stopped recognising the author the moment it went away and came back: DevTeam handed
+  // Claude a "fresh specification review" of code Claude had written twenty minutes earlier, in the
+  // previous session, with nothing in the payload saying so. The guarantee had not been removed,
+  // only quietly emptied — which is worse, because the verdict still reads as independent.
+  //
+  // So the author set is widened to every session that same participant has ever had here. Identity
+  // is the name and provider the participant connects under, which is what a human means by "Codex"
+  // or "Claude" and the only handle that survives a reconnect. Two genuinely different participants
+  // sharing one name and provider would be treated as one, and that is the right way to be wrong:
+  // it withholds a review, it never lets an author approve their own work.
   _currentVersionAuthors(taskId, version) {
     const authors = this.db.prepare(`
       SELECT agent_id, metadata FROM events
@@ -282,7 +295,18 @@ export const consensusMethods = {
       const metadata = fromJson(event.metadata, {});
       return metadata.version === version && Array.isArray(metadata.changedFiles) && metadata.changedFiles.length > 0;
     });
-    return new Set(authors.map((author) => author.agent_id));
+    const ids = new Set(authors.map((author) => author.agent_id));
+    if (!ids.size) return ids;
+    const placeholders = [...ids].map(() => "?").join(",");
+    const sessions = this.db.prepare(`
+      SELECT session.id FROM agents session
+      JOIN agents author
+        ON lower(session.name) = lower(author.name)
+       AND lower(COALESCE(session.provider, '')) = lower(COALESCE(author.provider, ''))
+      WHERE author.id IN (${placeholders})
+    `).all(...ids);
+    for (const session of sessions) ids.add(session.id);
+    return ids;
   },
 
   _approvers(taskId, version) {

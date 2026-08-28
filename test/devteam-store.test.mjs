@@ -1152,6 +1152,45 @@ test("the author of a version cannot approve it when a teammate could review ins
   assert.equal(outcome.selfReviewed, false, "and it is not labeled self-reviewed");
 });
 
+test("reconnecting does not make an author independent of its own work", async (t) => {
+  // An agent row is one connection, so an author set built from row ids forgot the author the
+  // moment it reconnected. A real session hit this: Claude wrote the implementation, its session
+  // ended, it rejoined under a fresh id, and DevTeam handed it a "fresh specification review" of
+  // its own code with nothing in the payload saying so. The guarantee was not removed, only
+  // emptied — and a self-review that still reads as independent is worse than no review.
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-rejoin-author-"));
+  const store = new DevTeamStore(dataDir);
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Rejoin project", process.cwd());
+  const task = store.createTask({ projectId: project.id, title: "Author rejoins", description: "The author comes back as a new session.", requiredApprovals: 1 });
+  const planner = store.connectAgent({ name: "Planner", provider: "test", freshTaskId: task.id });
+  const alice = store.connectAgent({ name: "Alice", provider: "test", freshTaskId: task.id });
+  const bob = store.connectAgent({ name: "Bob", provider: "test", freshTaskId: task.id });
+  const plan = store.claimNextAssignment(planner.id);
+  store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Build", description: "Implement it.", role: "implementer", requiresWrite: true, targetAgentName: "Alice" });
+  const review = store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Review", description: "Review the current version.", role: "reviewer" });
+  await store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Planned." });
+
+  const build = store.claimNextAssignment(alice.id);
+  await store.completeAssignment({ agentId: alice.id, assignmentId: build.id, message: "Implemented.", changedFiles: ["package.json"] });
+
+  store.disconnectAgent(alice.id, "Session ended.");
+  const aliceAgain = store.connectAgent({ name: "Alice", provider: "test", freshTaskId: task.id });
+  assert.notEqual(aliceAgain.id, alice.id, "a rejoin really is a new session, which is the whole trap");
+
+  assert.equal(store.claimNextAssignment(aliceAgain.id), null,
+    "the same participant, under a new session id, is still the author of that version");
+  const chain = store.whyNotClaimable(review.id, aliceAgain.id);
+  assert.ok(chain.reasons.some((reason) => reason.code === "verifier_is_author" && reason.blocking),
+    "and is told so, rather than discovering it after reviewing its own diff");
+
+  const bobReview = store.claimNextAssignment(bob.id);
+  assert.equal(bobReview.id, review.id, "the review goes to the teammate who did not write it");
+  await store.completeAssignment({ agentId: bob.id, assignmentId: bobReview.id, message: "Independent review passed." });
+  assert.throws(() => store.approveTask({ agentId: aliceAgain.id, taskId: task.id, summary: "Approving my earlier session's work." }),
+    /Approval requires a completed, read-only reviewer or tester assignment/);
+});
+
 test("refusing the author a review of its own work never leaves that review unclaimable", async (t) => {
   // The rule is "somebody else could actually take this", not "an independent teammate exists". A
   // teammate who is connected but cannot claim — or who has left — must not hold a review hostage on
