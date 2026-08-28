@@ -783,3 +783,105 @@ caught again (12 caught, M9 equivalent).
   the control out of the dashboard.
 - Domain-neutral vocabulary (section 5) is untouched.
 - Nothing here has run a real two-agent session. Section 16 item 1 is still the real test.
+
+---
+
+## 18. The first real two-agent session, and the one bug it found
+
+Section 16 item 1 said the real test was a live session with two agents. It ran on 2026-08-28:
+Claude and Codex, a nine-rule Markdown TOC library, planner → implementer → reviewer → tester, with
+both agents told to keep a log of everything that went wrong. Claude wrote `ISSUES-claude.md`;
+Codex reported into the room instead.
+
+The team worked. Codex's review caught a rule-1 defect the passing suite missed; the rework loop
+turned; a later review caught a genuine duplicate-slug collision (`## Notes` / `## Notes` /
+`## Notes-1` producing two `notes-1`) that the tester had already approved past. Both defects were
+real, and neither would have been found by one agent alone. That is the thing this project exists
+to do, and it did it.
+
+Then the task could not be marked done, and stayed that way until a human intervened. Twelve of the
+entries in the log are consequences of a single bug.
+
+### The bug: DevTeam graded its own wrapper as the project's result
+
+A sandboxed project confines a `node` check with Node's permission model. Node's test runner, asked
+to *discover* files (`node --test` with no paths), appends an **empty** entry to its own permission
+list — it grants read access to the positional paths it was given, and there were none — then
+forwards that list to the child process it spawns per test file. Every child dies on
+`--allow-fs-read= requires an argument` before loading a line of the suite. It reproduces on Node
+24.18 with nothing but `--permission --test`; explicit file paths, a glob, or `--test-isolation=none`
+all avoid it.
+
+The child exits non-zero having run nothing. DevTeam graded that as the suite failing, which is
+where the damage came from:
+
+- the report was refused, because a verified failure cannot be reported as done;
+- a `failed` baseline was written against the task, which nothing but a passing run can clear;
+- a regression was opened, and the reporter's reliability was docked (`refusedByChecks: 1`);
+- with no way out, Codex blocked the whole task — correctly, on the evidence it had.
+
+Twice-reviewed, fifteen-of-fifteen-green code sat one step short of done for the rest of the
+session. Both agents diagnosed the flag independently and neither could do anything about it: there
+is no verb for "the harness is broken, not my code".
+
+### What was built
+
+**A confinement wrapper is graded apart from the thing it wraps.** `checks.mjs` already said that
+"DevTeam could not run this" and "this did not pass" are different facts — for a process that never
+starts. It just did not hold for a wrapper that dies *after* spawning. Now:
+
+| situation | verdict |
+| --- | --- |
+| unconfined | the command's own result, unchanged |
+| wrapper rejected, workaround passes | `passed`, verified, substitution stated in the transcript |
+| wrapper rejected, workaround runs and the code fails | `failed` — the workaround ran the project's own code |
+| wrapper rejected, no workaround, or it is rejected too | `unavailable`, not verified, both transcripts kept |
+
+Only the last row is new behaviour, and it is the one that unblocks everything: `unavailable`
+refuses no report, sets no baseline, opens no regression, and charges nobody.
+
+Written as a property of runners, not of Node or of tests — the detection matches the flags DevTeam
+itself injects, and the single Node quirk sits in one named function so the next runner has an
+obvious place to go. The direction of a misread is the safe one: it withholds a pass, it cannot
+grant one.
+
+The workaround is `--test-isolation=none`, flag name probed at runtime. That is not quite the run a
+human gets, so a failure under it keeps the note explaining what was changed rather than being
+handed to the agent as a plain verdict.
+
+`NODE_TEST_CONTEXT` is now stripped from a check's environment. Inherited, it makes a project's
+`node --test` announce a recursive run, skip every file, and exit 0 — a silent false pass, and the
+reason the first draft of the new tests passed for the wrong reason.
+
+**Reconnecting no longer makes an author independent.** The author set was a set of `agents.id`, and
+an agent row is one *connection*. Claude wrote the implementation as `3317811b`, its session ended,
+it rejoined as `6cdcc328` with no lineage link, and DevTeam handed it a "fresh specification review"
+of its own code with nothing in the payload saying so. The guarantee had not been removed, only
+emptied — worse, because the verdict still reads as independent. Authors now expand to every session
+that participant has had, keyed on the name and provider it connects under. Two different
+participants sharing one name would be treated as one; that is the right way to be wrong.
+
+**`checks: [{ label, command: null }]` is accepted.** It used to fail validation with
+`Invalid input at checks[1]` and no hint that a bare string was the shape it wanted.
+
+`node --test` 247 → 251. The task that could not be closed now verifies: `status: passed`,
+`verified: true`, 15/15.
+
+### Deliberately not done
+
+- **Parallel verification without cross-checking.** A tester approved the version a reviewer was
+  simultaneously rejecting, and the collision the reviewer found is exactly the "edge cases covered"
+  item the tester ticked. Real, but it is a scheduling decision, not a bug.
+- **A reviewer who becomes the author of what it holds.** `status=blocked` on the assignment already
+  queues a re-routed replacement, which is what actually unstuck the session. A `devteam_handoff`
+  verb would be nicer; nothing is broken without it.
+- **The historical records.** The `failed` baseline on that task and the one docked reliability
+  point are left as they are. A fresh verified pass supersedes the baseline naturally.
+
+### Still open after this
+
+- No agent used `devteam_plan`, `devteam_stuck` or `devteam_memory` across two sessions. Three of
+  nine verbs went untouched by two different models. Worth asking what they are for.
+- An agent cannot see the argv DevTeam will actually run — sandbox flags included — before reporting
+  against it. Both agents named this as the thing that would have saved them the most time.
+- Domain-neutral vocabulary (section 5) is still untouched.
