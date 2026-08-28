@@ -1,6 +1,8 @@
 # DevTeam v2 — the queue and the conversation
 
-**Status:** correctness, memory and the tool collapse all shipped. Remaining: deleting the retired store internals (15), and the domain-neutral vocabulary.
+**Status:** correctness, memory, the tool collapse and model selection all shipped on branch
+`devteam/barefoot-core` — 277 tests green, unmerged. **No real agent has used the new nine-verb
+interface yet; that is the next thing to do.** Cold-start instructions are in section 16.
 **Written:** 2026-08-28. Progress and what remains are in section 9.
 **Supersedes:** `ROADMAP.md` as the forward-looking document. ROADMAP is now history — all 20 of its
 items are done, and it describes how DevTeam got here, not where it goes.
@@ -577,3 +579,110 @@ reverted both times — which is the argument for doing it separately, made conc
   agent assertions DevTeam never ran. That is a missing `.devteam/checks.json`, not a dead feature —
   and it is the difference between "the tests pass" and "an agent said the tests pass".
 - **Project-scoped memory.** One column's difference from task memory, and a real capability.
+
+---
+
+## 16. START HERE — next session
+
+Written for a cold start, including one that is Codex rather than Claude. Everything below is on
+branch `devteam/barefoot-core`, 277 tests green, unmerged and unpushed.
+
+**The one thing worth knowing first:** the whole agent interface was rewritten — nine verbs replacing
+thirty-nine — and **no real agent has used it yet**. All confidence comes from tests and from driving
+the dashboard by hand. The first genuine two-agent session is the real test, and it is item 1.
+
+### 1. Run one real session, and watch four things
+
+Start Codex and Claude on a small task in a project that is *not* DevTeam itself. Then check:
+
+- **Does review fire?** Someone should reach `devteam_verdict` with `verdict=changes` at least once.
+  If a whole task completes with only approvals, ask why — that was the original defect, and the fix
+  is that the *author is refused the review claim*, not that agents became stricter.
+- **Is the author actually refused?** Have the implementer call `devteam_next` after finishing. It
+  must not be handed the review of its own work. If it is, invariant 1 has regressed.
+- **Does the ladder get reported?** After a join, look at `.devteam/models.json` in the project. If
+  it is absent, agents ignored `runtime.askForLadder` and the model naming will stay silent.
+- **Do the nine verbs read clearly?** Watch for an agent hunting for a tool that no longer exists —
+  `devteam_wait`, `devteam_assign`, `devteam_approve`. That means `SKILL.md` or a description still
+  points somewhere stale.
+
+Expected failure modes, in order of likelihood: agents keep approving rather than requesting changes;
+nobody reports a ladder; `plan` with `agree=true` is used for ordinary work.
+
+### 2. `.devteam/checks.json` — the highest-value ten minutes
+
+`project_check_commands` is **0**, so all 50 checks ever reported are agent *assertions* DevTeam never
+ran. This is the difference between "the tests pass" and "an agent said the tests pass".
+
+Two steps, and the second is the one people miss:
+
+1. Write the file in the project root:
+
+```json
+{ "checks": [{ "name": "test", "argv": ["node", "--test"] }] }
+```
+
+**`npm test` is refused.** So are `npx`, `bash`, `sh`, `pnpm`, `yarn`, `deno` and anything else that
+runs a command on your behalf — see `INDIRECTION_PROGRAMS` in `checks.mjs`. The program must be a bare
+executable: `node`, `pytest`, `cargo`. Verify an entry is acceptable before trusting it:
+
+```
+node -e "import('./src/devteam/checks.mjs').then(m => console.log(m.normalizeCheckCommand({ name: 'test', argv: ['node','--test'] })))"
+```
+
+`null` means it was rejected.
+
+2. **Enable it in the dashboard.** Edit project → *Verified checks* → tick "Let DevTeam run these
+commands". Declaring makes a command *available*; only the human enabling it puts it in
+`project_check_commands`. Confirm with:
+
+```
+select count(*) from project_check_commands;
+```
+
+Read the warning on that panel first: enabling verification lets any agent working in this project
+run this project's code on your machine, at a moment of its choosing.
+
+Once it is on, verified checks, check baselines, regression detection and the reliability record all
+start working — four features that are currently dark for this one reason.
+
+### 3. The 20 blocked tasks
+
+They are history from before the fixes, and nothing clears them automatically. Each now has two
+exits (section 11):
+
+- Finished work that was blocked to *mean* finished → **Accept as finished** on the banner. Refused
+  once if work was still in flight, with the count; a second confirmation closes it.
+- Genuinely stopped work → **Resume**, which reopens at the next version with a fresh planning
+  assignment.
+
+Six of the twenty read "Done", "done", "because all work is done" — those are the accept case.
+
+### 4. Deleting the retired store internals
+
+Unreachable but still present in `store.mjs`: session checkpoints (~118 references), the runtime
+gate, the budget cap, `assignment_usage`. No tool, route or dashboard control can reach any of them,
+so they cost nothing at runtime and nothing in tokens — this is hygiene, not a bug.
+
+**Two attempts during the barefoot session spliced the wrong lines and were reverted.** Learn from
+that: do not remove these by line number. The traps, specifically:
+
+- `#participantLineage` follows *claimed checkpoints* to trace one identity across a session
+  handoff, and **invariant 1 — the author cannot verify their own work — depends on that lineage**.
+  Removing checkpoints means lineage collapses to identity; make that change deliberately and run
+  `test/devteam-scheduler-properties.test.mjs` before and after.
+- The budget feeds `steeringFor`, which is the live path carrying "stop, this is no longer worth
+  doing" to a busy agent. `cancel_requested_at` is the main signal there and must survive.
+- Do it with the property suite watching, one feature per commit, tests between each.
+
+### 5. Conventions will switch itself on
+
+`#syncConventions` needs 3 findings sharing a signature across 2 distinct tasks. There are currently
+**2 structured findings in total**, because review was rubber-stamping. Once item 1 is working, this
+fills `conventions/` by itself. Nothing to do but check back.
+
+### Still open from earlier sections
+
+- **Domain-neutral vocabulary** (section 5) — roles and checks are project-configurable already, but
+  the defaults and dashboard labels still say "changed files", "diff", "security review".
+- `store.mjs` is 6,194 lines in one class. Item 4 shrinks it; splitting it is a separate decision.
