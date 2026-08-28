@@ -1209,42 +1209,6 @@ test("a disconnected historical teammate cannot dead-end the remaining solo auth
   assert.equal(outcome.selfReviewed, true);
 });
 
-test("checkpoint successors share one approval lineage and cannot manufacture consensus", async (t) => {
-  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-lineage-"));
-  const store = new DevTeamStore(dataDir);
-  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
-  const project = store.ensureProject("Lineage project", process.cwd());
-  const task = store.createTask({ projectId: project.id, title: "Rotate one session", description: "A fresh session is not a fresh reviewer.", requiredApprovals: 2 });
-  const oldSession = store.connectAgent({ name: "Rotating agent", provider: "test", freshTaskId: task.id });
-  const plan = store.claimNextAssignment(oldSession.id);
-  store.createAssignment({ agentId: oldSession.id, taskId: task.id, title: "Build", description: "Implement it.", role: "implementer", requiresWrite: true, targetAgentName: oldSession.name });
-  store.createAssignment({ agentId: oldSession.id, taskId: task.id, title: "First review", description: "Review before rotation.", role: "reviewer", targetAgentName: oldSession.name });
-  store.createAssignment({ agentId: oldSession.id, taskId: task.id, title: "Fresh-session review", description: "Review after rotation.", role: "reviewer", targetAgentName: "Fresh rotating agent" });
-  await store.completeAssignment({ agentId: oldSession.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
-  const build = store.claimNextAssignment(oldSession.id);
-  await store.completeAssignment({ agentId: oldSession.id, assignmentId: build.id, claimToken: build.claimToken, message: "Built.", changedFiles: ["package.json"] });
-  const firstReview = store.claimNextAssignment(oldSession.id);
-  await store.completeAssignment({ agentId: oldSession.id, assignmentId: firstReview.id, claimToken: firstReview.claimToken, message: "Reviewed before rotation." });
-  const beforeRotation = store.approveTask({ agentId: oldSession.id, taskId: task.id, summary: "Self-review before rotating." });
-  assert.equal(beforeRotation.accepted, false, "the queued successor review keeps the task open");
-
-  const checkpoint = await store.createSessionCheckpoint({ agentId: oldSession.id, taskId: task.id, nextAction: "Complete the queued review." });
-  const freshSession = store.connectAgent({ name: "Fresh rotating agent", provider: "test", freshTaskId: task.id });
-  await store.takeoverSessionCheckpoint({
-    agentId: freshSession.id,
-    taskId: task.id,
-    checkpointId: checkpoint.checkpoint.id,
-    handoffToken: checkpoint.handoffToken,
-  });
-  const freshReview = store.claimNextAssignment(freshSession.id);
-  await store.completeAssignment({ agentId: freshSession.id, assignmentId: freshReview.id, claimToken: freshReview.claimToken, message: "Reviewed after rotation." });
-  const outcome = store.approveTask({ agentId: freshSession.id, taskId: task.id, summary: "Same participant, fresh session." });
-  assert.equal(outcome.accepted, true);
-  assert.equal(outcome.approvalCount, 1, "predecessor and successor approvals collapse to one lineage");
-  assert.equal(outcome.requiredApprovals, 1);
-  assert.equal(outcome.selfReviewed, true, "the acceptance is not mislabeled as independent consensus");
-});
-
 test("a solo acceptance is labeled selfReviewed; changed files that aren't on disk are flagged", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-selfreview-"));
   const store = new DevTeamStore(dataDir);
@@ -2147,103 +2111,7 @@ test("a cancel request reaches a working agent and asks rather than kills", asyn
     "queued work is not cancelled, it is deleted or re-prioritised");
 });
 
-test("a task budget is surfaced to the room once it is spent, without hard-stopping a writer", async (t) => {
-  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-budget-"));
-  const store = new DevTeamStore(dataDir);
-  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
-  const project = store.ensureProject("Budget project", process.cwd());
-  const task = store.createTask({ projectId: project.id, title: "Time-boxed", description: "One afternoon, no more." });
-  const agent = store.connectAgent({ name: "Worker", provider: "test", freshTaskId: task.id });
-  const claim = store.claimNextAssignment(agent.id);
-
-  assert.equal(store.taskBudgetState(task.id), null, "no budget set, nothing to say");
-  store.setTaskBudget({ taskId: task.id, wallClockMinutes: 60 });
-  const within = store.taskBudgetState(task.id);
-  assert.equal(within.budgetMinutes, 60);
-  assert.equal(within.exceeded, false);
-  assert.equal(store.steeringFor(agent.id), null, "a budget that is not spent is not a signal");
-
-  // Age the task past its budget.
-  store.db.prepare("UPDATE tasks SET created_at = ? WHERE id = ?")
-    .run(new Date(Date.now() - 90 * 60_000).toISOString(), task.id);
-  const spent = store.taskBudgetState(task.id);
-  assert.equal(spent.exceeded, true);
-  assert.equal(spent.remainingMinutes, 0);
-
-  const steering = store.steeringFor(agent.id);
-  assert.equal(steering.budget.exceeded, true);
-  assert.match(steering.budget.next, /do not start anything new/i);
-  // Advisory, not a kill: the claim survives, because a hard stop mid-write is the thing to avoid.
-  assert.equal(store.db.prepare("SELECT status FROM assignments WHERE id = ?").get(claim.id).status, "claimed");
-
-  store.setTaskBudget({ taskId: task.id, wallClockMinutes: null });
-  assert.equal(store.taskBudgetState(task.id), null, "a cleared budget stops being a signal");
-});
-
-// --- T4.2 / T4.3: what it cost, and what happened -------------------------------------------------
-
-test("reported cost is recorded, capped, and never presented as measured", async (t) => {
-  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-usage-"));
-  const store = new DevTeamStore(dataDir);
-  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
-  const project = store.ensureProject("Usage project", process.cwd());
-  const task = store.createTask({ projectId: project.id, title: "Costly", description: "Watch the spend." });
-  const agent = store.connectAgent({ name: "Spender", provider: "test", freshTaskId: task.id });
-
-  const plan = store.claimNextAssignment(agent.id);
-  const reported = await store.completeAssignment({
-    agentId: agent.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned.",
-    usage: { inputTokens: 12_000, outputTokens: 3_000, costUsd: 0.42, model: "some-model" },
-  });
-  assert.equal(reported.usage.inputTokens, 12_000);
-  assert.equal(reported.usage.costUsd, 0.42);
-
-  const usage = store.taskUsage(task.id);
-  assert.equal(usage.agentAsserted, true, "it is the agent's own figure, and says so");
-  assert.match(usage.note, /cannot measure/i);
-  assert.equal(usage.totalCostUsd, 0.42);
-  assert.equal(usage.byAgent[0].agentName, "Spender");
-
-  // Nonsense is dropped rather than stored: a negative or non-numeric figure is not a cost.
-  const second = store.createAssignment({ taskId: task.id, title: "More work", description: "Do it." });
-  const claim = store.claimNextAssignment(agent.id);
-  const junk = await store.completeAssignment({
-    agentId: agent.id, assignmentId: second.id, claimToken: claim.claimToken, message: "Done.",
-    usage: { inputTokens: -5, outputTokens: "lots", costUsd: null },
-  });
-  assert.equal(junk.usage ?? undefined, undefined);
-  assert.equal(store.taskUsage(task.id).totalCostUsd, 0.42, "nothing was added by a malformed report");
-});
-
-test("a spend cap is enforced against reported cost, and says that it is reported", async (t) => {
-  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-spend-"));
-  const store = new DevTeamStore(dataDir);
-  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
-  const project = store.ensureProject("Spend project", process.cwd());
-  const task = store.createTask({ projectId: project.id, title: "Capped", description: "A dollar, no more." });
-  const agent = store.connectAgent({ name: "Spender", provider: "test", freshTaskId: task.id });
-  store.setTaskBudget({ taskId: task.id, spendUsd: 1 });
-
-  const state = store.taskBudgetState(task.id);
-  assert.equal(state.budgetUsd, 1);
-  assert.equal(state.exceeded, false);
-  assert.equal(state.spendIsAgentReported, true, "a cap on a reported number must say so");
-
-  const plan = store.claimNextAssignment(agent.id);
-  await store.completeAssignment({
-    agentId: agent.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Expensive.",
-    usage: { costUsd: 1.75 },
-  });
-  const after = store.taskBudgetState(task.id);
-  assert.equal(after.exceeded, true);
-  assert.equal(after.spentUsd, 1.75);
-  assert.equal(after.remainingUsd, 0);
-
-  const next = store.createAssignment({ taskId: task.id, title: "More", description: "Do it." });
-  const claim = store.claimNextAssignment(agent.id);
-  assert.equal(claim.id, next.id, "the cap is advisory: it warns rather than hard-stopping a writer");
-  assert.equal(store.steeringFor(agent.id).budget.exceeded, true, "but the agent is told on its next call");
-});
+// --- T4.3: what happened --------------------------------------------------------------------------
 
 test("a task replays as a narrative that reports what happened without re-grading it", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-replay-"));
@@ -2262,7 +2130,7 @@ test("a task replays as a narrative that reports what happened without re-gradin
   await store.completeAssignment({
     agentId: author.id, assignmentId: work.id, claimToken: workClaim.claimToken,
     message: "Wrote it.\nHandles the nested case.", changedFiles: ["src/parser.mjs"],
-    checks: ["I ran it by hand"], usage: { costUsd: 0.2 },
+    checks: ["I ran it by hand"],
   });
   const reviewClaim = store.claimNextAssignment(reviewer.id);
   await store.completeAssignment({ agentId: reviewer.id, assignmentId: reviewClaim.id, claimToken: reviewClaim.claimToken, message: "Read it closely." });
@@ -2279,7 +2147,6 @@ test("a task replays as a narrative that reports what happened without re-gradin
     "an asserted check still reads as asserted — the replay reports, it does not re-grade");
   assert.match(replay.markdown, /changes_requested.*Nested case is wrong/);
   assert.match(replay.markdown, /## Where it stands/);
-  assert.match(replay.markdown, /Reported cost:.*agent-reported, not measured/);
   assert.ok(replay.events > 5);
   assert.throws(() => store.taskReplay("00000000-0000-4000-8000-000000000000"), /Task not found/);
 });

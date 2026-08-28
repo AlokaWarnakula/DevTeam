@@ -129,8 +129,8 @@ const MUTANTS = [
   {
     name: "M13 reaper skew restored (explanation skips the reaper)",
     from: `    if (agentId && refreshLiveness) {
-      this.#reapStaleAgents();
-      this.#recoverOrphanedClaims();
+      this._reapStaleAgents();
+      this._recoverOrphanedClaims();
     }`,
     to: "",
   },

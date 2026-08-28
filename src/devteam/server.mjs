@@ -9,7 +9,6 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { DevTeamStore } from "./store.mjs";
 import { createDevTeamMcpServer } from "./mcp.mjs";
-import { normalizeRuntimeProfile, resolveRuntimeRequirement } from "./runtime/index.mjs";
 import {
   checkExposureRequirements,
   decideApiAccess,
@@ -44,27 +43,6 @@ function requireDirectory(root) {
   return resolved;
 }
 
-function userRuntimeProfile(value) {
-  if (value == null) return null;
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Runtime profile must be an object or null.");
-  return normalizeRuntimeProfile({
-    ...value,
-    source: "user",
-    switchMode: value.switchMode || "user_required",
-    observedAt: value.observedAt || new Date().toISOString(),
-  });
-}
-
-function taskRuntimeProfile(task) {
-  if (!task?.base_runtime_profile) return null;
-  try {
-    const stored = typeof task.base_runtime_profile === "string" ? JSON.parse(task.base_runtime_profile) : task.base_runtime_profile;
-    return userRuntimeProfile(stored);
-  } catch {
-    return null;
-  }
-}
-
 export async function startDevTeamServer({
   host = "127.0.0.1",
   port = 7331,
@@ -73,7 +51,6 @@ export async function startDevTeamServer({
   liveness = {},
   knowledge = { enabled: true },
   codegraph = { enabled: true },
-  checkpoint = {},
 } = {}) {
   if (!dataDir) throw new Error("dataDir is required.");
   // T4.1 — the one place DevTeam declines to start. A server reachable from the network whose
@@ -81,7 +58,7 @@ export async function startDevTeamServer({
   // no server, and an operator who means to expose it can say so with a real secret.
   const exposure = checkExposureRequirements({ host, token: process.env.DEVTEAM_TOKEN });
   if (!exposure.ok) throw new Error(exposure.error);
-  const store = new DevTeamStore(dataDir, { liveness, knowledge, codegraph, checkpoint });
+  const store = new DevTeamStore(dataDir, { liveness, knowledge, codegraph });
   // An operator-supplied token replaces the generated one, so what authenticates is the secret they
   // chose rather than a string sitting in the data directory.
   if (process.env.DEVTEAM_TOKEN) store.setSharedToken(process.env.DEVTEAM_TOKEN);
@@ -179,18 +156,6 @@ export async function startDevTeamServer({
     return res.status(401).json({ error: "This action requires the DevTeam dashboard session or bearer token." });
   };
 
-  const checkpointInvitation = (task, result) => [
-    `Continue DevTeam task “${result.checkpoint.capsule?.task?.title || task.id}” in a fresh session.`,
-    "",
-    "Use the DevTeam skill and connect as a new agent session. Join the task room below, then call devteam_session_takeover exactly once with:",
-    "",
-    `taskId: ${task.id}`,
-    `checkpointId: ${result.checkpoint.id}`,
-    `handoffToken: ${result.handoffToken}`,
-    "",
-    "After takeover, read the bounded capsule, inspect the repository and current task state, and continue only under the newly issued claim token. Do not use devteam_resume: this is an intentional fresh-session takeover. The handoff token is single-use and expires at " + result.checkpoint.expiresAt + ".",
-  ].join("\n");
-
   const mcpPost = asyncRoute(async (req, res) => {
     const sessionId = req.get("mcp-session-id");
     let transport = sessionId ? transports.get(sessionId) : null;
@@ -249,22 +214,6 @@ export async function startDevTeamServer({
   app.get("/api/state", (req, res) => {
     const taskId = Object.hasOwn(req.query, "taskId") ? req.query.taskId || null : undefined;
     const snapshot = store.snapshot(taskId);
-    const task = snapshot.selectedTask;
-    if (task) {
-      const baseProfile = taskRuntimeProfile(task);
-      task.baseRuntimeProfile = baseProfile;
-      for (const assignment of task.assignments || []) {
-        if (!assignment.assessment?.requirements) continue;
-        const assigned = snapshot.agents.find((agent) => agent.id === assignment.agent_id);
-        const targeted = !assigned && assignment.target_agent_name
-          ? snapshot.agents.find((agent) => agent.status !== "disconnected" && agent.name.toLowerCase() === assignment.target_agent_name.toLowerCase())
-          : null;
-        const agentProfile = assigned?.runtimeProfile || targeted?.runtimeProfile || null;
-        const profile = agentProfile || baseProfile;
-        assignment.runtimeProfileSource = agentProfile ? "agent" : (baseProfile ? "task" : null);
-        assignment.runtimeResolution = resolveRuntimeRequirement(assignment.assessment.requirements, profile);
-      }
-    }
     res.json(snapshot);
   });
   app.get("/api/search", (req, res) => {
@@ -306,16 +255,12 @@ export async function startDevTeamServer({
     if (typeof req.body?.description === "string") patch.description = req.body.description;
     if (req.body?.requiredApprovals !== undefined) patch.requiredApprovals = Number(req.body.requiredApprovals);
     if (typeof req.body?.sessionPolicy === "string") patch.sessionPolicy = req.body.sessionPolicy;
-    if (Object.hasOwn(req.body || {}, "baseRuntimeProfile")) patch.baseRuntimeProfile = userRuntimeProfile(req.body.baseRuntimeProfile);
     if (!Object.keys(patch).length) throw new Error("Provide task details or a session policy to update.");
     res.json(store.updateTask(req.params.taskId, patch));
   });
   app.patch("/api/tasks/:taskId/session-policy", (req, res) => {
     requireFields(req.body, ["sessionPolicy"]);
-    res.json(store.updateTask(req.params.taskId, {
-      sessionPolicy: req.body.sessionPolicy,
-      baseRuntimeProfile: Object.hasOwn(req.body || {}, "baseRuntimeProfile") ? userRuntimeProfile(req.body.baseRuntimeProfile) : undefined,
-    }));
+    res.json(store.updateTask(req.params.taskId, { sessionPolicy: req.body.sessionPolicy }));
   });
   app.delete("/api/tasks/:taskId", (req, res) => {
     requireFields(req.body, ["confirmTaskId"]);

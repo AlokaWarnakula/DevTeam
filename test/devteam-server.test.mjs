@@ -139,57 +139,6 @@ test("an unscoped MCP agent on a multi-task server receives room choices instead
   assert.equal(assigned.structuredContent.assignment.task_id, first.id);
 });
 
-test("an already-delivered runtime recommendation does not hot-loop subsequent MCP waits", async (t) => {
-  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-runtime-wait-"));
-  const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd(), knowledge: { enabled: false } });
-  t.after(async () => { await instance.close(); await rm(dataDir, { recursive: true, force: true }); });
-  const state = await fetch(`${instance.url}/api/state`).then((response) => response.json());
-  const task = await fetch(`${instance.url}/api/tasks`, {
-    method: "POST",
-    headers: { authorization: `Bearer ${instance.store.token}`, "content-type": "application/json" },
-    body: JSON.stringify({ projectId: state.projects[0].id, title: "Runtime wait", description: "Avoid repeated wakeups." }),
-  }).then((response) => response.json());
-  const transport = new StreamableHTTPClientTransport(new URL(instance.mcpUrl), {
-    requestInit: { headers: { Authorization: `Bearer ${instance.store.token}` } },
-  });
-  const client = new Client({ name: "devteam-runtime-wait-test", version: "1.0.0" });
-  await client.connect(transport);
-  t.after(() => client.close());
-  const runtimeProfile = {
-    providerId: "fixture-provider",
-    currentModel: "fixture-balanced",
-    currentEffort: "fixture-medium",
-    availableModels: [
-      { id: "fixture-balanced", class: "balanced", efforts: [{ id: "fixture-medium", class: "medium" }] },
-      { id: "fixture-frontier", class: "frontier", efforts: [{ id: "fixture-high", class: "high" }] },
-    ],
-    switchMode: "user_required",
-    source: "host",
-    observedAt: new Date().toISOString(),
-  };
-  const connected = await client.callTool({ name: "devteam_join", arguments: { name: "Runtime worker", provider: "test", taskId: task.id } });
-  const agentId = connected.structuredContent.agent.id;
-  const planner = instance.store.claimNextAssignment(agentId);
-  assert.ok(planner?.id, "the fixture planner assignment is claimable");
-  await instance.store.completeAssignment({ agentId, assignmentId: planner.id, claimToken: planner.claimToken, message: "Planned." });
-  instance.store.updateRuntimeProfile({ agentId, profile: runtimeProfile });
-  instance.store.continueCurrentSession({ agentId, taskId: task.id });
-  instance.store.createAssignment({
-    taskId: task.id,
-    title: "Secure migration",
-    description: "Implement authentication tokens and a database schema migration.",
-    role: "implementer",
-  });
-
-  const firstGate = await client.callTool({ name: "devteam_next", arguments: { agentId, timeoutSeconds: 1 } });
-  assert.equal(firstGate.structuredContent.status, "runtime_action_required", "the recommendation is surfaced once");
-  const started = Date.now();
-  const repeatedWait = await client.callTool({ name: "devteam_next", arguments: { agentId, timeoutSeconds: 1 } });
-  const elapsed = Date.now() - started;
-  assert.equal(repeatedWait.structuredContent.status, "idle", "an undecided recommendation is not returned again");
-  assert.ok(elapsed >= 850, `the second wait should block near its timeout instead of hot-looping (${elapsed} ms)`);
-});
-
 test("MCP assignment dependencies sequence work and devteam_brief stays compact", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-dependency-mcp-"));
   const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd(), knowledge: { enabled: false } });

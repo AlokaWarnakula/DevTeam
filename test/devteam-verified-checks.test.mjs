@@ -539,7 +539,7 @@ test("a second report is refused while the first one's checks are still running"
 
 test("a claim that moves while its checks run cannot be settled by the session that lost it", async (t) => {
   // Verification is no longer instantaneous, so the claim can move underneath a report in flight —
-  // a force-release, a resume, or a checkpoint takeover all reassign it without waiting. Settling
+  // a force-release or a resume both reassign it without waiting. Settling
   // against the row read before the checks started would write a report on a lease this session no
   // longer holds.
   const { store, task, agent } = await slowChecksFixture(t, { millis: 900 });

@@ -169,7 +169,7 @@ test("a data directory left locked by a crashed process is taken over once the l
 
 test("a CLI can read the database while the server owns it, without touching scheduling state", async (t) => {
   // `devteam token` is run while the server is up, by definition. Before the lock it opened the
-  // database as a second owner and ran orphan recovery, checkpoint expiry and status derivation
+  // database as a second owner and ran orphan recovery and status derivation
   // against a live scheduler — quietly moving work around from a command that only prints a string.
   const { store, dataDir, task, agent } = await fixture(t);
   const claim = claimWork(store, agent, task);

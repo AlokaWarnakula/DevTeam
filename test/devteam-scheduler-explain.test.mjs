@@ -22,27 +22,7 @@ const SKIP_BRANCHES = [
   "dependency_pending",
   "awaiting_writer",
   "write_lease_conflict",
-  "runtime_decision_hold",
-  "runtime_gate",
 ];
-
-const balancedProfile = (overrides = {}) => ({
-  providerId: "fixture-provider",
-  currentModel: "fixture-balanced",
-  currentEffort: "fixture-medium",
-  availableModels: [
-    { id: "fixture-balanced", label: "Fixture balanced", class: "balanced", efforts: [
-      { id: "fixture-medium", class: "medium" }, { id: "fixture-high", class: "high" },
-    ] },
-    { id: "fixture-frontier", label: "Fixture frontier", class: "frontier", efforts: [
-      { id: "fixture-high", class: "high" }, { id: "fixture-extra", class: "extra_high" }, { id: "fixture-max", class: "maximum" },
-    ] },
-  ],
-  switchMode: "user_required",
-  source: "host",
-  observedAt: new Date().toISOString(),
-  ...overrides,
-});
 
 async function explainFixture(t) {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-explain-data-"));
@@ -224,33 +204,6 @@ test("whyNotClaimable names a reason for every branch on which the scan skips a 
     assert.ok(reason.paths.length >= 1, "and the overlapping paths are listed");
     assert.match(reason.detail, /src\/devteam/);
     assert.notEqual(store.claimNextAssignment(second.id)?.id, overlapping.id, "and the scan skips it too");
-  }
-
-  // --- runtime_gate / runtime_decision_hold -----------------------------------------------------
-  {
-    const { store, task } = await explainFixture(t);
-    const planner = store.connectAgent({ name: "Planner", provider: "fixture", freshTaskId: task.id });
-    await drainPlanner(store, planner);
-    store.disconnectAgent(planner.id, "Done planning.");
-    const critical = store.createAssignment({
-      taskId: task.id,
-      title: "Audit access",
-      description: "Implement authentication permission checks with a database schema migration.",
-      role: "implementer", requiresWrite: true, paths: ["src/auth.mjs"],
-    });
-    const agent = store.connectAgent({ name: "Underpowered", provider: "fixture", runtimeProfile: balancedProfile(), freshTaskId: task.id });
-    const gate = record(store.whyNotClaimable(critical.id, agent.id), "runtime_gate");
-    assert.match(gate.detail, /Fixture balanced/, "the advertised label of what it is running is quoted back");
-    assert.match(gate.detail, /Fixture frontier/, "as is the advertised label of what the work needs");
-    assert.equal(gate.current.modelId, "fixture-balanced");
-    assert.equal(gate.recommendation.modelId, "fixture-frontier");
-    assert.equal(store.claimNextAssignment(agent.id).status, "runtime_action_required", "and the scan gates it too");
-
-    const assessment = store.assignmentAssessment({ assignmentId: critical.id });
-    store.runtimeDecision({ agentId: agent.id, assignmentId: critical.id, assessmentId: assessment.id, choice: "reassign" });
-    const hold = record(store.whyNotClaimable(critical.id, agent.id), "runtime_decision_hold");
-    assert.equal(hold.decision.choice, "reassign");
-    assert.equal(store.claimNextAssignment(agent.id), null, "and the scan drops it from this agent's queue");
   }
 
   assert.deepEqual([...seen].sort(), [...SKIP_BRANCHES].sort(),
