@@ -490,3 +490,46 @@ instead** — one file, and `report` starts being verified.
 
 The 8 `knowledge_*` tools plus `note_get`/`note_set` are 10 tools over a feature that is DevTeam's
 best: 626 notes and counting. The feature stays; the surface becomes one `memory` verb.
+
+---
+
+## 14. Where an agent's tokens actually go
+
+Two costs, and they are paid on completely different schedules.
+
+### Paid once per session, before any work happens
+
+| | |
+|---|---|
+| `skills/devteam/SKILL.md` | 34,321 bytes |
+| 39 MCP tool schemas (prose alone) | 17,283 chars, plus names, types and enums |
+| **Session tax** | **~55–60 KB** |
+
+### Paid on every claim and every wait
+
+One real brief, after the work in sections 12 and 13:
+
+| Section | Bytes | Carries |
+|---|---|---|
+| projectKnowledge | 7,295 | **12 notes** (was 3) |
+| codeContext | 4,990 | **17 modules** (was 8) |
+| recent | 2,053 | 10 timeline events |
+| task + assignment | 1,961 | title, description, scope, checklist |
+| briefMeta | 637 | bookkeeping |
+| **Total** | **17,605** | |
+
+### What that means for what to cut next
+
+An agent that does five assignments in a session pays roughly
+`60 KB + 5 × 17.6 KB = 148 KB`. **The session tax is 40% of that and buys nothing** — it is
+what the agent must read to learn how to be a teammate, before it has seen a line of the project.
+
+So the remaining savings are not in the brief. Both memories were just made to carry three to four
+times as much for the same bytes, and the rest of the brief is task text, conversation and the
+assignment itself — all of it irreducible. Squeezing `recent` or the task description would save a
+few hundred bytes and cost real context.
+
+**The tool collapse is the token story now.** 39 tool descriptions to 9 takes the schema prose from
+17 KB to roughly 5 KB, and a `SKILL.md` written for nine verbs instead of thirty-nine should land
+near 8 KB rather than 34 KB. That is a **~40 KB saving on every session of every agent** — more than
+two entire briefs, recovered before the first assignment is claimed.
