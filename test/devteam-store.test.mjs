@@ -1209,42 +1209,6 @@ test("a disconnected historical teammate cannot dead-end the remaining solo auth
   assert.equal(outcome.selfReviewed, true);
 });
 
-test("checkpoint successors share one approval lineage and cannot manufacture consensus", async (t) => {
-  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-lineage-"));
-  const store = new DevTeamStore(dataDir);
-  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
-  const project = store.ensureProject("Lineage project", process.cwd());
-  const task = store.createTask({ projectId: project.id, title: "Rotate one session", description: "A fresh session is not a fresh reviewer.", requiredApprovals: 2 });
-  const oldSession = store.connectAgent({ name: "Rotating agent", provider: "test", freshTaskId: task.id });
-  const plan = store.claimNextAssignment(oldSession.id);
-  store.createAssignment({ agentId: oldSession.id, taskId: task.id, title: "Build", description: "Implement it.", role: "implementer", requiresWrite: true, targetAgentName: oldSession.name });
-  store.createAssignment({ agentId: oldSession.id, taskId: task.id, title: "First review", description: "Review before rotation.", role: "reviewer", targetAgentName: oldSession.name });
-  store.createAssignment({ agentId: oldSession.id, taskId: task.id, title: "Fresh-session review", description: "Review after rotation.", role: "reviewer", targetAgentName: "Fresh rotating agent" });
-  await store.completeAssignment({ agentId: oldSession.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
-  const build = store.claimNextAssignment(oldSession.id);
-  await store.completeAssignment({ agentId: oldSession.id, assignmentId: build.id, claimToken: build.claimToken, message: "Built.", changedFiles: ["package.json"] });
-  const firstReview = store.claimNextAssignment(oldSession.id);
-  await store.completeAssignment({ agentId: oldSession.id, assignmentId: firstReview.id, claimToken: firstReview.claimToken, message: "Reviewed before rotation." });
-  const beforeRotation = store.approveTask({ agentId: oldSession.id, taskId: task.id, summary: "Self-review before rotating." });
-  assert.equal(beforeRotation.accepted, false, "the queued successor review keeps the task open");
-
-  const checkpoint = await store.createSessionCheckpoint({ agentId: oldSession.id, taskId: task.id, nextAction: "Complete the queued review." });
-  const freshSession = store.connectAgent({ name: "Fresh rotating agent", provider: "test", freshTaskId: task.id });
-  await store.takeoverSessionCheckpoint({
-    agentId: freshSession.id,
-    taskId: task.id,
-    checkpointId: checkpoint.checkpoint.id,
-    handoffToken: checkpoint.handoffToken,
-  });
-  const freshReview = store.claimNextAssignment(freshSession.id);
-  await store.completeAssignment({ agentId: freshSession.id, assignmentId: freshReview.id, claimToken: freshReview.claimToken, message: "Reviewed after rotation." });
-  const outcome = store.approveTask({ agentId: freshSession.id, taskId: task.id, summary: "Same participant, fresh session." });
-  assert.equal(outcome.accepted, true);
-  assert.equal(outcome.approvalCount, 1, "predecessor and successor approvals collapse to one lineage");
-  assert.equal(outcome.requiredApprovals, 1);
-  assert.equal(outcome.selfReviewed, true, "the acceptance is not mislabeled as independent consensus");
-});
-
 test("a solo acceptance is labeled selfReviewed; changed files that aren't on disk are flagged", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-selfreview-"));
   const store = new DevTeamStore(dataDir);

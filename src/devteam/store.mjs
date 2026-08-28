@@ -3389,7 +3389,7 @@ export class DevTeamStore extends EventEmitter {
         }
         // A verifying assignment is never handed to whoever wrote the version it examines. Resolved
         // per candidate rather than as a SQL predicate for the same reason the write lease is: it
-        // depends on session lineage and on who is connected right now, neither of which the scan's
+        // depends on who authored the current version and on who is connected right now, neither of which the scan's
         // single query can see.
         if (candidate.verifies && this.#verifierIsAuthor(agentId, candidate)) continue;
         // Above this session's rung: skipped, not blocked. The agent goes on to take everything it
@@ -3585,7 +3585,7 @@ export class DevTeamStore extends EventEmitter {
       const writers = this.#blockingWriters(assignment.id);
       add("awaiting_writer", `Verification waits for the writer “${writers[0].title}” to finish${writers.length > 1 ? ` (and ${writers.length - 1} more)` : ""}.`, { writers });
     }
-    // Not a predicate: independence depends on session lineage and on who is connected, neither of
+    // Not a predicate: independence depends on who authored the current version and on who is connected, neither of
     // which the scan's single query can see, so it is resolved here exactly as the scan resolves it.
     if (assignment.verifies) {
       if (agent && this.#verifierIsAuthor(agent.id, assignment)) {
@@ -3596,11 +3596,11 @@ export class DevTeamStore extends EventEmitter {
         // room who wrote it cannot check it" is a fact about the item. Reported non-blocking, for
         // the same reason an absent target is: an independent teammate may be free to take this the
         // very next second, and calling it blocked would put the explanation at odds with a scan
-        // that is about to hand it over. Both branches read the same two lineage sets the scan
+        // that is about to hand it over. Both branches read the same two author sets the scan
         // reads, so the item can never be skipped for a reason this cannot name.
-        const authors = this.#currentVersionAuthorLineages(assignment.task_id, assignment.task_version);
-        const connected = this.#connectedParticipantLineages(assignment.task_id);
-        const excluded = [...connected].filter((lineage) => authors.has(lineage));
+        const authors = this.#currentVersionAuthors(assignment.task_id, assignment.task_version);
+        const connected = this.#connectedParticipants(assignment.task_id);
+        const excluded = [...connected].filter((agentId) => authors.has(agentId));
         if (excluded.length && this.#independentClaimantExists(assignment, authors, null)) {
           add("verifier_is_author", `Held for an independent teammate: ${excluded.length} of the contributors in this room wrote version ${assignment.task_version} and cannot verify their own work.`,
             { version: assignment.task_version, excludedAuthors: excluded.length }, false);
@@ -4770,34 +4770,20 @@ export class DevTeamStore extends EventEmitter {
     };
   }
 
-  // A checkpoint takeover creates a fresh session id, but it does not create a new independent
-  // participant. Follow claimed checkpoint links back to the original session in that lineage.
-  #participantLineage(agentId) {
-    let current = agentId;
-    const seen = new Set();
-    while (current && !seen.has(current)) {
-      seen.add(current);
-      const predecessor = this.db.prepare(`
-        SELECT from_agent_id FROM session_checkpoints
-        WHERE claimed_by_agent_id = ? AND status = 'claimed'
-        ORDER BY claimed_at DESC, checkpoint_generation DESC LIMIT 1
-      `).get(current);
-      if (!predecessor?.from_agent_id) break;
-      current = predecessor.from_agent_id;
-    }
-    return current || agentId;
-  }
-
-  #connectedParticipantLineages(taskId) {
+  // Who counts as one participant. This followed claimed checkpoint links back to an original
+  // session, because a takeover minted a fresh agent id for the same person and an author must not
+  // become their own independent reviewer by handing themselves the session. Checkpoints are gone,
+  // no other path mints a second id for one participant, and so identity is the whole answer.
+  #connectedParticipants(taskId) {
     const members = this.db.prepare(`
       SELECT tm.agent_id FROM task_members tm
       JOIN agents agent ON agent.id = tm.agent_id
       WHERE tm.task_id = ? AND tm.role = 'contributor' AND agent.status != 'disconnected'
     `).all(taskId);
-    return new Set(members.map((member) => this.#participantLineage(member.agent_id)));
+    return new Set(members.map((member) => member.agent_id));
   }
 
-  #currentVersionAuthorLineages(taskId, version) {
+  #currentVersionAuthors(taskId, version) {
     const authors = this.db.prepare(`
       SELECT agent_id, metadata FROM events
       WHERE task_id = ? AND type = 'assignment.completed' AND agent_id IS NOT NULL
@@ -4805,17 +4791,17 @@ export class DevTeamStore extends EventEmitter {
       const metadata = fromJson(event.metadata, {});
       return metadata.version === version && Array.isArray(metadata.changedFiles) && metadata.changedFiles.length > 0;
     });
-    return new Set(authors.map((author) => this.#participantLineage(author.agent_id)));
+    return new Set(authors.map((author) => author.agent_id));
   }
 
-  #approvalLineages(taskId, version) {
+  #approvers(taskId, version) {
     const approvals = this.db.prepare("SELECT agent_id FROM approvals WHERE task_id = ? AND version = ?").all(taskId, version);
-    return new Set(approvals.map((approval) => this.#participantLineage(approval.agent_id)));
+    return new Set(approvals.map((approval) => approval.agent_id));
   }
 
-  #eligibleIndependentApproverLineages(taskId, version) {
-    const authors = this.#currentVersionAuthorLineages(taskId, version);
-    return new Set([...this.#connectedParticipantLineages(taskId)].filter((lineage) => !authors.has(lineage)));
+  #eligibleIndependentApprovers(taskId, version) {
+    const authors = this.#currentVersionAuthors(taskId, version);
+    return new Set([...this.#connectedParticipants(taskId)].filter((agentId) => !authors.has(agentId)));
   }
 
   // Reviewer ≠ author, asked at claim time. approveTask has always refused a self-approval, but
@@ -4829,8 +4815,8 @@ export class DevTeamStore extends EventEmitter {
   // connected, the author still gets the work and the acceptance is labeled selfReviewed rather than
   // the assignment sitting claimable-by-nobody.
   #verifierIsAuthor(agentId, assignment) {
-    const authors = this.#currentVersionAuthorLineages(assignment.task_id, assignment.task_version);
-    if (!authors.has(this.#participantLineage(agentId))) return false;
+    const authors = this.#currentVersionAuthors(assignment.task_id, assignment.task_version);
+    if (!authors.has(agentId)) return false;
     return this.#independentClaimantExists(assignment, authors, agentId);
   }
 
@@ -4844,7 +4830,7 @@ export class DevTeamStore extends EventEmitter {
   // never drift from what the scan will really do with that teammate.
   //
   // The recursion terminates at one level: whyNotClaimable consults #verifierIsAuthor in turn, but
-  // only for the teammates asked about here, and those are non-authors by construction — the lineage
+  // only for the teammates asked about here, and those are non-authors by construction — the author
   // test above returns false for them before reaching this method again.
   #independentClaimantExists(assignment, authors, excludeAgentId) {
     const members = this.db.prepare(`
@@ -4854,7 +4840,7 @@ export class DevTeamStore extends EventEmitter {
     `).all(assignment.task_id);
     for (const member of members) {
       if (member.agent_id === excludeAgentId) continue;
-      if (authors.has(this.#participantLineage(member.agent_id))) continue;
+      if (authors.has(member.agent_id)) continue;
       if (this.whyNotClaimable(assignment.id, member.agent_id, { refreshLiveness: false }).claimable) return true;
     }
     return false;
@@ -4863,7 +4849,7 @@ export class DevTeamStore extends EventEmitter {
   // No dead-ends: configured consensus cannot exceed the independent teammates who could
   // actually approve now. With none available, one honest self-review remains sufficient.
   #effectiveRequiredApprovals(taskId, configured, version) {
-    const eligible = this.#eligibleIndependentApproverLineages(taskId, version).size;
+    const eligible = this.#eligibleIndependentApprovers(taskId, version).size;
     return Math.max(1, Math.min(configured, eligible || 1));
   }
 
@@ -4904,10 +4890,9 @@ export class DevTeamStore extends EventEmitter {
     // cannot approve it — an independent teammate must. A genuine solo run is still allowed to
     // finish (no dead-ends), but its acceptance is labeled selfReviewed so it is never mistaken
     // for independent consensus.
-    const authorLineages = this.#currentVersionAuthorLineages(taskId, task.version);
-    const approverLineage = this.#participantLineage(agentId);
-    const eligibleIndependent = this.#eligibleIndependentApproverLineages(taskId, task.version);
-    if (authorLineages.has(approverLineage) && eligibleIndependent.size > 0) {
+    const authors = this.#currentVersionAuthors(taskId, task.version);
+    const eligibleIndependent = this.#eligibleIndependentApprovers(taskId, task.version);
+    if (authors.has(agentId) && eligibleIndependent.size > 0) {
       throw new Error("The author of the current version cannot approve it; an independent reviewer or tester must.");
     }
     let outcome;
@@ -4916,7 +4901,7 @@ export class DevTeamStore extends EventEmitter {
       // Independence is recorded on the approval, not recomputed later. Whether the approver was the
       // author is a fact about the moment of approving; recomputing it lets the record change as
       // agents connect and disconnect, which is exactly when it must not.
-      const independent = !authorLineages.has(approverLineage);
+      const independent = !authors.has(agentId);
       this.db.prepare(`
         INSERT INTO approvals (task_id, agent_id, version, summary, created_at, independent, verified_evidence)
         VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -4926,14 +4911,14 @@ export class DevTeamStore extends EventEmitter {
       this.#event(taskId, agentId, "task.approved",
         `${agent.name} approved version ${task.version}${independent ? "" : " (self-review: no independent teammate was available)"}.`,
         { summary: summary.trim(), version: task.version, independent, verifiedEvidence });
-      const approvalLineages = this.#approvalLineages(taskId, task.version);
-      const approvalCount = approvalLineages.size;
+      const approvers = this.#approvers(taskId, task.version);
+      const approvalCount = approvers.size;
       const openAssignments = Number(this.db.prepare("SELECT COUNT(*) AS count FROM assignments WHERE task_id = ? AND status IN ('queued', 'claimed')").get(taskId).count);
       const effectiveRequired = this.#effectiveRequiredApprovals(taskId, task.required_approvals, task.version);
       const accepted = approvalCount >= effectiveRequired && openAssignments === 0;
       // Honest labeling: rotating one session through a checkpoint cannot manufacture consensus.
-      const independentApprovalCount = [...approvalLineages].filter((lineage) => !authorLineages.has(lineage)).length;
-      const selfReviewed = authorLineages.size > 0 ? independentApprovalCount === 0 : approvalLineages.size <= 1;
+      const independentApprovalCount = [...approvers].filter((agent) => !authors.has(agent)).length;
+      const selfReviewed = authors.size > 0 ? independentApprovalCount === 0 : approvers.size <= 1;
       if (accepted) {
         this.db.prepare("UPDATE tasks SET status = 'accepted', updated_at = ? WHERE id = ?").run(stamp, taskId);
         this.#event(taskId, null, "task.accepted", `${selfReviewed ? "Self-reviewed acceptance" : "Consensus reached"} for version ${task.version}.`, { approvalCount, requiredApprovals: effectiveRequired, selfReviewed });
