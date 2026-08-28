@@ -588,7 +588,7 @@ export class CodeGraph {
   // anyway. `importedBy` is the one that is genuinely expensive to derive: reverse dependencies need
   // a search across the whole project, and that is what a graph is for.
   //
-  // So the brief carries the part that cannot be read off a file, and `devteam_codegraph` returns
+  // So the brief carries the part that cannot be read off a file, and `devteam_next with want=module` returns
   // everything when an agent asks about a specific module. Push what cannot be derived, pull what
   // can — the same rule the knowledge vault now follows.
   #moduleContext(modulePath, modulesByPath, outgoing, incoming, { lean = false } = {}) {

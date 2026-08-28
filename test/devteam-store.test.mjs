@@ -287,7 +287,7 @@ test("a claim carries a fencing token; a stale report is refused with a structur
   const conflict = await store.completeAssignment({ agentId: planner.id, assignmentId: write.id, message: "Too late.", claimToken: claim.claimToken });
   assert.equal(conflict.completed, false, "a report against a lease that moved on is refused");
   assert.ok(conflict.claimConflict, "and the refusal is structured");
-  assert.match(conflict.claimConflict.nextAction, /devteam_wait|devteam_resume/);
+  assert.match(conflict.claimConflict.nextAction, /devteam_next|devteam_join/);
 
   // A fresh claim gets a new token and generation and can complete normally.
   const reclaim = store.claimNextAssignment(planner.id);
@@ -1469,7 +1469,7 @@ test("a plain reconnect replays messages missed while the agent was disconnected
   // The human keeps talking to the (now absent) agent.
   store.humanMessage(task.id, "Please pick this up when you return.", "all");
 
-  // A fresh session for the same identity reconnects — no resume token, plain devteam_connect.
+  // A fresh session for the same identity reconnects — no resume token, a plain devteam_join.
   const second = store.connectAgent({ name: "Claude", provider: "Anthropic", freshTaskId: task.id });
   const inbox = store.deliverDirectedMessages(second.id);
   assert.ok(inbox.some((m) => /pick this up/.test(m.message)), "the message sent while away replays on a plain reconnect");

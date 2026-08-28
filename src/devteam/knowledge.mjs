@@ -1084,7 +1084,7 @@ export class KnowledgeVault {
   //
   // The vault was one-way: every note was derived from an event, so an agent that discovered "this
   // API rate-limits at 30/min" had nowhere to record it except prose in a report, where retrieval
-  // would never find it as a fact. devteam_note_set exists but writes flat key/value notes outside
+  // would never find it as a fact. devteam_memory action=set exists but writes flat key/value notes outside
   // the vault's category/status/confidence model.
   //
   // A written note is subject to exactly the same rules as a derived one — same redaction, same
@@ -1208,7 +1208,7 @@ export class KnowledgeVault {
   //
   // A note's first sentence is its claim, and a claim is what tells an agent whether it needs the
   // rest. So the top few keep their bodies — that detail is worth pushing unasked — and the tail
-  // arrives as one line each with its `[[wikilink]]`, which `devteam_knowledge` reads in full on
+  // arrives as one line each with its `[[wikilink]]`, which `devteam_memory` reads in full on
   // demand. Same budget, an order of magnitude more of the vault visible.
   relevant(projectId, taskId, limit = 12, context = {}, { bodyCount = 2, bodyBytes = 800 } = {}) {
     const rows = this.db.prepare(`

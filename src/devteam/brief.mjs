@@ -91,11 +91,11 @@ export function buildBudgetedBrief({ core, sections, budget = {}, clipped = {}, 
     // fetchMore is different — it is prose, five sentences of it, charged to the same budget as the
     // brief itself. A pointer to more is worth its bytes only where there is more to fetch.
     fetchMore: Object.fromEntries(Object.entries({
-      taskMemory: "Use devteam_note_get or devteam_note_list.",
-      projectMemory: "Use devteam_note_get or devteam_note_list with scope=project.",
-      projectKnowledge: "Use devteam_knowledge.",
-      codeContext: "Use devteam_codegraph.",
-      activity: "Use devteam_state for the full authorized task view.",
+      taskMemory: "Use devteam_memory with action=get.",
+      projectMemory: "Use devteam_memory with action=get and scope=project.",
+      projectKnowledge: "Use devteam_memory.",
+      codeContext: "Use devteam_next with want=module.",
+      activity: "Use devteam_next with want=state for the full authorized task view.",
     }).filter(([key]) => Number(omittedCounts[key === "activity" ? "recent" : key]) > 0)),
   };
   payload.briefMeta.truncated = Object.values(omittedCounts).some((count) => Number(count) > 0)

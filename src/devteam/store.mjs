@@ -1112,11 +1112,11 @@ export class DevTeamStore extends EventEmitter {
   // Return undirected/directed human messages this agent has not yet received,
   // and record delivery. "Directed" = target is this agent's name; broadcasts use
   // target "all". Only messages posted during this session are delivered live;
-  // older history is still visible through devteam_state.
+  // older history is still visible through devteam_next with want=state.
   // Is this timeline event a live message for the given agent? Human messages reach the agent
   // if broadcast ("all") or addressed to its name. Agent messages are only *pushed* when they
   // are directed to this agent by name (never the sender's own, never undirected broadcasts —
-  // those stay timeline notes read via devteam_state).
+  // those stay timeline notes read via devteam_next with want=state).
   #messageIsForAgent(event, agent) {
     const nameLower = String(agent.name).toLowerCase();
     if (event.type === "human.message") {
@@ -2202,7 +2202,7 @@ export class DevTeamStore extends EventEmitter {
         return;
       }
       if (checkpoint.from_agent_id === agentId) {
-        outcome = { error: "Session takeover requires a distinct fresh agent session. Use devteam_resume only when restoring the same conversation." };
+        outcome = { error: "Session takeover requires a distinct fresh agent session. Use devteam_join with a resumeToken only when restoring the same conversation." };
         return;
       }
       if (checkpoint.expires_at <= stamp) {
@@ -2440,7 +2440,7 @@ export class DevTeamStore extends EventEmitter {
       score: record.score,
       reasons: (record.reasons || []).slice(0, 3).map((reason) => reason.detail || String(reason)),
       guidance: demanding && !gated
-        ? `This assignment scored ${record.level}. No model gate is active, so nothing will stop you if it is beyond the model or effort you are running — that judgement is yours alone. If it is beyond you, do not push on: call devteam_block with kind "over-my-head" and name the capability needed.`
+        ? `This assignment scored ${record.level}. No model gate is active, so nothing will stop you if it is beyond the model or effort you are running — that judgement is yours alone. If it is beyond you, do not push on: call devteam_stuck with kind "over-my-head" and name the capability needed.`
         : null,
     };
   }
@@ -2767,7 +2767,7 @@ export class DevTeamStore extends EventEmitter {
   // There is deliberately no implicit "sole active task" fallback: it made single-task use
   // zero-config at the price of an agent's room silently changing meaning the moment a second task
   // appeared, which read as "the board stopped handing out work" with nothing to explain it.
-  // devteam_connect(taskId) and devteam_join are the ways in; roomStatusForAgent says so out loud.
+  // devteam_join are the ways in; roomStatusForAgent says so out loud.
   #memberTaskIds(agentId) {
     return this.db.prepare("SELECT task_id FROM task_members WHERE agent_id = ?").all(agentId).map((row) => row.task_id);
   }
@@ -4131,7 +4131,7 @@ export class DevTeamStore extends EventEmitter {
   }
 
   // What a claimed assignment's holder should be told on its next call: whether it has been asked to
-  // stop, and whether the task has run past its budget. Returned by heartbeat and by devteam_wait.
+  // stop, and whether the task has run past its budget. Returned by heartbeat and by devteam_next.
   steeringFor(agentId) {
     const held = this.db.prepare(`
       SELECT a.id, a.title, a.task_id, a.cancel_requested_at, a.cancel_reason
@@ -4456,8 +4456,8 @@ export class DevTeamStore extends EventEmitter {
     if (!task) throw new Error("Task not found.");
     this.assertMembership(agentId, taskId);
     // A message can be aimed at a specific teammate. A directed agent message is pushed to that
-    // teammate (returned by their next devteam_wait / tool call); an undirected one is a
-    // timeline note anyone can read via devteam_state.
+    // teammate (returned by their next devteam_next / tool call); an undirected one is a
+    // timeline note anyone can read via devteam_next with want=state.
     const enriched = { ...metadata };
     let directedTo = null;
     if (metadata.target && String(metadata.target).trim()) {
@@ -4507,7 +4507,7 @@ export class DevTeamStore extends EventEmitter {
         reason: assignment.status !== "claimed"
           ? `This assignment is ${assignment.status}, not an active claim.`
           : "This assignment's lease has moved to a different session.",
-        nextAction: "Do not write further under this claim. Call devteam_wait to pick up current work, or devteam_resume if you are returning to an earlier session.",
+        nextAction: "Do not write further under this claim. Call devteam_next to pick up current work, or devteam_join with your resumeToken if you are returning to an earlier session.",
       },
     };
   }
@@ -4721,7 +4721,7 @@ export class DevTeamStore extends EventEmitter {
       if (status === "blocked") {
         // An assignment-level blocker is a triage signal, not permission to stop every teammate.
         // Queue a fresh planner item so the team can re-scope or ask the human while sibling work
-        // and write leases continue. Only the explicit blockTask/devteam_block path is task-wide.
+        // and write leases continue. Only the explicit blockTask/devteam_stuck path is task-wide.
         followUpAssignmentId = randomUUID();
         this.db.prepare(`
           INSERT INTO assignments (id, task_id, title, description, role, requires_write, status, created_at, plans)
@@ -4730,7 +4730,7 @@ export class DevTeamStore extends EventEmitter {
           followUpAssignmentId,
           assignment.task_id,
           `Resolve blocker: ${assignment.title}`,
-          `Review the blocker reported for "${assignment.title}": ${message.trim()}. Re-scope the work, create a replacement assignment, or use devteam_block only if the entire task genuinely requires human input.`,
+          `Review the blocker reported for "${assignment.title}": ${message.trim()}. Re-scope the work, create a replacement assignment, or use devteam_stuck only if the entire task genuinely requires human input.`,
           this.planningRoleFor(task.project_id),
           stamp,
         );
@@ -5476,7 +5476,7 @@ export class DevTeamStore extends EventEmitter {
     return {
       stale: this.knowledge.staleKnowledge(task.project_id, { olderThanDays, limit }),
       disputed,
-      next: "Confirm a stale note with devteam_knowledge_confirm if it still holds, correct it by writing over it, or resolve a disputed pair with devteam_propose.",
+      next: "Correct a stale note by writing over it with devteam_memory action=write, or resolve a disputed pair with devteam_propose.",
     };
   }
 
@@ -5955,7 +5955,7 @@ export class DevTeamStore extends EventEmitter {
       ...note,
       title: clip(note.title, 360, "knowledgeTitles"),
       // Only the few notes that carry a body pay for one. The rest arrive as a headline and a
-      // wikilink, which devteam_knowledge reads in full when the agent decides it matters.
+      // wikilink, which devteam_memory reads in full when the agent decides it matters.
       ...(note.body === undefined ? {} : { body: clip(note.body, 1_400, "knowledgeBodies") }),
       relatedFiles: (note.relatedFiles || []).slice(0, 8).map((file) => clip(file, 400, "knowledgePaths")),
     }));
@@ -6025,7 +6025,7 @@ export class DevTeamStore extends EventEmitter {
   }
 
   // The dashboard snapshot as one agent may see it: the pre-selected task detail is limited to a
-  // room the agent belongs to, so a no-taskId devteam_state never hands a non-member another
+  // room the agent belongs to, so a no-taskId devteam_next with want=state never hands a non-member another
   // room's full timeline. The project/agent/task lists stay visible (they carry no room secrets).
   snapshotForAgent(agentId) {
     const tasks = this.listTasks();

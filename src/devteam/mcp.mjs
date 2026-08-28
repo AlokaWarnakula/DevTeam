@@ -31,18 +31,18 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
   // Without this, any client sharing the bearer token could pass another agent's id and speak,
   // vote, approve, or disconnect as them — making the timeline's provenance untrustworthy.
   const requireIdentity = (agentId) => {
-    if (!session.agentId) throw new Error("This MCP session has not connected. Call devteam_connect first.");
+    if (!session.agentId) throw new Error("This MCP session has not connected. Call devteam_join first.");
     if (agentId !== session.agentId) throw new Error("Identity mismatch: an MCP session may only act as the agent it connected as.");
   };
 
   // Reachability: piggyback any directed/broadcast messages waiting for this agent onto whatever
-  // call it just made, so a *busy* agent (not sitting in devteam_wait) is still reached promptly
+  // call it just made, so a *busy* agent (not sitting in devteam_next) is still reached promptly
   // instead of only when it next goes idle.
   const takeInbox = (agentId) => {
     let pendingMessages = [];
     let pendingProposals = [];
     try { pendingMessages = store.deliverDirectedMessages(agentId); } catch { pendingMessages = []; }
-    // Surface open proposals the same way, so a *busy* agent (not sitting in devteam_wait) is asked to
+    // Surface open proposals the same way, so a *busy* agent (not sitting in devteam_next) is asked to
     // vote on any call it makes instead of a unanimity decision silently stalling until it next goes
     // idle. Only proposals in its rooms that it has not yet voted on are returned.
     try { pendingProposals = store.openProposalsForAgent(store.getAgent(agentId)); } catch { pendingProposals = []; }
@@ -51,7 +51,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
   const withInbox = (agentId, result) => {
     const { pendingMessages, pendingProposals } = takeInbox(agentId);
     // Human steering rides along on whatever call the agent just made, for the same reason messages
-    // do: an agent deep in a long edit is not sitting in devteam_wait, and "stop, this is no longer
+    // do: an agent deep in a long edit is not sitting in devteam_next, and "stop, this is no longer
     // worth doing" is worthless if it only arrives when the agent next goes idle.
     let steering = null;
     try { steering = store.steeringFor(agentId); } catch { steering = null; }
@@ -173,7 +173,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
         keepWaiting: false,
         availableTasks: initialRoomStatus.activeTasks,
         message: "You have joined no task room, so no work here is claimable by you. Choose the intended taskId from availableTasks and call devteam_join before waiting.",
-        next: "Call devteam_join with this agentId, the intended taskId, and role contributor; then call devteam_wait again.",
+        next: "Call devteam_join with this agentId, the intended taskId, and role contributor; then call devteam_next again.",
       };
     }
     const deadline = Date.now() + timeoutSeconds * 1000;
@@ -185,7 +185,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
           status: "message",
           messages,
           keepWaiting: true,
-          next: "Read these messages. If a reply or acknowledgement is expected, post it with devteam_message, then call devteam_wait again to stay responsive to the team.",
+          next: "Read these messages. If a reply or acknowledgement is expected, post it with devteam_message, then call devteam_next again to stay responsive to the team.",
         };
       }
       const proposals = store.openProposalsForAgent(store.getAgent(agentId));
@@ -194,7 +194,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
           status: "proposal",
           proposals,
           keepWaiting: true,
-          next: "The team is deciding how to organise. Review each proposal and vote with devteam_vote (agree or object, with a short reason). A proposal is adopted only when every connected teammate agrees.",
+          next: "The team is deciding how to organise. Review each proposal and vote with devteam_verdict (agree or object, with a short reason). A proposal is adopted only when every connected teammate agrees.",
         };
       }
       const rotation = store.sessionRotationRecommendation(agentId);
@@ -219,7 +219,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
             responseCore: {
               status: "assigned",
               keepWaiting: true,
-              instructions: "Inspect the current project state before acting. Complete this bounded assignment, then call devteam_report — pass back assignment.claimToken so a stale report is fenced if your lease moved. Use devteam_assign to delegate follow-up implementation, testing, or independent review.",
+              instructions: "Inspect the current project state before acting. Complete this bounded assignment, then call devteam_report — pass back assignment.claimToken so a stale report is fenced if your lease moved. Use devteam_plan to delegate follow-up implementation, testing, or independent review.",
             },
           });
         }
@@ -248,14 +248,14 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
       activity,
       ...(blockedRooms.length ? { blockedRooms } : {}),
       message: activity.active
-        ? "No work for you yet, but the team is still active (work is in flight or teammates are busy). Call devteam_wait again to stay assembled. If you have been idle with no assignment or message for about five minutes straight, disconnect and tell the user to invoke $devteam again when there is new work."
+        ? "No work for you yet, but the team is still active (work is in flight or teammates are busy). Call devteam_next again to stay assembled. If you have been idle with no assignment or message for about five minutes straight, disconnect and tell the user to invoke $devteam again when there is new work."
         : "The room is quiet: no open assignments and no busy teammates. Disconnect to save the session; the user can reconnect this agent when new work is ready.",
     };
   }));
 
   server.registerTool("devteam_message", {
     title: "Post a team message",
-    description: "Post a focused progress note, design decision, review finding, or question. Omit target to post a timeline note the whole room can read; set target to a teammate's name to send a directed message that is pushed to them. Pass replyTo (a timeline event id from devteam_state) to answer a specific message as a thread.",
+    description: "Post a focused progress note, design decision, review finding, or question. Omit target to post a timeline note the whole room can read; set target to a teammate's name to send a directed message that is pushed to them. Pass replyTo (a timeline event id from devteam_next with want=state) to answer a specific message as a thread.",
     inputSchema: {
       agentId: z.string().uuid(),
       taskId: z.string().uuid(),
@@ -371,7 +371,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
 
   server.registerTool("devteam_report", {
     title: "Report completed work",
-    description: "Complete the currently claimed assignment with evidence. Report exact files and checks; changed files advance the task version and invalidate prior approvals. A check may carry a command, which DevTeam runs itself inside the project root and grades by exit code — a report claiming success for a command that actually fails is refused, and your claim is left intact so you can fix it and report again. Checks without a command are recorded as your assertion and labeled as such. While those commands run the assignment shows as verifying and keeps your claim; if this returns completed:false with a verifying payload, an earlier report of yours is still being checked — wait for it rather than reporting again. status=blocked closes only this assignment and queues planner triage; use devteam_block separately only for a genuine task-wide blocker.",
+    description: "Complete the currently claimed assignment with evidence. Report exact files and checks; changed files advance the task version and invalidate prior approvals. A check may carry a command, which DevTeam runs itself inside the project root and grades by exit code — a report claiming success for a command that actually fails is refused, and your claim is left intact so you can fix it and report again. Checks without a command are recorded as your assertion and labeled as such. While those commands run the assignment shows as verifying and keeps your claim; if this returns completed:false with a verifying payload, an earlier report of yours is still being checked — wait for it rather than reporting again. status=blocked closes only this assignment and queues planner triage; use devteam_stuck separately only for a genuine task-wide blocker.",
     inputSchema: {
       agentId: z.string().uuid(),
       assignmentId: z.string().uuid(),
@@ -386,7 +386,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
         }),
       ])).max(100).default([]),
       disconnectAfter: z.boolean().default(false),
-      claimToken: z.string().max(200).optional().describe("The claimToken from the assignment you claimed (or from devteam_resume). Lets the server fence a stale report if your lease has since moved."),
+      claimToken: z.string().max(200).optional().describe("The claimToken from the assignment you claimed (or from devteam_join when you resumed). Lets the server fence a stale report if your lease has since moved."),
       usage: z.object({
         inputTokens: z.number().int().min(0).optional(),
         outputTokens: z.number().int().min(0).optional(),
