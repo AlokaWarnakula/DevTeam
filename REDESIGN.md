@@ -686,3 +686,100 @@ fills `conventions/` by itself. Nothing to do but check back.
 - **Domain-neutral vocabulary** (section 5) — roles and checks are project-configurable already, but
   the defaults and dashboard labels still say "changed files", "diff", "security review".
 - `store.mjs` is 6,194 lines in one class. Item 4 shrinks it; splitting it is a separate decision.
+  **Both are done — see section 17.**
+
+## 17. The store.mjs cleanup and split, as built
+
+Section 16 item 4 said the retired internals were hygiene, and that splitting the file was a
+separate decision. Both are done. `store.mjs` went from **6,194 lines and 196 methods in one class**
+to **2,462 lines**, across seven files. `npm test` 277 → 247, `npm run soak` and `npm run mutation`
+green at every step.
+
+### Phase A — what came out, and what proved it was unreachable
+
+| Feature | Evidence it was dead | Cost |
+|---|---|---|
+| Task budget cap | `setTaskBudget` had no caller outside its own tests — no tool, route or dashboard control | −127 lines, −2 tests |
+| `assignment_usage` | `usage` left the report schema in d10c94e, so `completeAssignment` always received `null` | −130 lines, −1 test |
+| Session checkpoints | Tools and routes removed in b7f5b51/1121b2c; `server.mjs` still held an invitation builder nothing called | −1,122 lines, −10 tests |
+| Runtime gate | No MCP path ever stored a profile; `updateRuntimeProfile` and `runtimeDecision` had only test callers | −1,100 lines, −16 tests |
+
+Two things were **not** as the handoff described them, and both are worth remembering.
+
+**The runtime gate was not merely dead — it was armable into a dead end.** `PATCH /api/tasks/:id`
+still accepted `baseRuntimeProfile`, a field no dashboard control exposes, and `#runtimeGate` sat in
+the claim path. Set that field and an assignment became unclaimable, while the gate told the agent
+to fix it by calling `devteam_runtime_decision` and `devteam_runtime_update` — neither a registered
+tool since b7f5b51. Removing it took away a way to strand work, which is a stronger reason than
+hygiene.
+
+**The ordering in the handoff had to be reversed twice.** The spend cap summed
+`assignment_usage.cost_cents`, so the budget had to go first or a query against a dropped table
+would stand for a commit. And the gate's largest block lived *inside* `createSessionCheckpoint`, so
+checkpoints had to go before the gate.
+
+Kept deliberately, despite sharing tables with what was removed: **`runtimeLadder`** and
+**`complexity_assessments`**. The ladder is live — `devteam_join` reports one, the board names the
+model a piece of work needs. Only the gate came out; `runtime/index.mjs` kept its assessment half
+and lost its profile half, 234 lines to 83.
+
+**Session rotation went too, and that was a judgement call rather than a deletion.**
+`sessionRotationRecommendation` is reached by every `devteam_next`, but opened with
+`if (!this.runtimeProfile(agentId)) return null` — so with zero profiles it had never once fired.
+Removing it keeps behaviour byte-identical; keeping it and dropping the guard would have switched a
+dormant feature on. The dashboard's session-policy setting survives with nothing acting on it for
+agents, which is a loose end for a later session.
+
+### Phase B — how the file is organised now
+
+| File | Lines | Holds |
+|---|---|---|
+| `store.mjs` | 2,462 | the class, constructor, lifecycle, tokens, jobs, the reaper, projects, tasks, assignments and the **scheduler** |
+| `store-views.mjs` | 647 | snapshot, task detail, `taskBrief`, replay, reliability — everything that reads |
+| `store-consensus.mjs` | 564 | proposals, approvals, and the author-cannot-verify-own-work rules |
+| `store-agents.mjs` | 474 | sessions, rooms, membership, presence, directed messages |
+| `store-checks.mjs` | 427 | the allowlist, verified checks, baselines, regressions |
+| `schema.mjs` | 396 | every table, index and migration |
+| `store-knowledge.mjs` | 214 | blackboard notes, the vault, code-graph queries |
+| `util.mjs` | 18 | `now`, `json`, `fromJson` |
+
+Mixins, composed with one `Object.assign(DevTeamStore.prototype, ...)` after the class body. No call
+site changed, inside the file or out. The scheduler stayed in `store.mjs` on purpose: it is what the
+rest of the class exists to serve, and `claimNextAssignment` and `whyNotClaimable` must be read
+against each other.
+
+`schema.mjs` is the one piece that is **not** a mixin. `#migrate` touched exactly one thing on
+`this` — the database handle — so it left as a free function, `applySchema(db)`. Nothing about it
+wanted to be a method.
+
+### The price, stated plainly
+
+A JavaScript `#private` is lexically bound to the class body that declares it, so **a mixin can
+never call `this.#event`**. Forty-six members had to become `_`-prefixed internals: privacy enforced
+by the compiler became privacy by convention. That is a real loss, and it is the entire cost of the
+file being separable. Twenty-five members that never crossed a boundary are still `#private` —
+scheduler internals, the instance lock, the scope resolver — so the convention is the exception
+rather than the rule.
+
+Two things made this safe to do mechanically:
+
+- **The language catches the mistake that matters.** Both errors during the agents split were
+  `this.#private` calls left in moved text, and both failed at module *parse* time, before any test
+  ran. Every mixin now contains zero `this.#` references, checked rather than assumed.
+- **The language does not catch a missing import.** `knowledgeWrite` reaches for `path.join`; the
+  first cut omitted the import and the module loaded fine, throwing only when a test actually wrote
+  a note. So every mixin is now scanned against the module-level names `store.mjs` defines.
+
+`tools/mutate-scheduler.mjs` needed one anchor repointed: M13 referenced `this.#reapStaleAgents`,
+and reported SETUP ERROR — "a mutant is testing nothing" — exactly as it should. All 13 mutants are
+caught again (12 caught, M9 equivalent).
+
+### Still open after this
+
+- `REDESIGN.md` had been **deleted outright** by e887959, a commit titled "reformat REDESIGN tables"
+  that recorded 688 deletions and no insertions. Restored in `41075d2`. Worth knowing that the
+  document the next session is told to start from can go missing silently.
+- The session-policy setting on a task now has no consumer for agents. Either give it one or take
+  the control out of the dashboard.
+- Domain-neutral vocabulary (section 5) is untouched.
+- Nothing here has run a real two-agent session. Section 16 item 1 is still the real test.
