@@ -73,7 +73,6 @@ export async function startDevTeamServer({
   liveness = {},
   knowledge = { enabled: true },
   codegraph = { enabled: true },
-  checkpoint = {},
 } = {}) {
   if (!dataDir) throw new Error("dataDir is required.");
   // T4.1 — the one place DevTeam declines to start. A server reachable from the network whose
@@ -81,7 +80,7 @@ export async function startDevTeamServer({
   // no server, and an operator who means to expose it can say so with a real secret.
   const exposure = checkExposureRequirements({ host, token: process.env.DEVTEAM_TOKEN });
   if (!exposure.ok) throw new Error(exposure.error);
-  const store = new DevTeamStore(dataDir, { liveness, knowledge, codegraph, checkpoint });
+  const store = new DevTeamStore(dataDir, { liveness, knowledge, codegraph });
   // An operator-supplied token replaces the generated one, so what authenticates is the secret they
   // chose rather than a string sitting in the data directory.
   if (process.env.DEVTEAM_TOKEN) store.setSharedToken(process.env.DEVTEAM_TOKEN);
@@ -178,18 +177,6 @@ export async function startDevTeamServer({
     if (credentialOf(req)) return next();
     return res.status(401).json({ error: "This action requires the DevTeam dashboard session or bearer token." });
   };
-
-  const checkpointInvitation = (task, result) => [
-    `Continue DevTeam task “${result.checkpoint.capsule?.task?.title || task.id}” in a fresh session.`,
-    "",
-    "Use the DevTeam skill and connect as a new agent session. Join the task room below, then call devteam_session_takeover exactly once with:",
-    "",
-    `taskId: ${task.id}`,
-    `checkpointId: ${result.checkpoint.id}`,
-    `handoffToken: ${result.handoffToken}`,
-    "",
-    "After takeover, read the bounded capsule, inspect the repository and current task state, and continue only under the newly issued claim token. Do not use devteam_resume: this is an intentional fresh-session takeover. The handoff token is single-use and expires at " + result.checkpoint.expiresAt + ".",
-  ].join("\n");
 
   const mcpPost = asyncRoute(async (req, res) => {
     const sessionId = req.get("mcp-session-id");

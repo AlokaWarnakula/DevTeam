@@ -1187,7 +1187,6 @@
   margin-top: -5px;
 }
 
-/* Safe session checkpoint and fresh-invitation controls. */
 .assignment-actions {
   display: flex;
   flex-wrap: wrap;
@@ -1196,75 +1195,6 @@
 }
 
 .assignment-actions:empty { display: none; }
-
-.mini.checkpoint {
-  border-color: color-mix(in srgb, var(--accent, #8ea7ff) 55%, transparent);
-}
-
-.checkpoint-list {
-  display: grid;
-  gap: 8px;
-}
-
-.checkpoint-card {
-  padding: 10px;
-  border: 1px solid var(--border, #2c313b);
-  border-radius: 10px;
-  background: color-mix(in srgb, var(--surface, #11151b) 86%, transparent);
-}
-
-.checkpoint-top {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.checkpoint-card p {
-  margin: 6px 0;
-  color: var(--muted, #9ba3b4);
-  font-size: 12px;
-  line-height: 1.45;
-  overflow-wrap: anywhere;
-}
-
-.checkpoint-card small { display: block; margin-bottom: 7px; }
-
-.checkpoint-status {
-  padding: 2px 7px;
-  border: 1px solid currentColor;
-  border-radius: 999px;
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: .05em;
-  text-transform: uppercase;
-}
-
-.checkpoint-status.ready { color: #f2c66d; }
-.checkpoint-status.claimed { color: #79d8a5; }
-.checkpoint-status.expired,
-.checkpoint-status.cancelled { color: #9ba3b4; }
-
-.checkpoint-dialog { width: min(680px, calc(100vw - 28px)); }
-
-.checkpoint-assignment-summary {
-  padding: 10px 12px;
-  border-left: 3px solid var(--accent, #8ea7ff);
-  background: color-mix(in srgb, var(--accent, #8ea7ff) 9%, transparent);
-  overflow-wrap: anywhere;
-}
-
-.checkpoint-result {
-  padding: 12px;
-  border: 1px solid color-mix(in srgb, #79d8a5 45%, var(--border, #2c313b));
-  border-radius: 10px;
-  background: color-mix(in srgb, #79d8a5 6%, transparent);
-}
-
-.checkpoint-result textarea {
-  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-  font-size: 12px;
-}
 
 #task-description.collapsed {
   display: -webkit-box;
