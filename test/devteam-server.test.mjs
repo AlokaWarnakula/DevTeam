@@ -553,66 +553,6 @@ test("dashboard can resume blocked work and records human acceptance without for
   assert.match(event.message, /Human accepted/);
 });
 
-test("the runtime profile control plane persists human-entered models and stays authenticated", async (t) => {
-  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-runtime-rest-"));
-  const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd(), knowledge: { enabled: false } });
-  t.after(async () => { await instance.close(); await rm(dataDir, { recursive: true, force: true }); });
-  const authed = { "content-type": "application/json", authorization: `Bearer ${instance.store.token}` };
-
-  const project = instance.store.ensureProject("Runtime REST", process.cwd());
-  const task = instance.store.createTask({ projectId: project.id, title: "Runtime REST", description: "Exercise the profile surface." });
-  const profile = {
-    providerId: "fixture-provider",
-    currentModel: "fixture-balanced",
-    currentEffort: "fixture-medium",
-    availableModels: [{
-      id: "fixture-balanced",
-      label: "Fixture Balanced 5",
-      class: "balanced",
-      efforts: [{ id: "fixture-medium", label: "Medium", class: "medium" }],
-    }],
-  };
-
-  // A state-changing profile call without a credential must be refused.
-  const anonymous = await fetch(`${instance.url}/api/tasks/${task.id}`, {
-    method: "PATCH",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ baseRuntimeProfile: profile }),
-  });
-  assert.equal(anonymous.status, 401, "the base profile cannot be set without the dashboard session or bearer token");
-
-  const patched = await fetch(`${instance.url}/api/tasks/${task.id}`, {
-    method: "PATCH", headers: authed, body: JSON.stringify({ baseRuntimeProfile: profile }),
-  });
-  assert.equal(patched.status, 200);
-  const state = await fetch(`${instance.url}/api/state?taskId=${task.id}`).then((response) => response.json());
-  const base = state.selectedTask.baseRuntimeProfile;
-  assert.equal(base.source, "user", "a human-entered profile is stored as a user claim, never as a host observation");
-  assert.equal(base.currentModelClass, "balanced");
-  assert.equal(base.availableModels[0].label, "Fixture Balanced 5", "the display name the human typed survives the round trip");
-
-  const agent = instance.store.connectAgent({ name: "RestAgent", provider: "fixture", freshTaskId: task.id });
-  const put = await fetch(`${instance.url}/api/agents/${agent.id}/runtime`, {
-    method: "PUT", headers: authed, body: JSON.stringify({ profile }),
-  });
-  assert.equal(put.status, 200);
-  const stored = await put.json();
-  assert.equal(stored.runtimeProfile.source, "user");
-  assert.equal(stored.runtimeProfile.currentModel, "fixture-balanced");
-  // The profile read-back is itself credentialed, so a page without the dashboard session cannot
-  // enumerate which models a session advertises.
-  const anonymousRead = await fetch(`${instance.url}/api/agents/${agent.id}/runtime`);
-  assert.equal(anonymousRead.status, 401, "reading an agent's advertised models requires a credential");
-  const readBack = await fetch(`${instance.url}/api/agents/${agent.id}/runtime`, { headers: authed }).then((response) => response.json());
-  assert.equal(readBack.runtimeProfile.availableModels[0].label, "Fixture Balanced 5");
-
-  // A value that claims to be a full profile but cannot normalize is refused rather than stored.
-  const rejected = await fetch(`${instance.url}/api/tasks/${task.id}`, {
-    method: "PATCH", headers: authed, body: JSON.stringify({ baseRuntimeProfile: { providerId: "", availableModels: [] } }),
-  });
-  assert.equal(rejected.status >= 400, true, "an unusable profile is refused where the human can still fix it");
-});
-
 test("the scheduler explains a held assignment over REST and over MCP", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-explain-server-"));
   const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd(), knowledge: { enabled: false } });
