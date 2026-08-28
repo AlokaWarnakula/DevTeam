@@ -387,12 +387,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
       ])).max(100).default([]),
       disconnectAfter: z.boolean().default(false),
       claimToken: z.string().max(200).optional().describe("The claimToken from the assignment you claimed (or from devteam_join when you resumed). Lets the server fence a stale report if your lease has since moved."),
-      usage: z.object({
-        inputTokens: z.number().int().min(0).optional(),
-        outputTokens: z.number().int().min(0).optional(),
-        costUsd: z.number().min(0).optional(),
-        model: z.string().max(120).optional(),
-      }).optional().describe("What this assignment cost you, if your host tells you. Recorded and shown as agent-reported — DevTeam cannot measure it and does not pretend to. Report real figures or omit this entirely; never estimate."),
+
     },
   }, safe(async ({ disconnectAfter, ...args }) => {
     requireIdentity(args.agentId);
