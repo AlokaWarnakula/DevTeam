@@ -7,6 +7,7 @@ import { applySchema } from "./schema.mjs";
 import { fromJson, json, now } from "./util.mjs";
 import { checksMethods } from "./store-checks.mjs";
 import { knowledgeMethods } from "./store-knowledge.mjs";
+import { consensusMethods, PROPOSAL_KINDS } from "./store-consensus.mjs";
 import { CodeGraph } from "./codegraph.mjs";
 import { KnowledgeVault } from "./knowledge.mjs";
 import { buildBudgetedBrief, clipUtf8, DEFAULT_BRIEF_BUDGET } from "./brief.mjs";
@@ -47,12 +48,6 @@ const CANDIDATE_SCAN_CEILING = 500;
 // How many read-only assignments one agent may hold at once, on top of its single write claim. A
 // guard against one agent draining the review queue, not a correctness rule — reviews take no lease.
 const MAX_CONCURRENT_READ_CLAIMS = 3;
-// Whether an assignment reads the work rather than changing it — and therefore waits for pending
-// writers, earns the right to approve, and puts its task in review — is a column on the row,
-// resolved from the project's role config when the assignment was created (see roles.mjs). It is
-// deliberately NOT a list of role names here: a project that calls its reviewing role `fact-checker`
-// or `structural-engineer` must schedule identically, and no domain vocabulary belongs in this SQL.
-const VERIFIES = "verifies = 1";
 // Which assignments depend, directly or transitively, on which. Written once so the candidate scan
 // and the scheduler's explanation walk the same edges.
 const DEPENDENCY_CLOSURE_CTE = `
@@ -433,7 +428,7 @@ export class DevTeamStore extends EventEmitter {
     this.emit("change", { type, taskId, at: now() });
   }
 
-  #syncTaskStatus(taskId, stamp = now()) {
+  _syncTaskStatus(taskId, stamp = now()) {
     const task = this.db.prepare("SELECT status FROM tasks WHERE id = ?").get(taskId);
     if (!task || ["accepted", "blocked", "cancelled"].includes(task.status)) return task?.status || null;
     const openAssignments = this.db.prepare(`
@@ -459,7 +454,7 @@ export class DevTeamStore extends EventEmitter {
       SELECT id FROM tasks WHERE status NOT IN ('accepted', 'blocked', 'cancelled')
     `).all();
     const stamp = now();
-    for (const task of taskIds) this.#syncTaskStatus(task.id, stamp);
+    for (const task of taskIds) this._syncTaskStatus(task.id, stamp);
   }
 
   #releaseAgentClaims(agent, stamp, reason) {
@@ -480,7 +475,7 @@ export class DevTeamStore extends EventEmitter {
         reason,
         releasedAssignments: released,
       });
-      this.#syncTaskStatus(taskId, stamp);
+      this._syncTaskStatus(taskId, stamp);
     }
     return taskIds;
   }
@@ -522,7 +517,7 @@ export class DevTeamStore extends EventEmitter {
       for (const row of recoverable) {
         this.db.prepare("UPDATE assignments SET status = 'queued', agent_id = NULL, claimed_at = NULL, claim_token_hash = NULL WHERE id = ?").run(row.id);
         this._event(row.task_id, null, "assignment.released", `${row.agent_name}'s read-only assignment was recovered after a long silence.`, { assignmentId: row.id, reason: "stale-readonly-recovery" });
-        this.#syncTaskStatus(row.task_id, stamp);
+        this._syncTaskStatus(row.task_id, stamp);
         affectedTasks.add(row.task_id);
       }
       // Agents gone a very long time are purged so the roster reflects reality instead of showing
@@ -566,7 +561,7 @@ export class DevTeamStore extends EventEmitter {
       `).run();
       for (const orphan of orphans) {
         this._event(orphan.task_id, orphan.agent_id, "assignment.released", `${orphan.agent_name}'s orphaned assignment was returned to the queue.`, { reason });
-        this.#syncTaskStatus(orphan.task_id, stamp);
+        this._syncTaskStatus(orphan.task_id, stamp);
       }
     });
     for (const taskId of new Set(orphans.map((orphan) => orphan.task_id))) this._changed("assignment.released", taskId);
@@ -644,7 +639,7 @@ export class DevTeamStore extends EventEmitter {
   // Activity as seen from one agent's rooms, so a member of a quiet task isn't kept assembled by
   // a different task's work on a multi-task server.
   teamActivityForAgent(agentId) {
-    return this.teamActivity(this.#memberTaskIds(agentId));
+    return this.teamActivity(this._memberTaskIds(agentId));
   }
 
   // Return undirected/directed human messages this agent has not yet received,
@@ -670,7 +665,7 @@ export class DevTeamStore extends EventEmitter {
   deliverDirectedMessages(agentId) {
     const agent = this.getAgent(agentId);
     if (agent.status === "disconnected") return [];
-    const rooms = this.#memberTaskIds(agentId);
+    const rooms = this._memberTaskIds(agentId);
     if (!rooms.length) return [];
     const roomPlaceholders = rooms.map(() => "?").join(", ");
     const floor = agent.message_floor || agent.connected_at;
@@ -766,21 +761,13 @@ export class DevTeamStore extends EventEmitter {
     };
   }
 
-  // Did this assignment read the work rather than change it? Asked of the assignment row rather than
-  // of the role name recorded on the event, so a project that renamed its reviewing role still earns
-  // approval standing, and a role renamed *after* the fact cannot retroactively grant it.
-  #assignmentVerifies(assignmentId) {
-    if (!assignmentId) return false;
-    return Boolean(this.db.prepare("SELECT verifies FROM assignments WHERE id = ?").get(assignmentId)?.verifies);
-  }
-
-  #resolveChecklist(projectId, role, provided) {
+  _resolveChecklist(projectId, role, provided) {
     if (Array.isArray(provided)) return provided.map((item) => String(item).trim()).filter(Boolean).slice(0, 40);
     const checklist = this.roleBehaviour(projectId, role).checklist;
     return checklist.length ? checklist : null;
   }
 
-  #storeChecklist(assignmentId, items) {
+  _storeChecklist(assignmentId, items) {
     if (!items || !items.length) return;
     this.db.prepare("INSERT OR REPLACE INTO assignment_checklists (assignment_id, items) VALUES (?, ?)").run(assignmentId, json(items));
   }
@@ -792,227 +779,7 @@ export class DevTeamStore extends EventEmitter {
   // --- Role negotiation: agents (and the human) propose role/handoff/plan changes,
   // teammates vote, and on agreement the change is adopted and real work is reassigned. ---
 
-  static PROPOSAL_KINDS = ["role", "handoff", "plan", "decision"];
-
-  createProposal({ agentId = null, taskId, kind = "role", summary, details = {} }) {
-    const task = this.getTask(taskId);
-    if (!task) throw new Error("Task not found.");
-    this.assertMembership(agentId, taskId);
-    if (["accepted", "blocked", "cancelled"].includes(task.status)) throw new Error(this.closedTaskError(task, "open a proposal on it"));
-    if (!DevTeamStore.PROPOSAL_KINDS.includes(kind)) throw new Error(`Unknown proposal kind: ${kind}.`);
-    const proposer = agentId ? this.getAgent(agentId) : null;
-    const proposerName = proposer ? proposer.name : "You";
-    if (kind === "handoff" && !details?.assignmentId) throw new Error("A handoff proposal needs details.assignmentId.");
-    if (kind === "role" && !String(details?.role || "").trim()) throw new Error("A role proposal needs details.role.");
-    const id = randomUUID();
-    const stamp = now();
-    // Quorum: 1 (default) = unanimity of the voter set snapshotted now; a fraction in (0,1) adopts
-    // once that share of the snapshot agrees (supermajority/majority).
-    const ratio = Math.min(1, Math.max(0, Number(details?.quorum) || 1)) || 1;
-    // Snapshot the required voter set at creation: exactly the members connected right now, minus
-    // the proposer. A teammate connecting mid-vote afterwards can neither block an almost-adopted
-    // proposal nor be silently conscripted into it.
-    const snapshotVoters = this.#connectedMemberIds(taskId).filter((memberId) => memberId !== agentId);
-    this._transaction(() => {
-      this.db.prepare(`
-        INSERT INTO proposals (id, task_id, proposer_id, proposer_name, kind, summary, details, status, created_at, required_ratio)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
-      `).run(id, taskId, agentId, proposerName, kind, summary.trim(), json(details), stamp, ratio);
-      for (const voterId of snapshotVoters) {
-        this.db.prepare("INSERT OR IGNORE INTO proposal_voters (proposal_id, voter_id) VALUES (?, ?)").run(id, voterId);
-      }
-      // An AGENT proposer implicitly agrees to its own proposal. A human proposer gets no implicit
-      // vote: the human decides with an explicit dashboard Agree/Object, and pre-seeding a "human
-      // agree" here would make that later click an idempotent no-op that never resolves the proposal.
-      if (agentId) {
-        this.db.prepare(`
-          INSERT INTO proposal_votes (proposal_id, voter_id, voter_name, vote, comment, created_at)
-          VALUES (?, ?, ?, 'agree', NULL, ?)
-        `).run(id, agentId, proposerName, stamp);
-      }
-      this._event(taskId, agentId, "proposal.created", summary.trim(), { proposalId: id, kind, details, requiredVoters: snapshotVoters.length, quorum: ratio });
-    });
-    this._changed("proposal.created", taskId);
-    return this.getProposal(id);
-  }
-
-  getProposal(proposalId) {
-    const row = this.db.prepare("SELECT * FROM proposals WHERE id = ?").get(proposalId);
-    if (!row) return null;
-    const votes = this.db.prepare("SELECT voter_id, voter_name, vote, comment, created_at FROM proposal_votes WHERE proposal_id = ? ORDER BY created_at ASC").all(proposalId);
-    return { ...row, details: fromJson(row.details, {}), votes };
-  }
-
-  voteProposal({ agentId = null, proposalId, vote = "agree", comment = null }) {
-    if (!["agree", "object"].includes(vote)) throw new Error("Vote must be 'agree' or 'object'.");
-    const voter = agentId ? this.getAgent(agentId) : null;
-    const voterName = voter ? voter.name : "You";
-    if (agentId) {
-      const owning = this.db.prepare("SELECT task_id FROM proposals WHERE id = ?").get(proposalId);
-      if (owning) this.assertMembership(agentId, owning.task_id);
-    }
-    let outcome;
-    this._transaction(() => {
-      const proposal = this.db.prepare("SELECT * FROM proposals WHERE id = ?").get(proposalId);
-      if (!proposal) throw new Error("Proposal not found.");
-      if (proposal.status !== "open") { outcome = { proposalId, taskId: proposal.task_id, status: proposal.status, alreadyResolved: true }; return; }
-      const voterId = agentId || "human";
-      const stamp = now();
-      // Re-casting the identical vote records nothing new and emits no vote event, but we still
-      // re-evaluate: a decisive vote already on record — e.g. a legacy proposal pre-seeded with the
-      // human's implicit agree — must resolve exactly once instead of being frozen by a no-op. A vote
-      // that leaves it open is marked unchanged so it doesn't spam duplicate "vote" change signals.
-      const existing = this.db.prepare("SELECT vote FROM proposal_votes WHERE proposal_id = ? AND voter_id = ?").get(proposalId, voterId);
-      if (existing && existing.vote === vote) {
-        outcome = this.#evaluateProposal(proposal, stamp);
-        if (outcome.status === "open") outcome.unchanged = true;
-        return;
-      }
-      this.db.prepare(`
-        INSERT INTO proposal_votes (proposal_id, voter_id, voter_name, vote, comment, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(proposal_id, voter_id) DO UPDATE SET vote = excluded.vote, comment = excluded.comment, created_at = excluded.created_at
-      `).run(proposalId, voterId, voterName, vote, comment?.trim() || null, stamp);
-      this._event(proposal.task_id, agentId, "proposal.vote", `${voterName} ${vote === "agree" ? "agreed to" : "objected to"}: ${proposal.summary}`, { proposalId, vote, comment: comment?.trim() || null });
-      outcome = this.#evaluateProposal(proposal, stamp);
-    });
-    this.markMessagesSeen(agentId || "");
-    // A resolution always signals (even when reached by re-evaluating an identical decisive vote); a
-    // vote that merely stays open signals once, and a true no-op stays silent.
-    if (outcome?.status === "adopted") this._changed("proposal.adopted", outcome.taskId);
-    else if (outcome?.status === "declined") this._changed("proposal.declined", outcome.taskId);
-    else if (!outcome?.unchanged && !outcome?.alreadyResolved) this._changed("proposal.vote", outcome?.taskId);
-    return outcome;
-  }
-
-  // Decide whether an open proposal is now adopted (all required teammates agreed) or
-  // declined (someone objected). Runs inside the caller's transaction.
-  #evaluateProposal(proposal, stamp) {
-    const votes = this.db.prepare("SELECT voter_id, vote FROM proposal_votes WHERE proposal_id = ?").all(proposal.id);
-    // Decide against the voter set snapshotted at creation, not whoever is connected right now.
-    const snapshot = this.db.prepare("SELECT voter_id FROM proposal_voters WHERE proposal_id = ?").all(proposal.id).map((r) => r.voter_id);
-    // The human is the room's owner: an explicit human vote is decisive and overrides agent consensus,
-    // so a dashboard Agree/Object actually resolves the proposal (agree adopts, object declines) rather
-    // than waiting on agent votes that may never come.
-    const humanVote = votes.find((v) => v.voter_id === "human");
-    if (humanVote && humanVote.vote === "agree") {
-      this.#adoptProposal(proposal, stamp);
-      this.db.prepare("UPDATE proposals SET status = 'adopted', resolved_at = ? WHERE id = ?").run(stamp, proposal.id);
-      return { proposalId: proposal.id, taskId: proposal.task_id, status: "adopted" };
-    }
-    if (humanVote && humanVote.vote === "object") {
-      this.db.prepare("UPDATE proposals SET status = 'declined', resolved_at = ? WHERE id = ?").run(stamp, proposal.id);
-      this._event(proposal.task_id, null, "proposal.declined", `Proposal declined: ${proposal.summary}`, { proposalId: proposal.id });
-      return { proposalId: proposal.id, taskId: proposal.task_id, status: "declined" };
-    }
-    const authoritative = new Set([...snapshot, "human"]); // late joiners can neither block nor carry a vote
-    const objection = votes.find((v) => v.vote === "object" && authoritative.has(v.voter_id));
-    if (objection) {
-      this.db.prepare("UPDATE proposals SET status = 'declined', resolved_at = ? WHERE id = ?").run(stamp, proposal.id);
-      this._event(proposal.task_id, null, "proposal.declined", `Proposal declined: ${proposal.summary}`, { proposalId: proposal.id });
-      return { proposalId: proposal.id, taskId: proposal.task_id, status: "declined" };
-    }
-    const agreed = new Set(votes.filter((v) => v.vote === "agree").map((v) => v.voter_id));
-    const agreements = snapshot.filter((id) => agreed.has(id)).length;
-    const ratio = Number(proposal.required_ratio) || 1;
-    let adopt;
-    if (!snapshot.length) {
-      // No teammate was around at creation — only the human can decide a solo proposer's request.
-      adopt = agreed.has("human");
-    } else if (ratio >= 1) {
-      // Unanimity of those still able to vote: a snapshot voter who has since disconnected or gone
-      // unresponsive can't hold the whole team hostage, but if none remain it stays open for the
-      // human/timeout rather than silently adopting.
-      const eligible = snapshot.filter((id) => this.#canVoteNow(id));
-      adopt = eligible.length > 0 && eligible.every((id) => agreed.has(id));
-    } else {
-      // Quorum/supermajority against the fixed snapshot denominator.
-      const needed = Math.max(1, Math.ceil(ratio * snapshot.length));
-      adopt = agreements >= needed;
-    }
-    if (adopt) {
-      this.#adoptProposal(proposal, stamp);
-      this.db.prepare("UPDATE proposals SET status = 'adopted', resolved_at = ? WHERE id = ?").run(stamp, proposal.id);
-      return { proposalId: proposal.id, taskId: proposal.task_id, status: "adopted" };
-    }
-    // Report what adoption actually needs *now*: for unanimity that is the snapshot voters still able
-    // to vote (a disconnected/unresponsive snapshot voter no longer counts), matching the adopt rule
-    // above — so the dashboard never shows "need 2" when only one reachable voter remains.
-    const needed = ratio >= 1
-      ? snapshot.filter((id) => this.#canVoteNow(id)).length
-      : Math.max(1, Math.ceil(ratio * snapshot.length));
-    return { proposalId: proposal.id, taskId: proposal.task_id, status: "open", agreements, needed };
-  }
-
-  // An agent can cast a vote right now only if it is connected and actually responsive — an
-  // 'unresponsive' (silently busy) agent is present but can't be waited on to break a tie.
-  #canVoteNow(agentId) {
-    const row = this.db.prepare("SELECT status FROM agents WHERE id = ?").get(agentId);
-    return Boolean(row) && row.status !== "disconnected" && row.status !== "unresponsive";
-  }
-
-  // Apply an adopted proposal's real effect. Runs inside the caller's transaction.
-  #adoptProposal(proposal, stamp) {
-    const details = fromJson(proposal.details, {});
-    if (proposal.kind === "role") {
-      const assignmentId = randomUUID();
-      const title = (details.title || `${details.role} work`).toString().trim();
-      const description = (details.description || proposal.summary).toString().trim();
-      this.db.prepare(`
-        INSERT INTO assignments (id, task_id, title, description, role, requires_write, target_agent_name, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)
-      `).run(assignmentId, proposal.task_id, title, description, String(details.role).trim(), details.requiresWrite ? 1 : 0, details.targetAgentName?.trim() || null, stamp);
-      const adoptedChecklist = this.#resolveChecklist(details.role, details.checklist);
-      this.#storeChecklist(assignmentId, adoptedChecklist);
-      if (details.requiresWrite && Array.isArray(details.paths) && details.paths.length) {
-        const writePaths = [...new Set(details.paths.map((p) => String(p).trim()).filter(Boolean))].slice(0, 50);
-        if (writePaths.length) this.db.prepare("INSERT OR REPLACE INTO assignment_write_scopes (assignment_id, paths) VALUES (?, ?)").run(assignmentId, json(writePaths));
-      }
-      this._event(proposal.task_id, proposal.proposer_id, "assignment.created", title, { assignmentId, role: details.role, requiresWrite: Boolean(details.requiresWrite), targetAgentName: details.targetAgentName?.trim() || null, viaProposal: proposal.id, checklist: adoptedChecklist || [] });
-      this.#syncTaskStatus(proposal.task_id, stamp);
-    } else if (proposal.kind === "handoff") {
-      const assignment = this.db.prepare("SELECT * FROM assignments WHERE id = ?").get(details.assignmentId);
-      if (assignment) {
-        const target = details.targetAgentName?.trim() || null;
-        if (assignment.status === "claimed") {
-          this.db.prepare("UPDATE assignments SET target_agent_name = ?, status = 'queued', agent_id = NULL, claimed_at = NULL, claim_token_hash = NULL WHERE id = ?").run(target, assignment.id);
-        } else {
-          this.db.prepare("UPDATE assignments SET target_agent_name = ? WHERE id = ?").run(target, assignment.id);
-        }
-        this._event(proposal.task_id, proposal.proposer_id, "assignment.reassigned", `Reassigned "${assignment.title}"${target ? ` to ${target}` : ""}.`, { assignmentId: assignment.id, targetAgentName: target, viaProposal: proposal.id });
-        this.#syncTaskStatus(proposal.task_id, stamp);
-      }
-    }
-    this._event(proposal.task_id, null, "proposal.adopted", `Team adopted: ${proposal.summary}`, { proposalId: proposal.id, kind: proposal.kind });
-  }
-
-  // Open proposals a waiting agent should weigh in on (in its rooms, not its own, not yet voted).
-  openProposalsForAgent(agent) {
-    const rooms = this.#memberTaskIds(agent.id);
-    if (!rooms.length) return [];
-    const roomPlaceholders = rooms.map(() => "?").join(", ");
-    const rows = this.db.prepare(`
-      SELECT p.* FROM proposals p
-      JOIN tasks t ON t.id = p.task_id
-      WHERE p.status = 'open'
-        AND p.task_id IN (${roomPlaceholders})
-        AND t.status NOT IN ('accepted', 'blocked', 'cancelled')
-        AND (p.proposer_id IS NULL OR p.proposer_id != ?)
-        AND NOT EXISTS (SELECT 1 FROM proposal_votes v WHERE v.proposal_id = p.id AND v.voter_id = ?)
-      ORDER BY p.created_at ASC
-      LIMIT 20
-    `).all(...rooms, agent.id, agent.id);
-    return rows.map((row) => ({ id: row.id, taskId: row.task_id, kind: row.kind, summary: row.summary, proposer: row.proposer_name, details: fromJson(row.details, {}) }));
-  }
-
-  proposalsForTask(taskId) {
-    const rows = this.db.prepare("SELECT * FROM proposals WHERE task_id = ? ORDER BY created_at ASC").all(taskId);
-    return rows.map((row) => ({
-      ...row,
-      details: fromJson(row.details, {}),
-      votes: this.db.prepare("SELECT voter_id, voter_name, vote, comment, created_at FROM proposal_votes WHERE proposal_id = ? ORDER BY created_at ASC").all(row.id),
-    }));
-  }
+  static PROPOSAL_KINDS = PROPOSAL_KINDS;
 
   close() {
     this.#releaseDataDirectory();
@@ -1491,14 +1258,8 @@ export class DevTeamStore extends EventEmitter {
   // zero-config at the price of an agent's room silently changing meaning the moment a second task
   // appeared, which read as "the board stopped handing out work" with nothing to explain it.
   // devteam_join are the ways in; roomStatusForAgent says so out loud.
-  #memberTaskIds(agentId) {
+  _memberTaskIds(agentId) {
     return this.db.prepare("SELECT task_id FROM task_members WHERE agent_id = ?").all(agentId).map((row) => row.task_id);
-  }
-
-  // Connected agents that belong to a given task (used to scope proposal consensus).
-  #connectedMemberIds(taskId) {
-    const connected = this.db.prepare("SELECT id FROM agents WHERE status != 'disconnected'").all().map((row) => row.id);
-    return connected.filter((id) => this.#memberTaskIds(id).includes(taskId));
   }
 
   // The task rooms an agent may *claim work in*: the rooms it joined as a contributor. Observers
@@ -1514,7 +1275,7 @@ export class DevTeamStore extends EventEmitter {
   // control plane (no agentId) is trusted and bypasses this.
   assertMembership(agentId, taskId) {
     if (!agentId) return;
-    if (!this.#memberTaskIds(agentId).includes(taskId)) {
+    if (!this._memberTaskIds(agentId).includes(taskId)) {
       throw new Error("You are not a member of this task room. Call devteam_join first.");
     }
   }
@@ -1566,7 +1327,7 @@ export class DevTeamStore extends EventEmitter {
 
   roomStatusForAgent(agentId) {
     this.getAgent(agentId);
-    const joinedTaskIds = this.#memberTaskIds(agentId);
+    const joinedTaskIds = this._memberTaskIds(agentId);
     const activeTasks = this.listTasks()
       .filter((task) => !["accepted", "blocked", "cancelled"].includes(task.status))
       .map((task) => ({
@@ -1584,7 +1345,7 @@ export class DevTeamStore extends EventEmitter {
   // How many directed/broadcast messages (from the human or a teammate) this agent has not yet
   // received. Powers the per-agent unread badge in the dashboard.
   #pendingMessageCount(agent) {
-    const rooms = this.#memberTaskIds(agent.id);
+    const rooms = this._memberTaskIds(agent.id);
     if (!rooms.length) return 0;
     const roomPlaceholders = rooms.map(() => "?").join(", ");
     const candidates = this.db.prepare(`
@@ -1660,7 +1421,7 @@ export class DevTeamStore extends EventEmitter {
       ).run(agentId);
       for (const taskId of claimedTaskIds) {
         this._event(taskId, null, "assignment.released", `${name}'s work returned to the queue when the agent was removed.`, { reason: "agent-forgotten" });
-        this.#syncTaskStatus(taskId, stamp);
+        this._syncTaskStatus(taskId, stamp);
       }
     }
     this.db.prepare("UPDATE assignments SET agent_id = NULL WHERE agent_id = ?").run(agentId);
@@ -1692,7 +1453,7 @@ export class DevTeamStore extends EventEmitter {
     this._transaction(() => {
       this.db.prepare("UPDATE assignments SET status = 'queued', agent_id = NULL, claimed_at = NULL, claim_token_hash = NULL WHERE id = ?").run(assignmentId);
       this._event(assignment.task_id, assignment.agent_id, "assignment.released", reason, { assignmentId, reason: "force-release", requiresWrite: Boolean(assignment.requires_write) });
-      this.#syncTaskStatus(assignment.task_id, stamp);
+      this._syncTaskStatus(assignment.task_id, stamp);
     });
     this._changed("assignment.released", assignment.task_id);
     return { released: true, assignmentId, taskId: assignment.task_id, requiresWrite: Boolean(assignment.requires_write) };
@@ -1711,7 +1472,7 @@ export class DevTeamStore extends EventEmitter {
     // on the row. Doing it at creation rather than at scan time means editing a project's role config
     // never silently re-classifies work that is already queued or in flight.
     const behaviour = this.roleBehaviour(task.project_id, assignment.role);
-    const resolvedChecklist = this.#resolveChecklist(task.project_id, assignment.role, checklist);
+    const resolvedChecklist = this._resolveChecklist(task.project_id, assignment.role, checklist);
     // A write assignment may declare the paths it will touch, enabling non-overlapping writers
     // to run in parallel; omitting them keeps the conservative whole-project lease.
     const writePaths = assignment.requiresWrite && Array.isArray(paths)
@@ -1732,13 +1493,13 @@ export class DevTeamStore extends EventEmitter {
         VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
       `).run(assignment.id, taskId, assignment.title, assignment.description, assignment.role, assignment.requiresWrite, assignment.targetAgentName, assignment.createdAt,
         behaviour.verifies ? 1 : 0, behaviour.plans ? 1 : 0);
-      this.#storeChecklist(assignment.id, resolvedChecklist);
+      this._storeChecklist(assignment.id, resolvedChecklist);
       if (writePaths.length) this.db.prepare("INSERT OR REPLACE INTO assignment_write_scopes (assignment_id, paths) VALUES (?, ?)").run(assignment.id, json(writePaths));
       for (const dependencyId of dependencyIds) {
         this.db.prepare("INSERT INTO assignment_dependencies (assignment_id, depends_on_assignment_id) VALUES (?, ?)")
           .run(assignment.id, dependencyId);
       }
-      this.#syncTaskStatus(taskId);
+      this._syncTaskStatus(taskId);
       this._event(taskId, agentId, "assignment.created", assignment.title, {
         assignmentId: assignment.id,
         role: assignment.role,
@@ -2121,7 +1882,7 @@ export class DevTeamStore extends EventEmitter {
         // per candidate rather than as a SQL predicate for the same reason the write lease is: it
         // depends on who authored the current version and on who is connected right now, neither of which the scan's
         // single query can see.
-        if (candidate.verifies && this.#verifierIsAuthor(agentId, candidate)) continue;
+        if (candidate.verifies && this._verifierIsAuthor(agentId, candidate)) continue;
         // Above this session's rung: skipped, not blocked. The agent goes on to take everything it
         // *can* do, and only when nothing claimable is left does it go idle saying what remains and
         // what that work needs. Stopping at the first hard item instead would strand work the
@@ -2149,7 +1910,7 @@ export class DevTeamStore extends EventEmitter {
         this.db.prepare(`
           INSERT OR IGNORE INTO task_members (task_id, agent_id, role, joined_at) VALUES (?, ?, 'contributor', ?)
         `).run(candidate.task_id, agentId, stamp);
-        this.#syncTaskStatus(candidate.task_id, stamp);
+        this._syncTaskStatus(candidate.task_id, stamp);
         const writeScope = candidate.requires_write ? this.#writeScopeFor(candidate.id) : [];
         this._event(candidate.task_id, agentId, "assignment.claimed", `${agent.name} claimed: ${candidate.title}`, {
           assignmentId: candidate.id,
@@ -2174,7 +1935,7 @@ export class DevTeamStore extends EventEmitter {
               count: Number(candidate.rework_count || 0),
               requestedAt: candidate.rework_requested_at,
               summary: candidate.rework_summary || null,
-              findings: this.#findingsFor(candidate.id),
+              findings: this._findingsFor(candidate.id),
               next: "This work was sent back for changes. Address the summary and every finding below, then report again — reporting without addressing them will simply be sent back.",
             },
           } : {}),
@@ -2257,7 +2018,7 @@ export class DevTeamStore extends EventEmitter {
       // Belonging to *no* room at all is a different situation from being in the wrong one, and it
       // is the one a fresh session lands in. Say which it is, and name the rooms it could join, so
       // "there is work on the board and I am doing nothing" is never a silent empty answer.
-      const rooms = this.#memberTaskIds(agent.id);
+      const rooms = this._memberTaskIds(agent.id);
       if (!rooms.length) {
         add("room_membership_required", `“${agent.name}” has not joined any task room, so no work is claimable anywhere; call devteam_join with the intended taskId first.`,
           { taskId: assignment.task_id, availableTasks: this.roomStatusForAgent(agent.id).activeTasks });
@@ -2294,7 +2055,7 @@ export class DevTeamStore extends EventEmitter {
     // Not a predicate: independence depends on who authored the current version and on who is connected, neither of
     // which the scan's single query can see, so it is resolved here exactly as the scan resolves it.
     if (assignment.verifies) {
-      if (agent && this.#verifierIsAuthor(agent.id, assignment)) {
+      if (agent && this._verifierIsAuthor(agent.id, assignment)) {
         add("verifier_is_author", `“${agent.name}” wrote version ${assignment.task_version}, so it cannot verify it; an independent teammate is free to take this one.`,
           { version: assignment.task_version });
       } else if (!agent) {
@@ -2304,10 +2065,10 @@ export class DevTeamStore extends EventEmitter {
         // very next second, and calling it blocked would put the explanation at odds with a scan
         // that is about to hand it over. Both branches read the same two author sets the scan
         // reads, so the item can never be skipped for a reason this cannot name.
-        const authors = this.#currentVersionAuthors(assignment.task_id, assignment.task_version);
-        const connected = this.#connectedParticipants(assignment.task_id);
+        const authors = this._currentVersionAuthors(assignment.task_id, assignment.task_version);
+        const connected = this._connectedParticipants(assignment.task_id);
         const excluded = [...connected].filter((agentId) => authors.has(agentId));
-        if (excluded.length && this.#independentClaimantExists(assignment, authors, null)) {
+        if (excluded.length && this._independentClaimantExists(assignment, authors, null)) {
           add("verifier_is_author", `Held for an independent teammate: ${excluded.length} of the contributors in this room wrote version ${assignment.task_version} and cannot verify their own work.`,
             { version: assignment.task_version, excludedAuthors: excluded.length }, false);
         }
@@ -2366,7 +2127,7 @@ export class DevTeamStore extends EventEmitter {
     `).all(agent.name).map((row) => row.task_id);
     // Observer rooms are included so an observer is told *why* it may not claim, rather than being
     // shown an empty board it has no way to interpret.
-    const rooms = [...new Set([...this.#memberTaskIds(agentId), ...invited])]
+    const rooms = [...new Set([...this._memberTaskIds(agentId), ...invited])]
       .filter((room) => !taskId || room === taskId);
     if (taskId && !rooms.includes(taskId)) this.assertMembership(agentId, taskId);
     this.#reapStaleAgents();
@@ -2413,7 +2174,7 @@ export class DevTeamStore extends EventEmitter {
   // explainer can never be used to enumerate another team's work.
   assertExplainable(agentId, taskId) {
     if (!agentId) return;
-    if (this.#memberTaskIds(agentId).includes(taskId)) return;
+    if (this._memberTaskIds(agentId).includes(taskId)) return;
     const agent = this.getAgent(agentId);
     const invited = this.db.prepare(`
       SELECT 1 FROM assignments a WHERE a.task_id = ? AND a.status = 'queued'
@@ -3020,12 +2781,12 @@ export class DevTeamStore extends EventEmitter {
         });
         this.db.prepare("UPDATE agents SET status = 'waiting', current_task_id = NULL, last_seen = ? WHERE id = ?")
           .run(stamp, agentId);
-        this.#syncTaskStatus(assignment.task_id, stamp);
+        this._syncTaskStatus(assignment.task_id, stamp);
       } else {
         const disconnect = nextStatus === "disconnected";
         this.db.prepare("UPDATE agents SET status = ?, current_task_id = NULL, last_seen = ?, disconnected_at = ? WHERE id = ?")
           .run(disconnect ? "disconnected" : "waiting", stamp, disconnect ? stamp : null, agentId);
-        this.#syncTaskStatus(assignment.task_id, stamp);
+        this._syncTaskStatus(assignment.task_id, stamp);
       }
     });
     this._changed(status === "blocked" ? "assignment.blocked" : "assignment.completed", assignment.task_id);
@@ -3042,307 +2803,6 @@ export class DevTeamStore extends EventEmitter {
       agent: agent.name,
       ...(status === "blocked" ? { taskBlocked: false, followUpAssignmentId } : {}),
     };
-  }
-
-  // Who counts as one participant. This followed claimed checkpoint links back to an original
-  // session, because a takeover minted a fresh agent id for the same person and an author must not
-  // become their own independent reviewer by handing themselves the session. Checkpoints are gone,
-  // no other path mints a second id for one participant, and so identity is the whole answer.
-  #connectedParticipants(taskId) {
-    const members = this.db.prepare(`
-      SELECT tm.agent_id FROM task_members tm
-      JOIN agents agent ON agent.id = tm.agent_id
-      WHERE tm.task_id = ? AND tm.role = 'contributor' AND agent.status != 'disconnected'
-    `).all(taskId);
-    return new Set(members.map((member) => member.agent_id));
-  }
-
-  #currentVersionAuthors(taskId, version) {
-    const authors = this.db.prepare(`
-      SELECT agent_id, metadata FROM events
-      WHERE task_id = ? AND type = 'assignment.completed' AND agent_id IS NOT NULL
-    `).all(taskId).filter((event) => {
-      const metadata = fromJson(event.metadata, {});
-      return metadata.version === version && Array.isArray(metadata.changedFiles) && metadata.changedFiles.length > 0;
-    });
-    return new Set(authors.map((author) => author.agent_id));
-  }
-
-  #approvers(taskId, version) {
-    const approvals = this.db.prepare("SELECT agent_id FROM approvals WHERE task_id = ? AND version = ?").all(taskId, version);
-    return new Set(approvals.map((approval) => approval.agent_id));
-  }
-
-  #eligibleIndependentApprovers(taskId, version) {
-    const authors = this.#currentVersionAuthors(taskId, version);
-    return new Set([...this.#connectedParticipants(taskId)].filter((agentId) => !authors.has(agentId)));
-  }
-
-  // Reviewer ≠ author, asked at claim time. approveTask has always refused a self-approval, but
-  // refusing it *only* there meant the author was handed the review claim, read the whole diff, and
-  // then found the single exit was to block the assignment: seven blocked assignments on this board
-  // are exactly that refusal, the most recent from 2026-08-27, and they are why 264 completed
-  // assignments produced two requests for changes. Enforcing it where the claim is handed out costs
-  // the team nothing and is the difference between independent review and a rubber stamp.
-  //
-  // No dead-ends, the same rule the rest of consensus follows: with no independent teammate
-  // connected, the author still gets the work and the acceptance is labeled selfReviewed rather than
-  // the assignment sitting claimable-by-nobody.
-  #verifierIsAuthor(agentId, assignment) {
-    const authors = this.#currentVersionAuthors(assignment.task_id, assignment.task_version);
-    if (!authors.has(agentId)) return false;
-    return this.#independentClaimantExists(assignment, authors, agentId);
-  }
-
-  // "Could somebody else actually take this, right now?" — deliberately not "does an independent
-  // teammate exist". The difference is a deadlock, and the property suite found it on the first try:
-  // a teammate who is connected but already holding as much work as it can take will never claim
-  // this item, so excluding the author on its behalf leaves the assignment queued forever with a
-  // reason that reads like a promise nobody is going to keep.
-  //
-  // Asked through the full explanation surface rather than a hand-rolled subset of it, so this can
-  // never drift from what the scan will really do with that teammate.
-  //
-  // The recursion terminates at one level: whyNotClaimable consults #verifierIsAuthor in turn, but
-  // only for the teammates asked about here, and those are non-authors by construction — the author
-  // test above returns false for them before reaching this method again.
-  #independentClaimantExists(assignment, authors, excludeAgentId) {
-    const members = this.db.prepare(`
-      SELECT tm.agent_id FROM task_members tm
-      JOIN agents agent ON agent.id = tm.agent_id
-      WHERE tm.task_id = ? AND tm.role = 'contributor' AND agent.status != 'disconnected'
-    `).all(assignment.task_id);
-    for (const member of members) {
-      if (member.agent_id === excludeAgentId) continue;
-      if (authors.has(member.agent_id)) continue;
-      if (this.whyNotClaimable(assignment.id, member.agent_id, { refreshLiveness: false }).claimable) return true;
-    }
-    return false;
-  }
-
-  // No dead-ends: configured consensus cannot exceed the independent teammates who could
-  // actually approve now. With none available, one honest self-review remains sufficient.
-  #effectiveRequiredApprovals(taskId, configured, version) {
-    const eligible = this.#eligibleIndependentApprovers(taskId, version).size;
-    return Math.max(1, Math.min(configured, eligible || 1));
-  }
-
-  approveTask({ agentId, taskId, summary }) {
-    const agent = this.getAgent(agentId);
-    const task = this.getTask(taskId);
-    if (!task) throw new Error("Task not found.");
-    this.assertMembership(agentId, taskId);
-    if (["blocked", "cancelled"].includes(task.status)) throw new Error(`Cannot approve a ${task.status} task.`);
-    if (task.status === "accepted") {
-      return { accepted: true, approvalCount: task.required_approvals, requiredApprovals: task.required_approvals, openAssignments: 0, version: task.version };
-    }
-    const reviewEvidence = this.db.prepare(`
-      SELECT metadata FROM events
-      WHERE task_id = ? AND agent_id = ? AND type = 'assignment.completed'
-      ORDER BY id DESC
-    `).all(taskId, agentId).some((event) => {
-      const metadata = fromJson(event.metadata, {});
-      return metadata.version === task.version
-        && this.#assignmentVerifies(metadata.assignmentId)
-        && (!Array.isArray(metadata.changedFiles) || metadata.changedFiles.length === 0);
-    });
-    if (!reviewEvidence) throw new Error("Approval requires a completed, read-only reviewer or tester assignment on the current task version.");
-    // T2.4: where a project has verification enabled, an approval must rest on something DevTeam
-    // actually ran. Without this, "verified checks" and "an agent said so" carry identical weight at
-    // the one moment that decides whether work ships — which is where the distinction matters most.
-    // Projects with no allowlist are unaffected: nothing to verify means nothing to require.
-    const verificationEnabled = this.projectCheckCommands(task.project_id).length > 0;
-    const verifiedEvidence = Number(this.db.prepare(`
-      SELECT COUNT(*) AS count FROM assignment_checks c
-      JOIN assignments a ON a.id = c.assignment_id
-      WHERE a.task_id = ? AND c.superseded_at IS NULL AND c.verified = 1 AND c.status = 'passed'
-    `).get(taskId).count) > 0;
-    if (verificationEnabled && !verifiedEvidence) {
-      throw new Error("This project runs verified checks, and nothing on this task version has passed one. Run an allowlisted check and report it before approving.");
-    }
-    // Reviewer ≠ author: when the team is more than one agent, the author of the current version
-    // cannot approve it — an independent teammate must. A genuine solo run is still allowed to
-    // finish (no dead-ends), but its acceptance is labeled selfReviewed so it is never mistaken
-    // for independent consensus.
-    const authors = this.#currentVersionAuthors(taskId, task.version);
-    const eligibleIndependent = this.#eligibleIndependentApprovers(taskId, task.version);
-    if (authors.has(agentId) && eligibleIndependent.size > 0) {
-      throw new Error("The author of the current version cannot approve it; an independent reviewer or tester must.");
-    }
-    let outcome;
-    this._transaction(() => {
-      const stamp = now();
-      // Independence is recorded on the approval, not recomputed later. Whether the approver was the
-      // author is a fact about the moment of approving; recomputing it lets the record change as
-      // agents connect and disconnect, which is exactly when it must not.
-      const independent = !authors.has(agentId);
-      this.db.prepare(`
-        INSERT INTO approvals (task_id, agent_id, version, summary, created_at, independent, verified_evidence)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(task_id, agent_id, version) DO UPDATE SET summary = excluded.summary, created_at = excluded.created_at,
-          independent = excluded.independent, verified_evidence = excluded.verified_evidence
-      `).run(taskId, agentId, task.version, summary.trim(), stamp, independent ? 1 : 0, verifiedEvidence ? 1 : 0);
-      this._event(taskId, agentId, "task.approved",
-        `${agent.name} approved version ${task.version}${independent ? "" : " (self-review: no independent teammate was available)"}.`,
-        { summary: summary.trim(), version: task.version, independent, verifiedEvidence });
-      const approvers = this.#approvers(taskId, task.version);
-      const approvalCount = approvers.size;
-      const openAssignments = Number(this.db.prepare("SELECT COUNT(*) AS count FROM assignments WHERE task_id = ? AND status IN ('queued', 'claimed')").get(taskId).count);
-      const effectiveRequired = this.#effectiveRequiredApprovals(taskId, task.required_approvals, task.version);
-      const accepted = approvalCount >= effectiveRequired && openAssignments === 0;
-      // Honest labeling: a lone participant reviewing itself is not consensus.
-      const independentApprovalCount = [...approvers].filter((agent) => !authors.has(agent)).length;
-      const selfReviewed = authors.size > 0 ? independentApprovalCount === 0 : approvers.size <= 1;
-      if (accepted) {
-        this.db.prepare("UPDATE tasks SET status = 'accepted', updated_at = ? WHERE id = ?").run(stamp, taskId);
-        this._event(taskId, null, "task.accepted", `${selfReviewed ? "Self-reviewed acceptance" : "Consensus reached"} for version ${task.version}.`, { approvalCount, requiredApprovals: effectiveRequired, selfReviewed });
-        // Keep the room's agents assembled (status 'waiting', membership intact) rather than force-
-        // disconnecting them on acceptance, so the human can send a same-conversation follow-up that
-        // continueTask reopens and the still-waiting agents pick up without restarting their sessions.
-        // The continuation window in teamActivity keeps them from idling out before that follow-up.
-        this.db.prepare(`
-          UPDATE agents SET status = 'waiting', current_task_id = NULL, last_seen = ?
-          WHERE (current_task_id = ? OR id IN (SELECT agent_id FROM approvals WHERE task_id = ?)) AND status != 'disconnected'
-        `).run(stamp, taskId, taskId);
-      } else {
-        this.db.prepare("UPDATE tasks SET status = 'review', updated_at = ? WHERE id = ?").run(stamp, taskId);
-      }
-      outcome = { accepted, approvalCount, requiredApprovals: effectiveRequired, configuredApprovals: task.required_approvals, openAssignments, version: task.version, selfReviewed };
-    });
-    this._changed(outcome.accepted ? "task.accepted" : "task.approved", taskId);
-    return outcome;
-  }
-
-  // A reviewer that finds problems used to have two moves, and both were wrong. Approving anyway is
-  // dishonest; `status=blocked` closes the *reviewer's own* assignment and queues a coarse planner
-  // item, so the fix routes through a human-shaped triage step instead of back to the person who
-  // wrote the code. This is the third move: send the work itself back to its author, with the
-  // findings attached, without stopping the task or disturbing anyone else's claim.
-  //
-  // What it deliberately does NOT do: create a new assignment. The original row is reopened, so its
-  // title, description, checklist, write scope, dependencies and whole event history stay attached
-  // to the work rather than being scattered across a chain of near-duplicate follow-ups. Reopening
-  // clears the claim and its fencing token exactly as a force-release does, so a late report from
-  // the author's previous session is refused instead of landing on top of the rework.
-  requestChanges({ agentId = null, taskId, assignmentId, summary, findings = [] }) {
-    const task = this.getTask(taskId);
-    if (!task) throw new Error("Task not found.");
-    this.assertMembership(agentId, taskId);
-    if (["blocked", "cancelled", "accepted"].includes(task.status)) {
-      throw new Error(`Cannot request changes on a ${task.status} task.`);
-    }
-    const agent = agentId ? this.getAgent(agentId) : null;
-    const assignment = this.db.prepare("SELECT * FROM assignments WHERE id = ? AND task_id = ?").get(assignmentId, taskId);
-    if (!assignment) throw new Error("Assignment not found in this task room.");
-    if (assignment.status !== "done") {
-      throw new Error(`Only completed work can be sent back for changes; this assignment is ${assignment.status}.`);
-    }
-    const cleanSummary = String(summary || "").trim();
-    if (!cleanSummary) throw new Error("Say what needs to change.");
-    // Earning the right to send work back is the same act as earning the right to approve it: an
-    // independent read-only verifier assignment on the current version. The alternative is holding
-    // that verifier claim right now — the reviewer that finds the problem mid-review should not have
-    // to finish and file its own report before it can say so.
-    if (agentId && !this.#hasReviewStanding(agentId, taskId, task.version)) {
-      throw new Error("Requesting changes needs a completed or in-progress read-only reviewer or tester assignment on the current task version.");
-    }
-    const cleanFindings = (Array.isArray(findings) ? findings : []).slice(0, 50).map((item) => {
-      const isObject = item && typeof item === "object" && !Array.isArray(item);
-      return {
-        detail: String((isObject ? item.detail : item) ?? "").trim().slice(0, 2000),
-        path: isObject && item.path ? String(item.path).trim().slice(0, 500) : null,
-      };
-    }).filter((item) => item.detail);
-    const authorName = assignment.agent_id
-      ? (this.db.prepare("SELECT name FROM agents WHERE id = ?").get(assignment.agent_id)?.name || null)
-      : null;
-    let outcome;
-    this._transaction(() => {
-      const stamp = now();
-      const reworkCount = Number(assignment.rework_count || 0) + 1;
-      // Back to queued, addressed to whoever wrote it. Targeting is a preference, not a lock: the
-      // existing scheduler rule returns a targeted item to the general queue once nobody by that
-      // name is connected, so rework never becomes unclaimable because its author went home.
-      this.db.prepare(`
-        UPDATE assignments
-        SET status = 'queued', agent_id = NULL, completed_at = NULL, claim_token_hash = NULL,
-            target_agent_name = COALESCE(?, target_agent_name),
-            rework_count = ?, rework_requested_at = ?, rework_summary = ?
-        WHERE id = ?
-      `).run(authorName, reworkCount, stamp, cleanSummary, assignmentId);
-      for (const finding of cleanFindings) {
-        this.db.prepare(`
-          INSERT INTO assignment_findings (id, assignment_id, task_id, requested_by_agent_id, requested_by_name, task_version, detail, path, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(randomUUID(), assignmentId, taskId, agentId, agent?.name || "the human", Number(task.version), finding.detail, finding.path, stamp);
-      }
-      // The version under review was just judged not good enough, so approvals built on it no longer
-      // describe a settled state. Clearing them is the same principle as version-invalidates-
-      // approvals: if the rework changes files the version bumps and they would have gone anyway,
-      // and if it changes none they would otherwise have survived a reviewer saying "not yet".
-      const clearedApprovals = this.db.prepare("DELETE FROM approvals WHERE task_id = ? AND version = ?").run(taskId, task.version).changes;
-      this._event(taskId, agentId, "assignment.changes_requested",
-        `${agent?.name || "The human"} sent “${assignment.title}” back for changes: ${cleanSummary}`, {
-          assignmentId,
-          role: assignment.role,
-          author: authorName,
-          version: Number(task.version),
-          reworkCount,
-          clearedApprovals,
-          findings: cleanFindings,
-        });
-      this.#syncTaskStatus(taskId, stamp);
-      outcome = {
-        changesRequested: true,
-        taskId,
-        assignmentId,
-        title: assignment.title,
-        routedTo: authorName,
-        reworkCount,
-        clearedApprovals,
-        findings: cleanFindings,
-        version: Number(task.version),
-      };
-    });
-    this._changed("assignment.changes_requested", taskId);
-    return {
-      ...outcome,
-      next: outcome.routedTo
-        ? `“${outcome.title}” is queued again and addressed to ${outcome.routedTo}. It stays claimable by the rest of the room if they are not connected.`
-        : `“${outcome.title}” is queued again for whoever picks it up.`,
-    };
-  }
-
-  // Whether this agent has earned a say on the current version: it either completed a read-only
-  // verifier assignment on it (the same evidence approveTask requires) or is holding one right now.
-  #hasReviewStanding(agentId, taskId, version) {
-    const holding = this.db.prepare(`
-      SELECT 1 FROM assignments
-      WHERE task_id = ? AND agent_id = ? AND status = 'claimed' AND requires_write = 0
-        AND ${VERIFIES} LIMIT 1
-    `).get(taskId, agentId);
-    if (holding) return true;
-    return this.db.prepare(`
-      SELECT metadata FROM events
-      WHERE task_id = ? AND agent_id = ? AND type = 'assignment.completed'
-      ORDER BY id DESC
-    `).all(taskId, agentId).some((event) => {
-      const metadata = fromJson(event.metadata, {});
-      return metadata.version === version
-        && this.#assignmentVerifies(metadata.assignmentId)
-        && (!Array.isArray(metadata.changedFiles) || metadata.changedFiles.length === 0);
-    });
-  }
-
-  // Outstanding findings for an assignment: what the author is being asked to fix. Resolved rows are
-  // kept so the history of a reworked piece of work stays legible.
-  #findingsFor(assignmentId, { includeResolved = false } = {}) {
-    return this.db.prepare(`
-      SELECT id, requested_by_name, task_version, detail, path, created_at, resolved_at
-      FROM assignment_findings
-      WHERE assignment_id = ?${includeResolved ? "" : " AND resolved_at IS NULL"}
-      ORDER BY created_at ASC, rowid ASC
-    `).all(assignmentId);
   }
 
   // When a task stops (blocked, or an agent reports a blocker), release its co-workers cleanly:
@@ -3431,7 +2891,7 @@ export class DevTeamStore extends EventEmitter {
   }
 
   blockedRoomsForAgent(agentId) {
-    return this.#memberTaskIds(agentId).map((room) => this.blockedRecovery(room)).filter(Boolean);
+    return this._memberTaskIds(agentId).map((room) => this.blockedRecovery(room)).filter(Boolean);
   }
 
   taskMemberNames(taskId) {
@@ -3614,7 +3074,7 @@ export class DevTeamStore extends EventEmitter {
         VALUES (?, ?, ?, ?, ?, 0, NULL, 'queued', ?, 1)
       `).run(assignmentId, taskId, title, `Plan the follow-up requested in chat: "${firstLine}". Split it into implementation and review work as needed.`, planningRoleName, stamp);
       this._event(taskId, byAgentId, "assignment.created", title, { assignmentId, role: planningRoleName, requiresWrite: false, targetAgentName: null, continuesEvent: eventId });
-      this.#syncTaskStatus(taskId, stamp);
+      this._syncTaskStatus(taskId, stamp);
       const version = this.db.prepare("SELECT version FROM tasks WHERE id = ?").get(taskId).version;
       result = { taskId, eventId, reopened, version, assignmentId };
     });
@@ -3665,8 +3125,8 @@ export class DevTeamStore extends EventEmitter {
         dependsOn: dependencies.map((item) => item.id),
         blockedBy: dependencies.filter((item) => item.status !== "done"),
         checks: this._checksFor(assignment.id),
-        findings: this.#findingsFor(assignment.id),
-        resolvedFindings: this.#findingsFor(assignment.id, { includeResolved: true }).filter((finding) => finding.resolved_at),
+        findings: this._findingsFor(assignment.id),
+        resolvedFindings: this._findingsFor(assignment.id, { includeResolved: true }).filter((finding) => finding.resolved_at),
         schedulingHold: this.#schedulingHold(assignment),
         assessment,
         // The score in the words the human uses for their own models. "Base · Score 0" is DevTeam's
@@ -4073,7 +3533,7 @@ export class DevTeamStore extends EventEmitter {
   // room's full timeline. The project/agent/task lists stay visible (they carry no room secrets).
   snapshotForAgent(agentId) {
     const tasks = this.listTasks();
-    const rooms = this.#memberTaskIds(agentId);
+    const rooms = this._memberTaskIds(agentId);
     const selectedId = tasks.find((task) => rooms.includes(task.id))?.id || null;
     return {
       serverTime: now(),
@@ -4088,4 +3548,4 @@ export class DevTeamStore extends EventEmitter {
 // The clusters that live in their own files, composed onto the prototype after the class body so
 // that every call site — inside this file and out — reads exactly as it did when they were declared
 // here. Order does not matter: no two mixins define the same name.
-Object.assign(DevTeamStore.prototype, checksMethods, knowledgeMethods);
+Object.assign(DevTeamStore.prototype, checksMethods, knowledgeMethods, consensusMethods);
