@@ -2147,39 +2147,6 @@ test("a cancel request reaches a working agent and asks rather than kills", asyn
     "queued work is not cancelled, it is deleted or re-prioritised");
 });
 
-test("a task budget is surfaced to the room once it is spent, without hard-stopping a writer", async (t) => {
-  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-budget-"));
-  const store = new DevTeamStore(dataDir);
-  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
-  const project = store.ensureProject("Budget project", process.cwd());
-  const task = store.createTask({ projectId: project.id, title: "Time-boxed", description: "One afternoon, no more." });
-  const agent = store.connectAgent({ name: "Worker", provider: "test", freshTaskId: task.id });
-  const claim = store.claimNextAssignment(agent.id);
-
-  assert.equal(store.taskBudgetState(task.id), null, "no budget set, nothing to say");
-  store.setTaskBudget({ taskId: task.id, wallClockMinutes: 60 });
-  const within = store.taskBudgetState(task.id);
-  assert.equal(within.budgetMinutes, 60);
-  assert.equal(within.exceeded, false);
-  assert.equal(store.steeringFor(agent.id), null, "a budget that is not spent is not a signal");
-
-  // Age the task past its budget.
-  store.db.prepare("UPDATE tasks SET created_at = ? WHERE id = ?")
-    .run(new Date(Date.now() - 90 * 60_000).toISOString(), task.id);
-  const spent = store.taskBudgetState(task.id);
-  assert.equal(spent.exceeded, true);
-  assert.equal(spent.remainingMinutes, 0);
-
-  const steering = store.steeringFor(agent.id);
-  assert.equal(steering.budget.exceeded, true);
-  assert.match(steering.budget.next, /do not start anything new/i);
-  // Advisory, not a kill: the claim survives, because a hard stop mid-write is the thing to avoid.
-  assert.equal(store.db.prepare("SELECT status FROM assignments WHERE id = ?").get(claim.id).status, "claimed");
-
-  store.setTaskBudget({ taskId: task.id, wallClockMinutes: null });
-  assert.equal(store.taskBudgetState(task.id), null, "a cleared budget stops being a signal");
-});
-
 // --- T4.2 / T4.3: what it cost, and what happened -------------------------------------------------
 
 test("reported cost is recorded, capped, and never presented as measured", async (t) => {
@@ -2213,36 +2180,6 @@ test("reported cost is recorded, capped, and never presented as measured", async
   });
   assert.equal(junk.usage ?? undefined, undefined);
   assert.equal(store.taskUsage(task.id).totalCostUsd, 0.42, "nothing was added by a malformed report");
-});
-
-test("a spend cap is enforced against reported cost, and says that it is reported", async (t) => {
-  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-spend-"));
-  const store = new DevTeamStore(dataDir);
-  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
-  const project = store.ensureProject("Spend project", process.cwd());
-  const task = store.createTask({ projectId: project.id, title: "Capped", description: "A dollar, no more." });
-  const agent = store.connectAgent({ name: "Spender", provider: "test", freshTaskId: task.id });
-  store.setTaskBudget({ taskId: task.id, spendUsd: 1 });
-
-  const state = store.taskBudgetState(task.id);
-  assert.equal(state.budgetUsd, 1);
-  assert.equal(state.exceeded, false);
-  assert.equal(state.spendIsAgentReported, true, "a cap on a reported number must say so");
-
-  const plan = store.claimNextAssignment(agent.id);
-  await store.completeAssignment({
-    agentId: agent.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Expensive.",
-    usage: { costUsd: 1.75 },
-  });
-  const after = store.taskBudgetState(task.id);
-  assert.equal(after.exceeded, true);
-  assert.equal(after.spentUsd, 1.75);
-  assert.equal(after.remainingUsd, 0);
-
-  const next = store.createAssignment({ taskId: task.id, title: "More", description: "Do it." });
-  const claim = store.claimNextAssignment(agent.id);
-  assert.equal(claim.id, next.id, "the cap is advisory: it warns rather than hard-stopping a writer");
-  assert.equal(store.steeringFor(agent.id).budget.exceeded, true, "but the agent is told on its next call");
 });
 
 test("a task replays as a narrative that reports what happened without re-grading it", async (t) => {

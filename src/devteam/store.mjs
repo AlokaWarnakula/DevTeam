@@ -729,12 +729,10 @@ export class DevTeamStore extends EventEmitter {
       ["approvals", "independent", "INTEGER NOT NULL DEFAULT 1"],
       ["approvals", "verified_evidence", "INTEGER NOT NULL DEFAULT 0"],
       // T2.6: human steering. Priority orders the queue; the cancel flag is read cooperatively by
-      // the holder; the budget is a wall-clock cap surfaced to the room.
+      // the holder.
       ["assignments", "priority", "INTEGER NOT NULL DEFAULT 0"],
       ["assignments", "cancel_requested_at", "TEXT"],
       ["assignments", "cancel_reason", "TEXT"],
-      ["tasks", "budget_minutes", "INTEGER"],
-      ["tasks", "budget_usd_cents", "INTEGER"],   // T4.2 spend cap, the counterpart to the wall clock
     ]) {
       try { this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`); } catch { /* already present */ }
     }
@@ -4279,76 +4277,22 @@ export class DevTeamStore extends EventEmitter {
     return { assignmentId, taskId, cancelRequested: true, reason: cleanReason };
   }
 
-  // What a claimed assignment's holder should be told on its next call: whether it has been asked to
-  // stop, and whether the task has run past its budget. Returned by heartbeat and by devteam_next.
+  // What a claimed assignment's holder should be told on its next call: that it has been asked to
+  // stop. Returned by heartbeat and by devteam_next.
   steeringFor(agentId) {
     const held = this.db.prepare(`
       SELECT a.id, a.title, a.task_id, a.cancel_requested_at, a.cancel_reason
       FROM assignments a WHERE a.agent_id = ? AND a.status = 'claimed' LIMIT 1
     `).get(agentId);
-    if (!held) return null;
-    const budget = this.taskBudgetState(held.task_id);
-    if (!held.cancel_requested_at && !budget?.exceeded) return null;
+    if (!held?.cancel_requested_at) return null;
     return {
       assignmentId: held.id,
       title: held.title,
       taskId: held.task_id,
-      ...(held.cancel_requested_at ? {
-        cancelRequested: true,
-        reason: held.cancel_reason,
-        next: "Stop as soon as you can do so safely. Report what you have with devteam_report — status=blocked if it is incomplete — rather than abandoning the claim.",
-      } : {}),
-      ...(budget?.exceeded ? { budget } : {}),
+      cancelRequested: true,
+      reason: held.cancel_reason,
+      next: "Stop as soon as you can do so safely. Report what you have with devteam_report — status=blocked if it is incomplete — rather than abandoning the claim.",
     };
-  }
-
-  // A wall-clock cap on a task, so "this has had enough of my afternoon" is something the room can
-  // enforce rather than something the human has to keep watching. Advisory by design: it surfaces to
-  // agents and on the board and does not itself stop work, because a hard stop mid-write is the same
-  // half-written tree that cooperative cancel exists to avoid.
-  setTaskBudget({ taskId, wallClockMinutes = null, spendUsd = null }) {
-    const task = this.getTask(taskId);
-    if (!task) throw new Error("Task not found.");
-    const minutes = wallClockMinutes == null ? null : Math.max(1, Math.min(10_080, Math.trunc(Number(wallClockMinutes) || 0)));
-    const cents = spendUsd == null ? null : Math.max(1, Math.min(10_000_000, Math.round(Number(spendUsd) * 100)));
-    this.db.prepare("UPDATE tasks SET budget_minutes = ?, budget_usd_cents = ? WHERE id = ?").run(minutes, cents, taskId);
-    const described = [
-      minutes == null ? null : `${minutes} minutes of wall clock`,
-      cents == null ? null : `${(cents / 100).toFixed(2)} of reported spend`,
-    ].filter(Boolean).join(" and ");
-    this.#event(taskId, null, described ? "task.budget_set" : "task.budget_cleared",
-      described ? `Task budget set to ${described}.` : "Task budget cleared.",
-      { budgetMinutes: minutes, budgetUsd: cents == null ? null : cents / 100 });
-    this.#changed("task.budget_set", taskId);
-    return { taskId, budgetMinutes: minutes, budgetUsd: cents == null ? null : cents / 100 };
-  }
-
-  taskBudgetState(taskId) {
-    const task = this.db.prepare("SELECT budget_minutes, budget_usd_cents, created_at, status FROM tasks WHERE id = ?").get(taskId);
-    if (!task?.budget_minutes && !task?.budget_usd_cents) return null;
-    const state = { exceeded: false };
-    if (task.budget_minutes) {
-      const minutes = Number(task.budget_minutes);
-      const usedMinutes = Math.max(0, Math.round((Date.now() - Date.parse(task.created_at)) / 60_000));
-      state.budgetMinutes = minutes;
-      state.usedMinutes = usedMinutes;
-      state.remainingMinutes = Math.max(0, minutes - usedMinutes);
-      if (usedMinutes > minutes) state.exceeded = true;
-    }
-    if (task.budget_usd_cents) {
-      // The spend side is agent-reported by nature, so a task with a spend cap and no agent
-      // reporting usage simply never trips it. Said out loud rather than left to be discovered.
-      const spent = Number(this.db.prepare("SELECT COALESCE(SUM(cost_cents), 0) AS cents FROM assignment_usage WHERE task_id = ?").get(taskId).cents);
-      state.budgetUsd = Number(task.budget_usd_cents) / 100;
-      state.spentUsd = spent / 100;
-      state.remainingUsd = Math.max(0, (Number(task.budget_usd_cents) - spent) / 100);
-      state.spendIsAgentReported = true;
-      if (spent > Number(task.budget_usd_cents)) state.exceeded = true;
-    }
-    if (state.exceeded) {
-      state.next = "This task is past the budget the human set. Finish what you are doing, report it, and do not start anything new without asking.";
-    }
-    return state;
   }
 
   // T2.5 — what the team has learned about each of its members.
@@ -5827,7 +5771,7 @@ export class DevTeamStore extends EventEmitter {
       ...task, assignments, approvals, events, proposals, blackboard, projectBlackboard, knowledge, members, sessionCheckpoints, roleCatalogue,
       blockedRecovery: this.blockedRecovery(taskId),
       regressions: this.openRegressions(taskId), checkBaseline: this.checkBaseline(taskId),
-      reliability: this.teamReliability(), budget: this.taskBudgetState(taskId), usage: this.taskUsage(taskId),
+      reliability: this.teamReliability(), usage: this.taskUsage(taskId),
       // What this server has been running for the task, including anything a restart cut short.
       jobs: this.jobs(taskId, { limit: 10 }),
       knowledgeVault: {
