@@ -65,3 +65,25 @@ test("the blocked banner states the reason, the cost of resuming, and who can ta
 
   assert.equal(blockedBannerCopy(null), null, "an unblocked task renders no banner");
 });
+
+test("the blocked banner says which kind of blocker it was, in the human's words", () => {
+  const overHead = blockedBannerCopy({
+    version: 2,
+    reason: "This needs a frontier model to do safely.",
+    blockedBy: "Claude",
+    kind: "over-my-head",
+    strandedAssignments: 1,
+  });
+  assert.match(overHead.meta, /Blocked by Claude — beyond the model or effort the agent had/);
+
+  const needsHuman = blockedBannerCopy({ version: 1, blockedBy: "Codex", kind: "needs-human" });
+  assert.match(needsHuman.meta, /needs a decision only you can make/);
+
+  // Blocks recorded before kinds existed carry none. The banner reads exactly as it always did
+  // rather than inventing a kind for them.
+  const legacy = blockedBannerCopy({ version: 1, blockedBy: "Codex", strandedAssignments: 2 });
+  assert.match(legacy.meta, /^Blocked by Codex · 2 assignments stopped mid-flight/);
+
+  const unknown = blockedBannerCopy({ version: 1, blockedBy: "Codex", kind: "something-new" });
+  assert.match(unknown.meta, /^Blocked by Codex ·/, "an unrecognised kind is ignored, not printed raw");
+});

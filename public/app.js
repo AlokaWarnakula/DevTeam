@@ -54,8 +54,6 @@ function renderRoleOptions(select, catalogue, selected) {
   }).join("");
   if (keep && roles.some((role) => role.name === keep)) select.value = keep;
 }
-const MODEL_CLASSES = ["economy", "balanced", "strong", "frontier", "specialized"];
-const EFFORT_CLASSES = ["light", "medium", "high", "extra_high", "maximum"];
 // A live "doing X" line for an agent: what it is working on right now, or how long it has waited.
 function activityLine(agent) {
   if (agent.status === "busy" && agent.current_assignment_title) {
@@ -68,34 +66,8 @@ function activityLine(agent) {
   return relativeTime(agent.last_seen);
 }
 
-function runtimeSelectionLabel(selection) {
-  if (!selection?.modelLabel || !selection?.effortLabel) return null;
-  const effort = selection.effortLabel === selection.effortClass
-    ? selection.effortLabel
-    : `${selection.effortLabel} (${selection.effortClass})`;
-  return `${selection.modelLabel} (${selection.modelClass}) · ${effort}`;
-}
 
-function runtimeProfileLabel(profile) {
-  if (!profile) return null;
-  const model = profile.availableModels?.find((item) => item.id === profile.currentModel);
-  const effort = model?.efforts?.find((item) => item.id === profile.currentEffort);
-  if (!model || !effort) return null;
-  return runtimeSelectionLabel({
-    modelLabel: model.label,
-    modelClass: model.class,
-    effortLabel: effort.label,
-    effortClass: effort.class,
-  });
-}
 
-function assignmentRuntimeLabel(assignment) {
-  const resolution = assignment.runtimeResolution;
-  const advertised = runtimeSelectionLabel(resolution?.recommendation);
-  if (advertised) return `${resolution.satisfied ? "Current" : "Needs at least"} ${advertised}`;
-  if (!assignment.runtimeProfileSource) return "Model gating inactive — no runtime profile registered";
-  return resolution?.reason || "No advertised model/effort combination matches this assignment.";
-}
 let state = null;
 let selectedTaskId = new URLSearchParams(location.search).get("task");
 let selectedProjectId = null;
@@ -112,9 +84,6 @@ let timelineFilter = "all";
 let pendingSends = [];
 let pendingJumpEventId = null;
 let searchGeneration = 0;
-let profileDraftModels = [];
-let profileDraftCurrentModel = "";
-let profileDraftCurrentEffort = "";
 const ATTACHMENT_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf"]);
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 const DRAFT_LIMIT = 50_000;
@@ -259,12 +228,18 @@ function render() {
   const visibleTasks = selectedProjectId ? state.tasks.filter((item) => item.project_id === selectedProjectId) : state.tasks;
   $("#task-count").textContent = visibleTasks.length;
   $("#task-list").innerHTML = visibleTasks.map((item) => `<div class="nav-row"><button class="task-item ${task?.id === item.id ? "active" : ""}" data-task="${item.id}" title="Open task history"><span class="dot"></span><span>${escapeHtml(item.title)}<small>${escapeHtml(item.status)} · ${item.open_assignments} open</small></span></button><button class="row-delete" data-delete-task="${item.id}" title="Delete task history" aria-label="Delete task history for ${escapeHtml(item.title)}">×</button></div>`).join("") || `<p class="hint">No tasks yet</p>`;
+  // What a collapsed section still shows. Kept in step with the lists so the sidebar never hides
+  // which project and task you are looking at — that is the one thing it exists to tell you.
+  const currentProject = state.projects.find((project) => project.id === selectedProjectId);
+  $("#project-current").textContent = currentProject ? currentProject.name : "";
+  $("#task-current").innerHTML = task
+    ? `${escapeHtml(task.title)}<small>${escapeHtml(task.status)}</small>`
+    : "";
   $("#project-select").innerHTML = state.projects.map((project) => `<option value="${project.id}" ${project.id === selectedProjectId ? "selected" : ""}>${escapeHtml(project.name)}</option>`).join("");
 
   $("#empty-state").classList.toggle("hidden", Boolean(task));
   $("#conversation").classList.toggle("hidden", !task);
   $("#copy-task-invite").classList.toggle("hidden", !task);
-  $("#edit-task-runtime").classList.toggle("hidden", !task || task.status === "cancelled");
   $("#edit-task").classList.toggle("hidden", !task || task.status === "cancelled");
   $("#block-task").classList.toggle("hidden", !task || ["accepted", "blocked", "cancelled"].includes(task.status));
   $("#unblock-task").classList.toggle("hidden", !task || task.status !== "blocked");
@@ -437,8 +412,6 @@ function renderTask(task) {
   $("#task-title").textContent = task.title;
   renderTaskDescription(task.description);
   $("#task-version").textContent = `v${task.version}`;
-  const taskRuntime = runtimeProfileLabel(task.baseRuntimeProfile);
-  $("#edit-task-runtime").textContent = taskRuntime ? `Task runtime: ${taskRuntime}` : "Set task runtime";
   $("#copy-task-invite").textContent = task.session_policy === "manual" ? "Invite agent" : "Fresh-session invite";
   const eventList = $("#event-list");
   const nearBottom = eventList.scrollHeight - eventList.scrollTop - eventList.clientHeight < 220;
@@ -456,9 +429,12 @@ function renderTask(task) {
     const checklist = item.checklist && item.checklist.length
       ? `<details class="checklist"><summary>${item.checklist.length}-point checklist</summary><ul>${item.checklist.map((point) => `<li>${escapeHtml(point)}</li>`).join("")}</ul></details>`
       : "";
-    const scope = item.requires_write && item.writeScope && item.writeScope.length
-      ? `<span class="scope" title="Write lease scope">${item.writeScope.map((p) => escapeHtml(p === "" ? "whole project" : p)).join(", ")}</span>`
-      : (item.requires_write ? `<span class="scope">whole project</span>` : "");
+    // Only while the lease is live. A finished assignment's write scope is history, and printing it
+    // on every completed card was a line of text that answered a question nobody was asking.
+    const leaseIsLive = item.status === "queued" || item.status === "claimed";
+    const scope = item.requires_write && leaseIsLive
+      ? `<span class="scope" title="Write lease scope">${(item.writeScope?.length ? item.writeScope : [""]).map((p) => escapeHtml(p === "" ? "whole project" : p)).join(", ")}</span>`
+      : "";
     const release = item.status === "claimed" && item.requires_write
       ? `<button class="mini release" data-release="${item.id}" data-release-title="${escapeHtml(item.title)}" title="Force-release this stuck write lease (asks you to confirm the title)">Release lease</button>`
       : "";
@@ -466,9 +442,6 @@ function renderTask(task) {
     // of the same loop reviewers drive with devteam_request_changes.
     const sendBack = item.status === "done"
       ? `<button class="mini send-back" data-send-back="${item.id}" data-send-back-title="${escapeHtml(item.title)}" title="Send this work back to its author for changes, with your reasons attached">Request changes</button>`
-      : "";
-    const checkpoint = item.status === "claimed" && item.agent_id
-      ? `<button class="mini checkpoint" data-checkpoint-assignment="${item.id}" title="Create a bounded checkpoint and fresh-session invitation without releasing this claim">Checkpoint & rotate</button>`
       : "";
     const blockedBy = item.blockedBy?.length
       ? `<div class="dependency-wait"><strong>Waiting for</strong>${item.blockedBy.map((dependency) => `<span>${escapeHtml(dependency.title)} · ${escapeHtml(dependency.status)}</span>`).join("")}</div>`
@@ -494,19 +467,24 @@ function renderTask(task) {
     const rework = item.rework_requested_at
       ? `<div class="rework"><strong>Changes requested${Number(item.rework_count) > 1 ? ` · ${Number(item.rework_count)} times` : ""}</strong><span>${escapeHtml(item.rework_summary || "Sent back to its author.")}</span>${findings}</div>`
       : (item.findings?.length ? `<div class="rework"><strong>Open findings</strong>${findings}</div>` : "");
+    // Complexity answers "is this the right agent and model for the job", which is a question about
+    // work not yet finished. On a done card it is history, and it was the single most repeated block
+    // on the board. The "assessment pending" placeholder is gone outright: an absent assessment now
+    // says nothing rather than taking a line to announce its own absence on every card.
     const assessment = item.assessment;
-    const assessmentView = assessment
-      ? `<div class="complexity"><strong>${escapeHtml(assessment.level)} · score ${Number(assessment.score)}</strong><span>${escapeHtml(assignmentRuntimeLabel(item))}</span><small>${assessment.reasons.slice(0, 2).map((reason) => escapeHtml(reason.detail)).join(" · ") || "Scoped baseline work."}</small></div>`
-      : `<div class="complexity pending"><small>Complexity assessment pending</small></div>`;
-    const runtimeDecision = item.runtimeDecision ? `<small class="runtime-decision">Runtime: ${escapeHtml(item.runtimeDecision.choice)} by ${escapeHtml(item.runtimeDecision.actor)}</small>` : "";
-    const runtime = item.status === "queued" && assessment
-      ? `<button class="mini runtime" data-runtime-assignment="${item.id}" title="Review the provider-neutral runtime recommendation">Runtime settings</button>`
+    const assessmentView = assessment && leaseIsLive
+      // Lead with the model this needs, in the names the ladder reported. The level and score are
+      // DevTeam's own vocabulary and stay as the small print — useful when you want to know why, and
+      // meaningless as a headline. With no ladder reported yet, the level leads instead.
+      ? `<div class="complexity"><strong>${item.needsRung ? `Needs ${escapeHtml(item.needsRung)}` : escapeHtml(assessment.level)}</strong>${item.needsRung ? `<span>${escapeHtml(assessment.level)} · score ${Number(assessment.score)}</span>` : ""}<small>${assessment.reasons.slice(0, 2).map((reason) => escapeHtml(reason.detail)).join(" · ") || "Ordinary scoped work."}</small></div>`
       : "";
-    return `<div class="assignment"><div class="assignment-top"><strong>${escapeHtml(item.title)}</strong><span class="role">${escapeHtml(item.role)}</span></div><p>${escapeHtml(item.agent_name ? `${item.agent_name} · ${item.status}` : item.status)}${item.requires_write ? " · write lease" : ""}</p>${assessmentView}${runtimeDecision}${verifying}${rework}${hold}${blockedBy}${checks}${scope}${checklist}<div class="assignment-actions">${runtime}${sendBack}${checkpoint}${release}</div></div>`;
+    const runtimeDecision = item.runtimeDecision && leaseIsLive
+      ? `<small class="runtime-decision">Runtime: ${escapeHtml(item.runtimeDecision.choice)} by ${escapeHtml(item.runtimeDecision.actor)}</small>`
+      : "";
+    return `<div class="assignment"><div class="assignment-top"><strong>${escapeHtml(item.title)}</strong><span class="role">${escapeHtml(item.role)}</span></div><p>${escapeHtml(item.agent_name ? `${item.agent_name} · ${item.status}` : item.status)}${item.requires_write && leaseIsLive ? " · write lease" : ""}</p>${assessmentView}${runtimeDecision}${verifying}${rework}${hold}${blockedBy}${checks}${scope}${checklist}<div class="assignment-actions">${sendBack}${release}</div></div>`;
   }).join("") || `<p class="hint">Waiting for the plan</p>`;
   renderRegressions(task);
   renderRoleOptions($("#proposal-role"), task.roleCatalogue);
-  renderSessionCheckpoints(task);
   renderBlackboard(task);
   const approvals = task.approvals.length;
   $("#approval-label").textContent = `${approvals} / ${task.required_approvals}`;
@@ -533,20 +511,6 @@ function renderTask(task) {
   $("#accept-task").classList.toggle("hidden", !canAccept);
 }
 
-function renderSessionCheckpoints(task) {
-  const checkpoints = Array.isArray(task.sessionCheckpoints) ? task.sessionCheckpoints : [];
-  const section = $("#checkpoint-section");
-  section.classList.toggle("hidden", checkpoints.length === 0);
-  $("#checkpoint-count").textContent = checkpoints.length;
-  $("#checkpoint-list").innerHTML = checkpoints.slice(0, 8).map((checkpoint) => {
-    const bytes = checkpoint.capsuleMeta?.bytes ? `${(checkpoint.capsuleMeta.bytes / 1024).toFixed(1)} KiB` : "bounded";
-    const expiry = checkpoint.status === "ready" ? `expires ${time(checkpoint.expiresAt)}` : checkpoint.status;
-    const cancel = checkpoint.status === "ready"
-      ? `<button class="mini" data-cancel-checkpoint="${checkpoint.id}" aria-label="Cancel checkpoint from ${escapeHtml(checkpoint.fromAgentName)}">Cancel</button>`
-      : "";
-    return `<div class="checkpoint-card"><div class="checkpoint-top"><strong>${escapeHtml(checkpoint.fromAgentName)}</strong><span class="checkpoint-status ${escapeHtml(checkpoint.status)}">${escapeHtml(checkpoint.status)}</span></div><p>${escapeHtml(checkpoint.nextAction || "Task state checkpointed")}</p><small>generation ${checkpoint.checkpointGeneration} · ${escapeHtml(bytes)} · ${escapeHtml(expiry)}</small>${cancel}</div>`;
-  }).join("");
-}
 
 function renderTaskDescription(description) {
   const element = $("#task-description");
@@ -751,13 +715,10 @@ function renderAgentList() {
     const forget = agent.status === "unresponsive"
       ? `<button class="row-delete" data-forget-agent="${agent.id}" data-forget-name="${escapeHtml(agent.name)}" title="Remove this unresponsive agent from DevTeam" aria-label="Remove ${escapeHtml(agent.name)}">×</button>`
       : "";
-    const profile = agent.runtimeProfile;
-    const profileLabel = runtimeProfileLabel(profile);
-    const runtime = profile
-      ? `<small class="runtime-profile">${escapeHtml(profileLabel || "Registered profile has no valid current selection")} · ${escapeHtml(profile.source)}${profile.stale ? " · expired" : ""}</small>`
-      : `<small class="runtime-profile unknown">Model gating inactive — no runtime profile registered for this agent</small>`;
-    const editRuntime = `<button class="row-runtime" data-edit-agent-runtime="${escapeHtml(agent.id)}" title="Set or correct ${escapeHtml(agent.name)}'s real model and effort options" aria-label="Edit runtime profile for ${escapeHtml(agent.name)}">⚙</button>`;
-    return `<div class="agent"><div class="avatar">${initials(agent.name)}</div><div class="agent-info"><strong>${escapeHtml(agent.name)}${unread}</strong><small>${escapeHtml(agent.provider)} · ${escapeHtml(agent.status)} · session ${Number(agent.session_generation || 1)}</small>${runtime}<small class="activity">${escapeHtml(activityLine(agent))}</small></div><span class="agent-actions">${editRuntime}<span class="agent-status ${agent.status} ${freshness(agent.last_seen)}" title="${escapeHtml(agent.status)} · seen ${relativeTime(agent.last_seen)}"></span>${forget}</span></div>`;
+    // What this session says it is running, in the words it reported at join.
+    const running = [agent.current_model, agent.current_effort].filter(Boolean).join(" · ");
+    const runtime = running ? `<small class="runtime-profile">${escapeHtml(running)}</small>` : "";
+    return `<div class="agent"><div class="avatar">${initials(agent.name)}</div><div class="agent-info"><strong>${escapeHtml(agent.name)}${unread}</strong><small>${escapeHtml(agent.provider)} · ${escapeHtml(agent.status)} · session ${Number(agent.session_generation || 1)}</small>${runtime}<small class="activity">${escapeHtml(activityLine(agent))}</small></div><span class="agent-actions"><span class="agent-status ${agent.status} ${freshness(agent.last_seen)}" title="${escapeHtml(agent.status)} · seen ${relativeTime(agent.last_seen)}"></span>${forget}</span></div>`;
   }).join("") || `<p class="hint">No agents connected. Copy the MCP setup, then invoke <code>$devteam</code> in an AI desktop.</p>`;
   renderReconnectList();
 }
@@ -779,7 +740,7 @@ function agentInvite(name = "your agent") {
   const task = state?.selectedTask;
   if (!task) return "Use $devteam to join the local DevTeam.";
   const fresh = task.session_policy === "manual" ? "" : " Open a fresh desktop conversation for this task using host-advertised runtime settings; related assignments normally stay in that session.";
-  return `Use $devteam as ${name} and join task "${task.title}" with taskId ${task.id}.${fresh} If this is the same returning conversation, resume the prior DevTeam session so missed messages replay before claiming work. Use checkpoint takeover only when the invitation includes a one-time checkpoint token.`;
+  return `Use $devteam as ${name} and join task "${task.title}" with taskId ${task.id}.${fresh} If this is the same returning conversation, resume the prior DevTeam session so missed messages replay before claiming work.`;
 }
 
 function addAttachments(files) {
@@ -967,66 +928,6 @@ document.addEventListener("click", async (event) => {
     } catch (error) { toast(error.message); }
     return;
   }
-  const checkpointButton = event.target.closest("[data-checkpoint-assignment]");
-  if (checkpointButton) {
-    const task = state?.selectedTask;
-    const assignment = task?.assignments.find((item) => item.id === checkpointButton.dataset.checkpointAssignment);
-    if (!task || !assignment || assignment.status !== "claimed") return;
-    const form = $("#checkpoint-form");
-    form.reset();
-    form.dataset.taskId = task.id;
-    form.elements.assignmentId.value = assignment.id;
-    $("#checkpoint-assignment-summary").textContent = `${assignment.agent_name} will hand off “${assignment.title}” at claim generation ${assignment.claim_generation}.`;
-    $("#checkpoint-result").classList.add("hidden");
-    $("#checkpoint-invitation").value = "";
-    $("#create-checkpoint").classList.remove("hidden");
-    $("#checkpoint-dialog").showModal();
-    form.elements.nextAction.focus();
-    return;
-  }
-  const editAgentRuntimeButton = event.target.closest("[data-edit-agent-runtime]");
-  if (editAgentRuntimeButton) {
-    const agent = state.agents.find((item) => item.id === editAgentRuntimeButton.dataset.editAgentRuntime);
-    if (!agent || agent.status === "disconnected") return;
-    openRuntimeProfileEditor({
-      scopeType: "agent",
-      scopeId: agent.id,
-      scopeLabel: `${agent.name} · ${agent.provider}`,
-      profile: agent.runtimeProfile,
-    });
-    return;
-  }
-  const runtimeButton = event.target.closest("[data-runtime-assignment]");
-  if (runtimeButton) {
-    const assignment = state?.selectedTask?.assignments.find((item) => item.id === runtimeButton.dataset.runtimeAssignment);
-    if (!assignment?.assessment) return;
-    const form = $("#runtime-form");
-    form.reset();
-    form.elements.assignmentId.value = assignment.id;
-    form.elements.assessmentId.value = assignment.assessment.id;
-    form.dataset.exceptional = String(Boolean(assignment.assessment.requirements.humanApprovalRequired));
-    $("#runtime-assignment-summary").textContent = `${assignment.title}: ${assignment.assessment.level} (${assignment.assessment.score}). ${assignmentRuntimeLabel(assignment)}.`;
-    $("#runtime-reasons").innerHTML = assignment.assessment.reasons.map((reason) => {
-      const source = reason.source === "task" ? "from the task description" : "from the assignment";
-      return `<p><strong>+${Number(reason.points)}</strong> ${escapeHtml(reason.detail)} <small>· ${escapeHtml(source)}</small></p>`;
-    }).join("") || "<p>Baseline scoped work.</p>";
-    $("#runtime-exceptional-confirm").classList.toggle("hidden", !assignment.assessment.requirements.humanApprovalRequired);
-    const agents = state.agents.filter((agent) => agent.status !== "disconnected");
-    $("#runtime-agent").innerHTML = agents.map((agent) => `<option value="${escapeHtml(agent.id)}">${escapeHtml(agent.name)} · ${escapeHtml(runtimeProfileLabel(agent.runtimeProfile || state.selectedTask.baseRuntimeProfile) || "no runtime profile")}</option>`).join("") || '<option value="">No connected agents</option>';
-    populateRuntimeOptions();
-    $("#runtime-dialog").showModal();
-    return;
-  }
-  const cancelCheckpointButton = event.target.closest("[data-cancel-checkpoint]");
-  if (cancelCheckpointButton) {
-    if (!selectedTaskId || !confirm("Cancel this unused session handoff?\n\nThe old session keeps its assignment claim, and the one-time handoff token will stop working immediately.")) return;
-    try {
-      await api(`/api/tasks/${selectedTaskId}/checkpoints/${cancelCheckpointButton.dataset.cancelCheckpoint}/cancel`, { method: "POST", body: JSON.stringify({}) });
-      await refresh();
-      toast("Checkpoint cancelled; the old claim was kept");
-    } catch (error) { toast(error.message); }
-    return;
-  }
   const voteButton = event.target.closest("[data-vote-proposal]");
   if (voteButton) {
     const actions = voteButton.closest(".proposal-actions");
@@ -1066,280 +967,13 @@ $("#project-form").addEventListener("submit", async (event) => {
   } catch (error) { toast(error.message); }
 });
 
-function runtimeClassOptions(values, selected) {
-  return values.map((value) => `<option value="${value}" ${value === selected ? "selected" : ""}>${escapeHtml(value.replace("_", " "))}</option>`).join("");
-}
 
-function renderProfileModelRows() {
-  $("#profile-model-list").innerHTML = profileDraftModels.map((model, modelIndex) => `
-    <section class="profile-model-card">
-      <div class="profile-model-head"><strong>Model ${modelIndex + 1}</strong><button type="button" class="row-delete visible" data-profile-remove-model="${modelIndex}" aria-label="Remove model ${modelIndex + 1}">×</button></div>
-      <div class="profile-grid">
-        <label>Model ID<input data-profile-model-field="id" data-model-index="${modelIndex}" value="${escapeHtml(model.id || "")}" placeholder="desktop-model-id" required></label>
-        <label>Display name<input data-profile-model-field="label" data-model-index="${modelIndex}" value="${escapeHtml(model.label || "")}" placeholder="Clear model name" required></label>
-        <label>Capability class<select data-profile-model-field="class" data-model-index="${modelIndex}">${runtimeClassOptions(MODEL_CLASSES, model.class)}</select></label>
-      </div>
-      <div class="profile-effort-list">${(model.efforts || []).map((effort, effortIndex) => `
-        <div class="profile-effort-row">
-          <input data-profile-effort-field="id" data-model-index="${modelIndex}" data-effort-index="${effortIndex}" value="${escapeHtml(effort.id || "")}" placeholder="effort-id" aria-label="Effort ID" required>
-          <input data-profile-effort-field="label" data-model-index="${modelIndex}" data-effort-index="${effortIndex}" value="${escapeHtml(effort.label || "")}" placeholder="Display label" aria-label="Effort display label" required>
-          <select data-profile-effort-field="class" data-model-index="${modelIndex}" data-effort-index="${effortIndex}" aria-label="Effort class">${runtimeClassOptions(EFFORT_CLASSES, effort.class)}</select>
-          <button type="button" class="row-delete visible" data-profile-remove-effort="${modelIndex}:${effortIndex}" aria-label="Remove effort">×</button>
-        </div>`).join("")}</div>
-      <button type="button" class="secondary profile-add-effort" data-profile-add-effort="${modelIndex}">Add effort</button>
-    </section>`).join("");
-  populateProfileCurrentOptions(profileDraftCurrentModel, profileDraftCurrentEffort);
-}
 
-function populateProfileCurrentOptions(requestedModel = "", requestedEffort = "") {
-  const models = profileDraftModels.filter((model) => String(model.id || "").trim());
-  const modelId = models.some((model) => model.id === requestedModel) ? requestedModel : (models[0]?.id || "");
-  profileDraftCurrentModel = modelId;
-  $("#profile-current-model").innerHTML = models.map((model) => `<option value="${escapeHtml(model.id)}" ${model.id === modelId ? "selected" : ""}>${escapeHtml(model.label || model.id)} · ${escapeHtml(model.class)}</option>`).join("") || '<option value="">Add a model first</option>';
-  const model = models.find((item) => item.id === modelId);
-  const efforts = (model?.efforts || []).filter((effort) => String(effort.id || "").trim());
-  const effortId = efforts.some((effort) => effort.id === requestedEffort) ? requestedEffort : (efforts[0]?.id || "");
-  profileDraftCurrentEffort = effortId;
-  $("#profile-current-effort").innerHTML = efforts.map((effort) => `<option value="${escapeHtml(effort.id)}" ${effort.id === effortId ? "selected" : ""}>${escapeHtml(effort.label || effort.id)} · ${escapeHtml(effort.class)}</option>`).join("") || '<option value="">Add an effort first</option>';
-}
 
-function openRuntimeProfileEditor({ scopeType, scopeId, scopeLabel, profile = null }) {
-  const form = $("#runtime-profile-form");
-  form.reset();
-  form.dataset.scopeType = scopeType;
-  form.dataset.scopeId = scopeId;
-  form.elements.providerId.value = profile?.providerId || "";
-  form.elements.switchMode.value = profile?.switchMode || "user_required";
-  profileDraftModels = (profile?.availableModels || []).map((model) => ({
-    id: model.id,
-    label: model.label,
-    class: model.class,
-    efforts: (model.efforts || []).map((effort) => ({ id: effort.id, label: effort.label, class: effort.class })),
-  }));
-  if (!profileDraftModels.length) profileDraftModels = [{ id: "", label: "", class: "balanced", efforts: [{ id: "", label: "", class: "medium" }] }];
-  for (const model of profileDraftModels) {
-    if (!model.efforts.length) model.efforts.push({ id: "", label: "", class: "medium" });
-  }
-  profileDraftCurrentModel = profile?.currentModel || "";
-  profileDraftCurrentEffort = profile?.currentEffort || "";
-  $("#runtime-profile-title").textContent = scopeType === "task" ? "Set task base runtime" : "Set agent runtime";
-  $("#runtime-profile-scope").textContent = scopeLabel;
-  $("#profile-clear-task").classList.toggle("hidden", scopeType !== "task" || !profile);
-  renderProfileModelRows();
-  $("#runtime-profile-dialog").showModal();
-}
 
-$("#profile-add-model").addEventListener("click", () => {
-  profileDraftModels.push({ id: "", label: "", class: "balanced", efforts: [{ id: "", label: "", class: "medium" }] });
-  renderProfileModelRows();
-});
 
-$("#profile-model-list").addEventListener("input", (event) => {
-  const modelField = event.target.dataset.profileModelField;
-  const effortField = event.target.dataset.profileEffortField;
-  const modelIndex = Number(event.target.dataset.modelIndex);
-  if (modelField && profileDraftModels[modelIndex]) profileDraftModels[modelIndex][modelField] = event.target.value;
-  if (effortField) {
-    const effortIndex = Number(event.target.dataset.effortIndex);
-    if (profileDraftModels[modelIndex]?.efforts[effortIndex]) profileDraftModels[modelIndex].efforts[effortIndex][effortField] = event.target.value;
-  }
-  populateProfileCurrentOptions(profileDraftCurrentModel, profileDraftCurrentEffort);
-});
 
-$("#profile-model-list").addEventListener("change", (event) => {
-  event.target.dispatchEvent(new Event("input", { bubbles: true }));
-});
 
-$("#profile-model-list").addEventListener("click", (event) => {
-  const addEffort = event.target.closest("[data-profile-add-effort]");
-  if (addEffort) {
-    profileDraftModels[Number(addEffort.dataset.profileAddEffort)].efforts.push({ id: "", label: "", class: "medium" });
-    renderProfileModelRows();
-    return;
-  }
-  const removeEffort = event.target.closest("[data-profile-remove-effort]");
-  if (removeEffort) {
-    const [modelIndex, effortIndex] = removeEffort.dataset.profileRemoveEffort.split(":").map(Number);
-    profileDraftModels[modelIndex].efforts.splice(effortIndex, 1);
-    renderProfileModelRows();
-    return;
-  }
-  const removeModel = event.target.closest("[data-profile-remove-model]");
-  if (removeModel) {
-    profileDraftModels.splice(Number(removeModel.dataset.profileRemoveModel), 1);
-    renderProfileModelRows();
-  }
-});
-
-$("#profile-current-model").addEventListener("change", (event) => populateProfileCurrentOptions(event.target.value, ""));
-$("#profile-current-effort").addEventListener("change", (event) => { profileDraftCurrentEffort = event.target.value; });
-
-$("#runtime-profile-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const form = event.target;
-  const models = profileDraftModels.map((model) => ({
-    id: String(model.id || "").trim(),
-    label: String(model.label || "").trim(),
-    class: model.class,
-    efforts: (model.efforts || []).map((effort) => ({ id: String(effort.id || "").trim(), label: String(effort.label || "").trim(), class: effort.class })),
-  }));
-  if (!models.length || models.some((model) => !model.id || !model.label || !model.efforts.length || model.efforts.some((effort) => !effort.id || !effort.label))) {
-    toast("Every model and effort needs an ID and a clear display name");
-    return;
-  }
-  if (new Set(models.map((model) => model.id)).size !== models.length || models.some((model) => new Set(model.efforts.map((effort) => effort.id)).size !== model.efforts.length)) {
-    toast("Model and effort IDs must be unique within the profile");
-    return;
-  }
-  const values = Object.fromEntries(new FormData(form));
-  const currentModel = models.find((model) => model.id === values.currentModel);
-  if (!currentModel?.efforts.some((effort) => effort.id === values.currentEffort)) { toast("Choose a valid current model and effort"); return; }
-  const profile = {
-    providerId: values.providerId,
-    currentModel: values.currentModel,
-    currentEffort: values.currentEffort,
-    availableModels: models,
-    switchMode: values.switchMode,
-    source: "user",
-    observedAt: new Date().toISOString(),
-  };
-  try {
-    if (form.dataset.scopeType === "task") {
-      await api(`/api/tasks/${form.dataset.scopeId}`, { method: "PATCH", body: JSON.stringify({ baseRuntimeProfile: profile }) });
-    } else {
-      await api(`/api/agents/${form.dataset.scopeId}/runtime`, { method: "PUT", body: JSON.stringify({ profile }) });
-    }
-    form.closest("dialog").close();
-    await refresh();
-    if ($("#runtime-dialog").open) populateRuntimeOptions();
-    toast("Runtime profile saved with real model names");
-  } catch (error) { toast(error.message); }
-});
-
-$("#profile-clear-task").addEventListener("click", async () => {
-  const form = $("#runtime-profile-form");
-  if (form.dataset.scopeType !== "task" || !confirm("Clear this task's base runtime profile? Model gating stays inactive for agents that do not advertise their own profile.")) return;
-  try {
-    await api(`/api/tasks/${form.dataset.scopeId}`, { method: "PATCH", body: JSON.stringify({ baseRuntimeProfile: null }) });
-    $("#runtime-profile-dialog").close();
-    await refresh();
-    toast("Task runtime profile cleared");
-  } catch (error) { toast(error.message); }
-});
-
-const checkpointLines = (value) => String(value || "").split("\n").map((line) => line.trim()).filter(Boolean);
-
-function selectedRuntimeAgent() {
-  return state?.agents.find((agent) => agent.id === $("#runtime-agent").value) || null;
-}
-
-function selectedRuntimeProfile() {
-  return selectedRuntimeAgent()?.runtimeProfile || state?.selectedTask?.baseRuntimeProfile || null;
-}
-
-function populateRuntimeOptions(requestedModel = null) {
-  const agent = selectedRuntimeAgent();
-  const profile = selectedRuntimeProfile();
-  const models = profile?.availableModels || [];
-  const selectedModel = models.some((model) => model.id === requestedModel) ? requestedModel : profile?.currentModel;
-  $("#runtime-model").innerHTML = models.map((model) => `<option value="${escapeHtml(model.id)}" ${model.id === selectedModel ? "selected" : ""}>${escapeHtml(model.label)} · ${escapeHtml(model.class)}</option>`).join("") || '<option value="">No advertised models</option>';
-  const model = models.find((item) => item.id === selectedModel) || models[0];
-  $("#runtime-effort").innerHTML = (model?.efforts || []).map((effort) => `<option value="${escapeHtml(effort.id)}" ${effort.id === profile?.currentEffort ? "selected" : ""}>${escapeHtml(effort.label)} · ${escapeHtml(effort.class)}</option>`).join("") || '<option value="">No advertised efforts</option>';
-  $("#runtime-profile-state").textContent = profile
-    ? `${agent?.runtimeProfile ? "Agent profile" : "Task base profile"}: ${runtimeProfileLabel(profile) || "no valid current selection"}`
-    : "Model gating inactive — no runtime profile registered for this agent";
-}
-
-$("#runtime-agent").addEventListener("change", populateRuntimeOptions);
-$("#runtime-model").addEventListener("change", (event) => populateRuntimeOptions(event.target.value));
-$("#runtime-edit-profile").addEventListener("click", () => {
-  const agent = selectedRuntimeAgent();
-  if (!agent) { toast("Choose a connected agent first"); return; }
-  openRuntimeProfileEditor({ scopeType: "agent", scopeId: agent.id, scopeLabel: `${agent.name} · ${agent.provider}`, profile: agent.runtimeProfile });
-});
-$("#runtime-form").addEventListener("click", async (event) => {
-  const button = event.target.closest("[data-runtime-choice]");
-  if (!button) return;
-  const form = event.currentTarget;
-  const choice = button.dataset.runtimeChoice;
-  const values = Object.fromEntries(new FormData(form));
-  if (!values.agentId) { toast("Choose an agent with an advertised runtime profile"); return; }
-  const exceptional = form.dataset.exceptional === "true";
-  if (exceptional && ["switched", "continue"].includes(choice) && values.humanApproved !== "on") { toast("Exceptional settings require explicit approval"); return; }
-  button.disabled = true;
-  try {
-    if (choice === "switched") {
-      const profile = selectedRuntimeProfile();
-      const advertised = profile?.availableModels.find((model) => model.id === values.modelId);
-      const effort = advertised?.efforts.find((item) => item.id === values.effortId);
-      if (!advertised || !effort) throw new Error("Choose a host-advertised model and effort before confirming the switch.");
-      await api(`/api/agents/${values.agentId}/runtime`, { method: "PUT", body: JSON.stringify({ profile: {
-        ...profile,
-        currentModel: advertised.id,
-        currentEffort: effort.id,
-        currentModelClass: advertised.class,
-        currentEffortClass: effort.class,
-        observedAt: new Date().toISOString(),
-        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
-      } }) });
-    }
-    await api(`/api/assignments/${values.assignmentId}/runtime-decisions`, { method: "POST", body: JSON.stringify({
-      agentId: values.agentId,
-      assessmentId: values.assessmentId,
-      choice,
-      reason: values.reason,
-      humanApproved: values.humanApproved === "on",
-    }) });
-    $("#runtime-dialog").close();
-    await refresh();
-    toast(`Runtime decision recorded: ${choice}`);
-  } catch (error) { toast(error.message); }
-  finally { button.disabled = false; }
-});
-
-$("#checkpoint-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const form = event.target;
-  const taskId = form.dataset.taskId;
-  if (!taskId || !form.elements.assignmentId.value) return;
-  const submit = $("#create-checkpoint");
-  submit.disabled = true;
-  try {
-    const values = Object.fromEntries(new FormData(form));
-    const result = await api(`/api/tasks/${taskId}/checkpoints`, {
-      method: "POST",
-      body: JSON.stringify({
-        assignmentId: values.assignmentId,
-        nextAction: values.nextAction,
-        decisions: checkpointLines(values.decisions),
-        blockers: checkpointLines(values.blockers),
-        checks: checkpointLines(values.checks),
-        failedApproaches: checkpointLines(values.failedApproaches),
-        expiresInMinutes: Number(values.expiresInMinutes),
-      }),
-    });
-    $("#checkpoint-invitation").value = result.invitation;
-    $("#checkpoint-result").classList.remove("hidden");
-    submit.classList.add("hidden");
-    await refresh();
-    try { await navigator.clipboard.writeText(result.invitation); toast("Checkpoint created and invitation copied"); }
-    catch { toast("Checkpoint created — copy the one-time invitation now"); }
-  } catch (error) { toast(error.message); }
-  finally { submit.disabled = false; }
-});
-
-$("#copy-checkpoint-invitation").addEventListener("click", async () => {
-  const invitation = $("#checkpoint-invitation").value;
-  if (!invitation) return;
-  try { await navigator.clipboard.writeText(invitation); toast("Fresh-session invitation copied"); }
-  catch { $("#checkpoint-invitation").select(); toast("Invitation selected — copy it now"); }
-});
-
-$("#checkpoint-dialog").addEventListener("close", () => {
-  $("#checkpoint-invitation").value = "";
-  $("#checkpoint-result").classList.add("hidden");
-  $("#create-checkpoint").classList.remove("hidden");
-});
 
 function openTaskEditor() {
   const task = state?.selectedTask;
@@ -1354,11 +988,6 @@ function openTaskEditor() {
 }
 
 $("#edit-task").addEventListener("click", openTaskEditor);
-$("#edit-task-runtime").addEventListener("click", () => {
-  const task = state?.selectedTask;
-  if (!task) return;
-  openRuntimeProfileEditor({ scopeType: "task", scopeId: task.id, scopeLabel: `Default runtime for “${task.title}”`, profile: task.baseRuntimeProfile });
-});
 $("#edit-task-from-brief").addEventListener("click", () => {
   $("#task-brief-dialog").close();
   openTaskEditor();
@@ -1557,6 +1186,31 @@ function openResumeDialog() {
 
 $("#unblock-task").addEventListener("click", openResumeDialog);
 $("#resume-task").addEventListener("click", openResumeDialog);
+
+// The other way out of a block. Resume is right for work that genuinely stopped; it is the wrong
+// shape for a task an agent blocked to mean "finished", which then needed a whole replan cycle just
+// to close. The server refuses this if work was still in flight, and says how much.
+$("#close-blocked-task").addEventListener("click", async () => {
+  const summary = prompt("Close this task as finished. What was delivered?");
+  if (summary === null) return;
+  const body = { summary: summary.trim() || "Human closed a stopped task as finished." };
+  try {
+    await api(`/api/tasks/${selectedTaskId}/accept`, { method: "POST", body: JSON.stringify(body) });
+  } catch (error) {
+    // The only refusal worth a second question is "work was still in flight"; anything else stands.
+    if (!/still in flight/.test(error.message)) { toast(error.message); return; }
+    if (!confirm(`${error.message}
+
+Close it anyway, leaving that work unfinished?`)) return;
+    try {
+      await api(`/api/tasks/${selectedTaskId}/accept`, {
+        method: "POST", body: JSON.stringify({ ...body, acceptStranded: true }),
+      });
+    } catch (retryError) { toast(retryError.message); return; }
+  }
+  await refresh();
+  toast("Task closed as finished");
+});
 
 $("#resume-form").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -1777,3 +1431,33 @@ async function boot() {
   } catch (error) { toast(error.message); }
 }
 boot();
+
+// Collapsing a nav section. The state is remembered per browser, and a collapsed section keeps
+// showing the selected project or task above the fold — see #project-current / #task-current.
+function applyNavCollapse(section, collapsed) {
+  const nav = document.querySelector(".sidebar nav");
+  if (!nav) return;
+  nav.classList.toggle(`${section}-collapsed`, collapsed);
+  const toggle = document.querySelector(`[data-collapse="${section}"]`);
+  if (toggle) {
+    toggle.setAttribute("aria-expanded", collapsed ? "false" : "true");
+    toggle.title = collapsed
+      ? `Expand ${section === "projects" ? "projects" : "task history"}`
+      : `Collapse ${section === "projects" ? "projects" : "task history"}`;
+  }
+  // A private convenience, so it is fine for this to be unavailable or to throw.
+  try { localStorage.setItem(`devteam.nav.${section}`, collapsed ? "collapsed" : "open"); } catch { /* ignore */ }
+}
+
+for (const section of ["projects", "tasks"]) {
+  let collapsed = false;
+  try { collapsed = localStorage.getItem(`devteam.nav.${section}`) === "collapsed"; } catch { collapsed = false; }
+  applyNavCollapse(section, collapsed);
+}
+
+document.addEventListener("click", (event) => {
+  const toggle = event.target.closest("[data-collapse]");
+  if (!toggle) return;
+  const section = toggle.dataset.collapse;
+  applyNavCollapse(section, toggle.getAttribute("aria-expanded") === "true");
+});

@@ -63,18 +63,18 @@ test("dashboard API and authenticated MCP endpoint work together", async (t) => 
   await client.connect(transport);
   t.after(() => client.close());
   const tools = await client.listTools();
-  assert.ok(tools.tools.some((tool) => tool.name === "devteam_connect"));
-  assert.ok(tools.tools.some((tool) => tool.name === "devteam_wait"));
+  assert.ok(tools.tools.some((tool) => tool.name === "devteam_join"));
+  assert.ok(tools.tools.some((tool) => tool.name === "devteam_next"));
 
-  const connected = await client.callTool({ name: "devteam_connect", arguments: { name: "Integration Agent", provider: "test", capabilities: ["planning"], taskId: createdTask.id } });
+  const connected = await client.callTool({ name: "devteam_join", arguments: { name: "Integration Agent", provider: "test", capabilities: ["planning"], taskId: createdTask.id } });
   const agentId = connected.structuredContent.agent.id;
-  const waiting = await client.callTool({ name: "devteam_wait", arguments: { agentId, timeoutSeconds: 1 } });
+  const waiting = await client.callTool({ name: "devteam_next", arguments: { agentId, timeoutSeconds: 1 } });
   assert.equal(waiting.structuredContent.status, "assigned");
   assert.equal(waiting.structuredContent.assignment.role, "planner");
   const healthState = await fetch(`${instance.url}/api/state?taskId=${createdTask.id}`).then((response) => response.json());
   assert.equal(healthState.selectedTask.memoryHealth.brief.bytes, waiting.structuredContent.briefMeta.bytes);
   assert.equal(healthState.selectedTask.memoryHealth.brief.limitBytes, 32 * 1024);
-  const disconnected = await client.callTool({ name: "devteam_disconnect", arguments: { agentId, summary: "Integration verified." } });
+  const disconnected = await client.callTool({ name: "devteam_leave", arguments: { agentId, summary: "Integration verified." } });
   assert.equal(disconnected.structuredContent.disconnected, true);
 
   const explicitEmptyState = await fetch(`${instance.url}/api/state?taskId=`).then((response) => response.json());
@@ -123,18 +123,18 @@ test("an unscoped MCP agent on a multi-task server receives room choices instead
   await client.connect(transport);
   t.after(() => client.close());
 
-  const connected = await client.callTool({ name: "devteam_connect", arguments: { name: "Roomless Agent", provider: "test" } });
+  const connected = await client.callTool({ name: "devteam_join", arguments: { name: "Roomless Agent", provider: "test" } });
   const result = connected.structuredContent;
   assert.equal(result.roomRequired, true);
   assert.deepEqual(new Set(result.availableTasks.map((task) => task.id)), new Set([first.id, second.id]));
-  const waiting = await client.callTool({ name: "devteam_wait", arguments: { agentId: result.agent.id, timeoutSeconds: 1 } });
+  const waiting = await client.callTool({ name: "devteam_next", arguments: { agentId: result.agent.id, timeoutSeconds: 1 } });
   assert.equal(waiting.structuredContent.status, "room_required");
   assert.equal(waiting.structuredContent.keepWaiting, false);
   assert.match(waiting.structuredContent.next, /devteam_join/);
 
   const joined = await client.callTool({ name: "devteam_join", arguments: { agentId: result.agent.id, taskId: first.id, role: "contributor" } });
   assert.equal(joined.structuredContent.joined, true);
-  const assigned = await client.callTool({ name: "devteam_wait", arguments: { agentId: result.agent.id, timeoutSeconds: 1 } });
+  const assigned = await client.callTool({ name: "devteam_next", arguments: { agentId: result.agent.id, timeoutSeconds: 1 } });
   assert.equal(assigned.structuredContent.status, "assigned");
   assert.equal(assigned.structuredContent.assignment.task_id, first.id);
 });
@@ -167,7 +167,7 @@ test("an already-delivered runtime recommendation does not hot-loop subsequent M
     source: "host",
     observedAt: new Date().toISOString(),
   };
-  const connected = await client.callTool({ name: "devteam_connect", arguments: { name: "Runtime worker", provider: "test", taskId: task.id } });
+  const connected = await client.callTool({ name: "devteam_join", arguments: { name: "Runtime worker", provider: "test", taskId: task.id } });
   const agentId = connected.structuredContent.agent.id;
   const planner = instance.store.claimNextAssignment(agentId);
   assert.ok(planner?.id, "the fixture planner assignment is claimable");
@@ -181,10 +181,10 @@ test("an already-delivered runtime recommendation does not hot-loop subsequent M
     role: "implementer",
   });
 
-  const firstGate = await client.callTool({ name: "devteam_wait", arguments: { agentId, timeoutSeconds: 1 } });
+  const firstGate = await client.callTool({ name: "devteam_next", arguments: { agentId, timeoutSeconds: 1 } });
   assert.equal(firstGate.structuredContent.status, "runtime_action_required", "the recommendation is surfaced once");
   const started = Date.now();
-  const repeatedWait = await client.callTool({ name: "devteam_wait", arguments: { agentId, timeoutSeconds: 1 } });
+  const repeatedWait = await client.callTool({ name: "devteam_next", arguments: { agentId, timeoutSeconds: 1 } });
   const elapsed = Date.now() - started;
   assert.equal(repeatedWait.structuredContent.status, "idle", "an undecided recommendation is not returned again");
   assert.ok(elapsed >= 850, `the second wait should block near its timeout instead of hot-looping (${elapsed} ms)`);
@@ -206,15 +206,15 @@ test("MCP assignment dependencies sequence work and devteam_brief stays compact"
   const client = new Client({ name: "devteam-dependency-test", version: "1.0.0" });
   await client.connect(transport);
   t.after(() => client.close());
-  const connected = await client.callTool({ name: "devteam_connect", arguments: { name: "Worker", provider: "test", taskId: task.id } });
+  const connected = await client.callTool({ name: "devteam_join", arguments: { name: "Worker", provider: "test", taskId: task.id } });
   const agentId = connected.structuredContent.agent.id;
-  const planner = await client.callTool({ name: "devteam_wait", arguments: { agentId, timeoutSeconds: 1 } });
+  const planner = await client.callTool({ name: "devteam_next", arguments: { agentId, timeoutSeconds: 1 } });
   assert.equal(planner.structuredContent.briefMeta.bytes, Buffer.byteLength(JSON.stringify(planner.structuredContent), "utf8"));
   assert.ok(planner.structuredContent.briefMeta.bytes <= 32 * 1024, "automatic assignment context obeys the same hard budget");
-  const parent = await client.callTool({ name: "devteam_assign", arguments: { agentId, taskId: task.id, title: "Parent", description: "First." } });
-  const child = await client.callTool({ name: "devteam_assign", arguments: { agentId, taskId: task.id, title: "Child", description: "Second.", dependsOn: [parent.structuredContent.id] } });
+  const parent = await client.callTool({ name: "devteam_plan", arguments: { agentId, taskId: task.id, title: "Parent", description: "First." } });
+  const child = await client.callTool({ name: "devteam_plan", arguments: { agentId, taskId: task.id, title: "Child", description: "Second.", dependsOn: [parent.structuredContent.id] } });
   instance.store.humanMessage(task.id, "😀".repeat(50_000), "Worker");
-  const brief = await client.callTool({ name: "devteam_brief", arguments: { agentId, taskId: task.id } });
+  const brief = await client.callTool({ name: "devteam_next", arguments: { agentId, want: "brief", taskId: task.id } });
   assert.equal(brief.structuredContent.briefMeta.bytes, Buffer.byteLength(JSON.stringify(brief.structuredContent), "utf8"));
   assert.ok(brief.structuredContent.briefMeta.bytes <= 32 * 1024, "pending live messages remain inside the brief budget");
   assert.equal(brief.structuredContent.pendingMessages.length, 1);
@@ -224,10 +224,10 @@ test("MCP assignment dependencies sequence work and devteam_brief stays compact"
   assert.equal(Object.hasOwn(brief.structuredContent, "agents"), false);
 
   await client.callTool({ name: "devteam_report", arguments: { agentId, assignmentId: planner.structuredContent.assignment.id, claimToken: planner.structuredContent.assignment.claimToken, message: "Planned." } });
-  const parentClaim = await client.callTool({ name: "devteam_wait", arguments: { agentId, timeoutSeconds: 1 } });
+  const parentClaim = await client.callTool({ name: "devteam_next", arguments: { agentId, timeoutSeconds: 1 } });
   assert.equal(parentClaim.structuredContent.assignment.id, parent.structuredContent.id);
   await client.callTool({ name: "devteam_report", arguments: { agentId, assignmentId: parent.structuredContent.id, claimToken: parentClaim.structuredContent.assignment.claimToken, message: "Parent done." } });
-  const childClaim = await client.callTool({ name: "devteam_wait", arguments: { agentId, timeoutSeconds: 1 } });
+  const childClaim = await client.callTool({ name: "devteam_next", arguments: { agentId, timeoutSeconds: 1 } });
   assert.equal(childClaim.structuredContent.assignment.id, child.structuredContent.id);
 });
 
@@ -250,7 +250,7 @@ test("a human message wakes a waiting agent through MCP and records delivery", a
   await client.connect(transport);
   t.after(() => client.close());
 
-  const connected = await client.callTool({ name: "devteam_connect", arguments: { name: "Codex", provider: "test", capabilities: ["coding"], taskId: task.id } });
+  const connected = await client.callTool({ name: "devteam_join", arguments: { name: "Codex", provider: "test", capabilities: ["coding"], taskId: task.id } });
   const agentId = connected.structuredContent.agent.id;
 
   const authoredMessage = "Codex,\n\nplease   prioritise security.";
@@ -260,7 +260,7 @@ test("a human message wakes a waiting agent through MCP and records delivery", a
     body: JSON.stringify({ message: authoredMessage, target: "Codex" }),
   });
 
-  const waking = await client.callTool({ name: "devteam_wait", arguments: { agentId, timeoutSeconds: 5 } });
+  const waking = await client.callTool({ name: "devteam_next", arguments: { agentId, timeoutSeconds: 5 } });
   assert.equal(waking.structuredContent.status, "message", "a pending message is returned before any assignment");
   assert.match(waking.structuredContent.messages[0].message, /prioritise security/);
   assert.equal(waking.structuredContent.keepWaiting, true);
@@ -270,7 +270,7 @@ test("a human message wakes a waiting agent through MCP and records delivery", a
   assert.equal(humanEvent.message, authoredMessage, "internal line breaks and repeated spaces survive the chat pipeline");
   assert.ok(humanEvent.receipts.some((receipt) => receipt.agent_name === "Codex" && receipt.delivered_at), "delivery is recorded for the dashboard");
 
-  const nextWait = await client.callTool({ name: "devteam_wait", arguments: { agentId, timeoutSeconds: 5 } });
+  const nextWait = await client.callTool({ name: "devteam_next", arguments: { agentId, timeoutSeconds: 5 } });
   assert.equal(nextWait.structuredContent.status, "assigned", "after messages drain, queued work is claimed");
   assert.equal(nextWait.structuredContent.assignment.role, "planner");
 });
@@ -287,7 +287,7 @@ test("an MCP session cannot act as an agent it did not connect as", async (t) =>
     const client = new Client({ name, version: "1.0.0" });
     await client.connect(transport);
     t.after(() => client.close());
-    const result = await client.callTool({ name: "devteam_connect", arguments: { name, provider: "test" } });
+    const result = await client.callTool({ name: "devteam_join", arguments: { name, provider: "test" } });
     return { client, agentId: result.structuredContent.agent.id };
   };
 
@@ -295,7 +295,7 @@ test("an MCP session cannot act as an agent it did not connect as", async (t) =>
   const beta = await connect("Beta");
 
   // Beta tries to act as Alpha by passing Alpha's agentId.
-  const spoof = await beta.client.callTool({ name: "devteam_disconnect", arguments: { agentId: alpha.agentId, summary: "spoofed" } });
+  const spoof = await beta.client.callTool({ name: "devteam_leave", arguments: { agentId: alpha.agentId, summary: "spoofed" } });
   assert.equal(spoof.isError, true, "acting as another agent is rejected");
 
   const state = await fetch(`${instance.url}/api/state`).then((response) => response.json());
@@ -362,9 +362,9 @@ test("a busy agent is reached with pending messages on its next action", async (
   await client.connect(transport);
   t.after(() => client.close());
 
-  const connected = await client.callTool({ name: "devteam_connect", arguments: { name: "Worker", provider: "test", taskId: task.id } });
+  const connected = await client.callTool({ name: "devteam_join", arguments: { name: "Worker", provider: "test", taskId: task.id } });
   const agentId = connected.structuredContent.agent.id;
-  const assigned = await client.callTool({ name: "devteam_wait", arguments: { agentId, timeoutSeconds: 2 } });
+  const assigned = await client.callTool({ name: "devteam_next", arguments: { agentId, timeoutSeconds: 2 } });
   assert.equal(assigned.structuredContent.status, "assigned", "the agent is now busy on the planner assignment");
 
   // The human reaches the agent while it is busy (not sitting in devteam_wait).
@@ -374,7 +374,7 @@ test("a busy agent is reached with pending messages on its next action", async (
     body: JSON.stringify({ message: "Please pause and check the spec.", target: "Worker" }),
   });
 
-  const inspected = await client.callTool({ name: "devteam_state", arguments: { agentId, taskId: task.id } });
+  const inspected = await client.callTool({ name: "devteam_next", arguments: { agentId, want: "state", taskId: task.id } });
   assert.ok(Array.isArray(inspected.structuredContent.pendingMessages), "an ordinary action carries the agent's inbox");
   assert.match(inspected.structuredContent.pendingMessages[0].message, /check the spec/);
 });
@@ -398,31 +398,31 @@ test("shared blackboard round-trips over MCP and a stuck write lease can be forc
   await client.connect(transport);
   t.after(() => client.close());
 
-  const connected = await client.callTool({ name: "devteam_connect", arguments: { name: "Worker", provider: "test", taskId: task.id } });
+  const connected = await client.callTool({ name: "devteam_join", arguments: { name: "Worker", provider: "test", taskId: task.id } });
   const agentId = connected.structuredContent.agent.id;
 
   // Shared memory writes and reads back over MCP with provenance.
-  await client.callTool({ name: "devteam_note_set", arguments: { agentId, taskId: task.id, key: "world", value: "goal: ship it" } });
-  const got = await client.callTool({ name: "devteam_note_get", arguments: { agentId, taskId: task.id, key: "world" } });
+  await client.callTool({ name: "devteam_memory", arguments: { agentId, taskId: task.id, action: "set", key: "world", value: "goal: ship it" } });
+  const got = await client.callTool({ name: "devteam_memory", arguments: { agentId, taskId: task.id, action: "get", key: "world" } });
   assert.equal(got.structuredContent.value, "goal: ship it");
   assert.equal(got.structuredContent.version, 1);
   assert.equal(got.structuredContent.scope, "task");
 
-  await client.callTool({ name: "devteam_note_set", arguments: { agentId, taskId: task.id, scope: "project", key: "architecture", value: "local-first" } });
-  const projectNote = await client.callTool({ name: "devteam_note_get", arguments: { agentId, taskId: task.id, scope: "project", key: "architecture" } });
+  await client.callTool({ name: "devteam_memory", arguments: { agentId, taskId: task.id, action: "set", scope: "project", key: "architecture", value: "local-first" } });
+  const projectNote = await client.callTool({ name: "devteam_memory", arguments: { agentId, taskId: task.id, action: "get", scope: "project", key: "architecture" } });
   assert.equal(projectNote.structuredContent.scope, "project");
   assert.equal(projectNote.structuredContent.value, "local-first");
-  const projectKeys = await client.callTool({ name: "devteam_note_get", arguments: { agentId, taskId: task.id, scope: "project" } });
+  const projectKeys = await client.callTool({ name: "devteam_memory", arguments: { agentId, taskId: task.id, action: "get", scope: "project" } });
   assert.equal(projectKeys.structuredContent.scope, "project");
   assert.deepEqual(projectKeys.structuredContent.keys.map((item) => item.key), ["architecture"]);
   assert.equal(instance.store.taskDetail(task.id).projectBlackboard[0].value, "local-first");
 
   // Claim the planner assignment, then delegate a write assignment and claim it to hold a lease.
-  await client.callTool({ name: "devteam_wait", arguments: { agentId, timeoutSeconds: 2 } });
+  await client.callTool({ name: "devteam_next", arguments: { agentId, timeoutSeconds: 2 } });
   const plannerId = instance.store.taskDetail(task.id).assignments.find((a) => a.role === "planner").id;
   await client.callTool({ name: "devteam_report", arguments: { agentId, assignmentId: plannerId, message: "Planned." } });
   const write = instance.store.createAssignment({ taskId: task.id, title: "Do the write", description: "Edit files.", requiresWrite: true, targetAgentName: "Worker" });
-  const claimed = await client.callTool({ name: "devteam_wait", arguments: { agentId, timeoutSeconds: 2 } });
+  const claimed = await client.callTool({ name: "devteam_next", arguments: { agentId, timeoutSeconds: 2 } });
   assert.equal(claimed.structuredContent.assignment.id, write.id);
   assert.ok(claimed.structuredContent.assignment.claimToken, "the claim carries a fencing token");
 
@@ -553,80 +553,6 @@ test("dashboard can resume blocked work and records human acceptance without for
   assert.match(event.message, /Human accepted/);
 });
 
-test("the runtime profile control plane persists human-entered models and stays authenticated", async (t) => {
-  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-runtime-rest-"));
-  const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd(), knowledge: { enabled: false } });
-  t.after(async () => { await instance.close(); await rm(dataDir, { recursive: true, force: true }); });
-  const authed = { "content-type": "application/json", authorization: `Bearer ${instance.store.token}` };
-
-  const project = instance.store.ensureProject("Runtime REST", process.cwd());
-  const task = instance.store.createTask({ projectId: project.id, title: "Runtime REST", description: "Exercise the profile surface." });
-  const profile = {
-    providerId: "fixture-provider",
-    currentModel: "fixture-balanced",
-    currentEffort: "fixture-medium",
-    availableModels: [{
-      id: "fixture-balanced",
-      label: "Fixture Balanced 5",
-      class: "balanced",
-      efforts: [{ id: "fixture-medium", label: "Medium", class: "medium" }],
-    }],
-  };
-
-  // A state-changing profile call without a credential must be refused.
-  const anonymous = await fetch(`${instance.url}/api/tasks/${task.id}`, {
-    method: "PATCH",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ baseRuntimeProfile: profile }),
-  });
-  assert.equal(anonymous.status, 401, "the base profile cannot be set without the dashboard session or bearer token");
-
-  const patched = await fetch(`${instance.url}/api/tasks/${task.id}`, {
-    method: "PATCH", headers: authed, body: JSON.stringify({ baseRuntimeProfile: profile }),
-  });
-  assert.equal(patched.status, 200);
-  const state = await fetch(`${instance.url}/api/state?taskId=${task.id}`).then((response) => response.json());
-  const base = state.selectedTask.baseRuntimeProfile;
-  assert.equal(base.source, "user", "a human-entered profile is stored as a user claim, never as a host observation");
-  assert.equal(base.currentModelClass, "balanced");
-  assert.equal(base.availableModels[0].label, "Fixture Balanced 5", "the display name the human typed survives the round trip");
-
-  const agent = instance.store.connectAgent({ name: "RestAgent", provider: "fixture", freshTaskId: task.id });
-  const put = await fetch(`${instance.url}/api/agents/${agent.id}/runtime`, {
-    method: "PUT", headers: authed, body: JSON.stringify({ profile }),
-  });
-  assert.equal(put.status, 200);
-  const stored = await put.json();
-  assert.equal(stored.runtimeProfile.source, "user");
-  assert.equal(stored.runtimeProfile.currentModel, "fixture-balanced");
-  // The profile read-back is itself credentialed, so a page without the dashboard session cannot
-  // enumerate which models a session advertises.
-  const anonymousRead = await fetch(`${instance.url}/api/agents/${agent.id}/runtime`);
-  assert.equal(anonymousRead.status, 401, "reading an agent's advertised models requires a credential");
-  const readBack = await fetch(`${instance.url}/api/agents/${agent.id}/runtime`, { headers: authed }).then((response) => response.json());
-  assert.equal(readBack.runtimeProfile.availableModels[0].label, "Fixture Balanced 5");
-
-  // A value that claims to be a full profile but cannot normalize is refused rather than stored.
-  const rejected = await fetch(`${instance.url}/api/tasks/${task.id}`, {
-    method: "PATCH", headers: authed, body: JSON.stringify({ baseRuntimeProfile: { providerId: "", availableModels: [] } }),
-  });
-  assert.equal(rejected.status >= 400, true, "an unusable profile is refused where the human can still fix it");
-});
-
-test("the dashboard renders advertised model names and states plainly when gating is inactive", async (t) => {
-  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-runtime-ui-"));
-  const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd(), knowledge: { enabled: false } });
-  t.after(async () => { await instance.close(); await rm(dataDir, { recursive: true, force: true }); });
-  const script = await fetch(`${instance.url}/app.js`).then((response) => response.text());
-  const markup = await fetch(`${instance.url}`).then((response) => response.text());
-  // The human asked to stop reading bare capability classes: a name must be paired with its class.
-  assert.match(script, /modelLabel\}\s*\(\$\{[^}]*modelClass\}\)/, "the model name is rendered with its class, not the class alone");
-  assert.match(script, /effortLabel/, "the effort is rendered by its advertised label");
-  assert.match(script, /Model gating inactive/, "an unprofiled agent is told gating is off rather than shown a guess");
-  assert.match(script, /runtimeProfileSource/, "the dashboard distinguishes an agent profile from the task's standing one");
-  assert.match(markup, /runtime-dialog/, "the runtime decision dialog still ships");
-});
-
 test("the scheduler explains a held assignment over REST and over MCP", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-explain-server-"));
   const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd(), knowledge: { enabled: false } });
@@ -663,11 +589,11 @@ test("the scheduler explains a held assignment over REST and over MCP", async (t
   t.after(async () => { await client.close(); });
   const call = async (name, args) => JSON.parse((await client.callTool({ name, arguments: args })).content[0].text);
 
-  const connected = await call("devteam_connect", { name: "McpExplainer", provider: "fixture", taskId: task.id });
-  const board = await call("devteam_why_blocked", { agentId: connected.agent.id });
+  const connected = await call("devteam_join", { name: "McpExplainer", provider: "fixture", taskId: task.id });
+  const board = await call("devteam_stuck", { agentId: connected.agent.id, kind: "why" });
   assert.equal(board.queuedCount, 2, "an idle agent gets the whole board it may see");
   assert.equal(board.claimable.length, 1, "the writer is claimable, the reviewer is not");
-  const single = await call("devteam_why_blocked", { agentId: connected.agent.id, assignmentId: reviewer.id });
+  const single = await call("devteam_stuck", { agentId: connected.agent.id, kind: "why", assignmentId: reviewer.id });
   assert.equal(single.claimable, false);
   assert.match(single.reasons.find((reason) => reason.code === "awaiting_writer").detail, /Ship the feature/);
 });

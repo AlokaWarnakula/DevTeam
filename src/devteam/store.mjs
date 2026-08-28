@@ -8,6 +8,7 @@ import { CodeGraph } from "./codegraph.mjs";
 import { KnowledgeVault } from "./knowledge.mjs";
 import { buildBudgetedBrief, clipUtf8, DEFAULT_BRIEF_BUDGET } from "./brief.mjs";
 import { DEFAULT_ROLES, loadProjectRoles, planningRole, roleBehaviour, ROLES_CONFIG_PATH } from "./roles.mjs";
+import { currentRung, ladderIsStale, loadLadders, requiredRung, rungLabel, saveLadder } from "./models.mjs";
 import { hashToken, mintToken, normalizeTokenLabel, tokensMatch } from "./access.mjs";
 import {
   boundedCheckpointText,
@@ -36,6 +37,16 @@ import {
 // A task in one of these states hands out no work; named once so the candidate scan and the
 // scheduler's explanation can never disagree about what "closed" means.
 const CLOSED_TASK_STATUSES = ["accepted", "blocked", "cancelled"];
+// Why a task was stopped, recorded rather than inferred from prose. Blocking is the one action no
+// MCP tool can undo, and on the live board agents reached for that single verb to mean six different
+// things — including "done": six task.blocked events read "Done", "done", "because all work is
+// done". A finished task closed that way stands every teammate down and needs the human to reopen it
+// purely so it can be accepted. None of these kinds is "finished", which is the point: naming the
+// kind is what stops the verb from absorbing a meaning it should never have had.
+const BLOCK_KINDS = ["needs-human", "over-my-head", "misrouted", "external"];
+// The three above that describe work in flight. With an empty board there is nothing for them to
+// stop, so they are refused and the caller is pointed at the move it actually wanted.
+const BLOCK_KINDS_NEEDING_OPEN_WORK = BLOCK_KINDS.filter((kind) => kind !== "needs-human");
 // How far the candidate scan will look past lease-blocked and runtime-gated work before giving up.
 // Generous for a local single-user server, and bounded so a pathological board cannot stall a claim.
 const CANDIDATE_PAGE_SIZE = 20;
@@ -138,7 +149,6 @@ function holdingProcessIsAlive(pid) {
 export class DevTeamStore extends EventEmitter {
   // Per-project role config, cached by the file's mtime (see projectRoles).
   #roleCache = new Map();
-  // Carries the transactional part of splitAssignment out to its caller (see T2.1).
   #splitOutcome = { inferred: [], keep: false };
 
   // `exclusive: false` opens the database to *look* at it — `devteam token`, a doctor command, a
@@ -696,6 +706,11 @@ export class DevTeamStore extends EventEmitter {
       ["agents", "fresh_task_id", "TEXT"],
       ["agents", "replaced_by_agent_id", "TEXT"],
       ["agents", "session_policy_ack_task_id", "TEXT"],
+      // What this session reports it is running right now. Free text in the agent's own words: it is
+      // the one party that actually knows, and DevTeam compares it only against that provider's own
+      // reported ladder, never across vendors.
+      ["agents", "current_model", "TEXT"],
+      ["agents", "current_effort", "TEXT"],
       ["events", "author_name", "TEXT"],                                   // who wrote it, kept even after the agent row is purged
       ["events", "author_kind", "TEXT"],
       ["projects", "check_sandbox", "INTEGER NOT NULL DEFAULT 0"],       // confine node checks to the project root
@@ -1103,11 +1118,11 @@ export class DevTeamStore extends EventEmitter {
   // Return undirected/directed human messages this agent has not yet received,
   // and record delivery. "Directed" = target is this agent's name; broadcasts use
   // target "all". Only messages posted during this session are delivered live;
-  // older history is still visible through devteam_state.
+  // older history is still visible through devteam_next with want=state.
   // Is this timeline event a live message for the given agent? Human messages reach the agent
   // if broadcast ("all") or addressed to its name. Agent messages are only *pushed* when they
   // are directed to this agent by name (never the sender's own, never undirected broadcasts —
-  // those stay timeline notes read via devteam_state).
+  // those stay timeline notes read via devteam_next with want=state).
   #messageIsForAgent(event, agent) {
     const nameLower = String(agent.name).toLowerCase();
     if (event.type === "human.message") {
@@ -2193,7 +2208,7 @@ export class DevTeamStore extends EventEmitter {
         return;
       }
       if (checkpoint.from_agent_id === agentId) {
-        outcome = { error: "Session takeover requires a distinct fresh agent session. Use devteam_resume only when restoring the same conversation." };
+        outcome = { error: "Session takeover requires a distinct fresh agent session. Use devteam_join with a resumeToken only when restoring the same conversation." };
         return;
       }
       if (checkpoint.expires_at <= stamp) {
@@ -2416,6 +2431,26 @@ export class DevTeamStore extends EventEmitter {
     };
   }
 
+  // What the working agent gets, as opposed to what the dashboard gets. The full record carries six
+  // bookkeeping fields — evidence hashes, policy and assignment versions — that an agent cannot act
+  // on, and no instruction at all. On this board 27 of 54 assignments scored difficult or worse and
+  // not one of them produced a word of advice, because model gating needs a registered profile and
+  // there has never been one. So the brief says the quiet part: nobody is going to stop you, the
+  // judgement is yours, and here is the one move that works.
+  #assessmentForBrief(row, { gated = false } = {}) {
+    const record = this.#assessmentRecord(row);
+    if (!record) return null;
+    const demanding = ["difficult", "critical", "recovery", "exceptional"].includes(record.level);
+    return {
+      level: record.level,
+      score: record.score,
+      reasons: (record.reasons || []).slice(0, 3).map((reason) => reason.detail || String(reason)),
+      guidance: demanding && !gated
+        ? `This assignment scored ${record.level}. No model gate is active, so nothing will stop you if it is beyond the model or effort you are running — that judgement is yours alone. If it is beyond you, do not push on: call devteam_stuck with kind "over-my-head" and name the capability needed.`
+        : null,
+    };
+  }
+
   assignmentAssessment({ agentId = null, assignmentId, refresh = false }) {
     const assignment = this.db.prepare(`
       SELECT a.*, t.title AS task_title, t.description AS task_description, t.version AS task_version
@@ -2586,7 +2621,7 @@ export class DevTeamStore extends EventEmitter {
     };
   }
 
-  connectAgent({ name, provider, capabilities = [], runtimeProfile = null, sessionGeneration = 1, freshTaskId = null }) {
+  connectAgent({ name, provider, capabilities = [], runtimeProfile = null, sessionGeneration = 1, freshTaskId = null, model = null, effort = null }) {
     const cleanName = name.trim();
     const cleanProvider = provider.trim();
     if (!cleanName || !cleanProvider) throw new Error("Agent name and provider are required.");
@@ -2602,9 +2637,10 @@ export class DevTeamStore extends EventEmitter {
     const RECONNECT_REPLAY_MS = 6 * 60 * 60 * 1000;
     this.#transaction(() => {
       this.db.prepare(`
-        INSERT INTO agents (id, name, provider, capabilities, status, connected_at, last_seen, resume_token_hash, session_generation, fresh_task_id)
-        VALUES (?, ?, ?, ?, 'waiting', ?, ?, ?, ?, ?)
-      `).run(id, cleanName, cleanProvider, json(capabilities), stamp, stamp, this.#hashToken(resumeToken), Math.max(1, Number(sessionGeneration) || 1), freshTaskId || null);
+        INSERT INTO agents (id, name, provider, capabilities, status, connected_at, last_seen, resume_token_hash, session_generation, fresh_task_id, current_model, current_effort)
+        VALUES (?, ?, ?, ?, 'waiting', ?, ?, ?, ?, ?, ?, ?)
+      `).run(id, cleanName, cleanProvider, json(capabilities), stamp, stamp, this.#hashToken(resumeToken), Math.max(1, Number(sessionGeneration) || 1), freshTaskId || null,
+        String(model || "").trim().slice(0, 80) || null, String(effort || "").trim().slice(0, 40) || null);
       // A returning identity (same name+provider) that recently disconnected should still see what it
       // missed while away, even on a plain reconnect that carries no resume token. Inherit that prior
       // session's read floor — never its claim or write lease — so the backlog of directed/broadcast
@@ -2738,7 +2774,7 @@ export class DevTeamStore extends EventEmitter {
   // There is deliberately no implicit "sole active task" fallback: it made single-task use
   // zero-config at the price of an agent's room silently changing meaning the moment a second task
   // appeared, which read as "the board stopped handing out work" with nothing to explain it.
-  // devteam_connect(taskId) and devteam_join are the ways in; roomStatusForAgent says so out loud.
+  // devteam_join are the ways in; roomStatusForAgent says so out loud.
   #memberTaskIds(agentId) {
     return this.db.prepare("SELECT task_id FROM task_members WHERE agent_id = ?").all(agentId).map((row) => row.task_id);
   }
@@ -3157,6 +3193,143 @@ export class DevTeamStore extends EventEmitter {
     return [...new Set([...this.#claimableTaskIds(agent.id), ...invitedRooms])];
   }
 
+  // Cache what an agent reported it can be run as, and say whether we should ask again.
+  //
+  // Asking the agent is the only honest source: it is the one party that knows what its host offers,
+  // and the alternative — a catalogue typed in by hand — is exactly the dialog nobody ever filled in.
+  // It is cached because interrogating every session is wasteful, and it expires because a list of
+  // models written once in March is wrong by June.
+  runtimeLadder({ agentId, taskId, model = null, effort = null, ladder = null }) {
+    const agent = this.getAgent(agentId);
+    if (!agent) throw new Error("Agent not found.");
+    const stamp = now();
+    if (model || effort) {
+      this.db.prepare("UPDATE agents SET current_model = COALESCE(?, current_model), current_effort = COALESCE(?, current_effort) WHERE id = ?")
+        .run(model ? String(model).trim().slice(0, 80) : null, effort ? String(effort).trim().slice(0, 40) : null, agentId);
+    }
+    const task = taskId ? this.getTask(taskId) : null;
+    if (!task) return { known: false, askForLadder: false, reason: "no project in view yet" };
+    const root = task.project_root;
+    let saved = null;
+    if (Array.isArray(ladder) && ladder.length) {
+      saved = saveLadder(root, agent.provider, { ladder, reportedBy: agent.name });
+      if (saved.written) {
+        this.#event(taskId, agentId, "agent.progress",
+          `${agent.name} reported what ${agent.provider} can be run as: ${saved.rungs} rungs, weakest first.`,
+          { ladderRungs: saved.rungs, provider: agent.provider });
+      }
+    }
+    const ladders = loadLadders(root);
+    const entry = ladders.providers[agent.provider];
+    const stale = ladderIsStale(entry, Date.parse(stamp));
+    const rung = this.agentRung({ ...agent, current_model: model || agent.current_model, current_effort: effort || agent.current_effort }, root);
+    return {
+      known: Boolean(entry?.ladder?.length),
+      askForLadder: stale,
+      ...(saved ? { ladderSaved: saved.written, ...(saved.written ? {} : { notSaved: saved.reason }) } : {}),
+      ...(entry?.ladder?.length ? {
+        ladder: entry.ladder.map((step) => rungLabel(step)),
+        ladderSource: entry.source,
+        ladderReportedAt: entry.reportedAt,
+      } : {}),
+      ...(rung && rung.at >= 0 ? { running: rungLabel(rung.ladder[rung.at]), rung: rung.at } : {}),
+      ...(rung && rung.at < 0 && entry?.ladder?.length ? {
+        running: null,
+        note: "This session's model is not on the reported ladder, so DevTeam cannot tell whether work is above it. Nothing will be withheld from you.",
+      } : {}),
+      next: stale
+        ? "Call devteam_join again with `ladder`: the model and effort combinations this host can run you at, ordered weakest first. It is cached for a week and is what lets DevTeam name the model a hard assignment needs."
+        : null,
+    };
+  }
+
+  // The rung a difficulty level needs, named from whatever ladder this project has cached. Any
+  // provider will do: they are all describing the same piece of work, and the human recognises the
+  // names either way. Null when no ladder has been reported yet, and the dashboard then says nothing
+  // rather than falling back to a score nobody can act on.
+  #rungLabelFor(projectId, level) {
+    const project = this.db.prepare("SELECT root FROM projects WHERE id = ?").get(projectId);
+    if (!project?.root) return null;
+    let ladders;
+    try { ladders = loadLadders(project.root); } catch { return null; }
+    const entry = Object.values(ladders.providers)[0];
+    if (!entry?.ladder?.length) return null;
+    return rungLabel(entry.ladder[requiredRung(level, entry.ladder.length)]);
+  }
+
+  // The ladder this provider reported, and where this session sits on it. Everything about model
+  // selection reads through here, so there is one place that decides what "too hard for you" means.
+  //
+  // A missing ladder, an unrecognised current model, or a session that never said what it is running
+  // all resolve to "cannot judge", and cannot-judge never withholds work. Silence has to mean the
+  // team keeps working, or one unreported field stalls the board.
+  agentRung(agent, projectRoot) {
+    if (!agent?.provider) return null;
+    let ladders;
+    try { ladders = loadLadders(projectRoot); } catch { return null; }
+    const entry = ladders.providers[agent.provider];
+    if (!entry?.ladder?.length) return null;
+    const at = currentRung(entry.ladder, agent.current_model, agent.current_effort);
+    return { ladder: entry.ladder, at, source: entry.source, reportedAt: entry.reportedAt };
+  }
+
+  #aboveCurrentRung(agent, candidate) {
+    const rung = this.agentRung(agent, candidate.project_root);
+    if (!rung || rung.at < 0) return false;
+    const assessment = this.db.prepare(`
+      SELECT level FROM complexity_assessments WHERE assignment_id = ? AND invalidated_at IS NULL
+      ORDER BY created_at DESC LIMIT 1
+    `).get(candidate.id);
+    if (!assessment) return false;
+    return requiredRung(assessment.level, rung.ladder.length) > rung.at;
+  }
+
+  // What is waiting for a stronger session, in the words the human will recognise. Returned with the
+  // idle answer so "nothing for me" can never be mistaken for "the work is finished".
+  workAboveCurrentRung(agentId) {
+    const agent = this.getAgent(agentId);
+    if (!agent) return null;
+    const rooms = this.#claimableTaskIds(agentId);
+    if (!rooms.length) return null;
+    const placeholders = rooms.map(() => "?").join(", ");
+    const queued = this.db.prepare(`
+      SELECT a.id, a.title, a.task_id, t.title AS task_title, p.root AS project_root
+      FROM assignments a
+      JOIN tasks t ON t.id = a.task_id
+      JOIN projects p ON p.id = t.project_id
+      WHERE a.status = 'queued' AND a.task_id IN (${placeholders})
+    `).all(...rooms);
+    const held = [];
+    let rung = null;
+    for (const candidate of queued) {
+      rung = rung || this.agentRung(agent, candidate.project_root);
+      if (!rung || rung.at < 0) return null;
+      if (!this.#aboveCurrentRung(agent, candidate)) continue;
+      const assessment = this.db.prepare(`
+        SELECT level FROM complexity_assessments WHERE assignment_id = ? AND invalidated_at IS NULL
+        ORDER BY created_at DESC LIMIT 1
+      `).get(candidate.id);
+      held.push({
+        assignmentId: candidate.id,
+        title: candidate.title,
+        taskId: candidate.task_id,
+        taskTitle: candidate.task_title,
+        level: assessment?.level || null,
+        needs: rungLabel(rung.ladder[requiredRung(assessment?.level, rung.ladder.length)]),
+      });
+    }
+    if (!held.length) return null;
+    const needed = [...new Set(held.map((item) => item.needs).filter(Boolean))];
+    return {
+      running: rungLabel(rung.ladder[rung.at]),
+      needs: needed,
+      assignments: held.slice(0, 10),
+      count: held.length,
+      message: `${held.length} assignment${held.length === 1 ? "" : "s"} on this board ${held.length === 1 ? "needs" : "need"} ${needed.join(" or ")}, and this session is running ${rungLabel(rung.ladder[rung.at])}.`,
+      humanAction: "Start a fresh session on that model and join this same task. Nothing is lost and nothing needs replanning: the task, its queue, its history and its memory are all still here, and the new session picks up exactly where this one stopped.",
+    };
+  }
+
   claimNextAssignment(agentId) {
     this.#reapStaleAgents();
     this.#recoverOrphanedClaims();
@@ -3232,6 +3405,16 @@ export class DevTeamStore extends EventEmitter {
             && lease.scopes.some((held) => scopes.some((want) => this.#scopesOverlap(held, want))));
           if (conflict) continue;
         }
+        // A verifying assignment is never handed to whoever wrote the version it examines. Resolved
+        // per candidate rather than as a SQL predicate for the same reason the write lease is: it
+        // depends on session lineage and on who is connected right now, neither of which the scan's
+        // single query can see.
+        if (candidate.verifies && this.#verifierIsAuthor(agentId, candidate)) continue;
+        // Above this session's rung: skipped, not blocked. The agent goes on to take everything it
+        // *can* do, and only when nothing claimable is left does it go idle saying what remains and
+        // what that work needs. Stopping at the first hard item instead would strand work the
+        // current model was perfectly capable of finishing.
+        if (this.#aboveCurrentRung(agent, candidate)) continue;
         const gate = this.#runtimeGate(agent, candidate);
         if (gate.skip) continue;
         // Preserve the queue's targeted-first ordering for recommendations, but do not let one
@@ -3334,7 +3517,7 @@ export class DevTeamStore extends EventEmitter {
       this.#recoverOrphanedClaims();
     }
     const assignment = this.db.prepare(`
-      SELECT a.*, t.status AS task_status, t.project_id, p.root AS project_root
+      SELECT a.*, t.status AS task_status, t.project_id, t.version AS task_version, p.root AS project_root
       FROM assignments a
       JOIN tasks t ON t.id = a.task_id
       JOIN projects p ON p.id = t.project_id
@@ -3419,6 +3602,28 @@ export class DevTeamStore extends EventEmitter {
     if (failed.has("awaiting_writer")) {
       const writers = this.#blockingWriters(assignment.id);
       add("awaiting_writer", `Verification waits for the writer “${writers[0].title}” to finish${writers.length > 1 ? ` (and ${writers.length - 1} more)` : ""}.`, { writers });
+    }
+    // Not a predicate: independence depends on session lineage and on who is connected, neither of
+    // which the scan's single query can see, so it is resolved here exactly as the scan resolves it.
+    if (assignment.verifies) {
+      if (agent && this.#verifierIsAuthor(agent.id, assignment)) {
+        add("verifier_is_author", `“${agent.name}” wrote version ${assignment.task_version}, so it cannot verify it; an independent teammate is free to take this one.`,
+          { version: assignment.task_version });
+      } else if (!agent) {
+        // The dashboard asks about the item rather than about a claimant, and "the people in this
+        // room who wrote it cannot check it" is a fact about the item. Reported non-blocking, for
+        // the same reason an absent target is: an independent teammate may be free to take this the
+        // very next second, and calling it blocked would put the explanation at odds with a scan
+        // that is about to hand it over. Both branches read the same two lineage sets the scan
+        // reads, so the item can never be skipped for a reason this cannot name.
+        const authors = this.#currentVersionAuthorLineages(assignment.task_id, assignment.task_version);
+        const connected = this.#connectedParticipantLineages(assignment.task_id);
+        const excluded = [...connected].filter((lineage) => authors.has(lineage));
+        if (excluded.length && this.#independentClaimantExists(assignment, authors, null)) {
+          add("verifier_is_author", `Held for an independent teammate: ${excluded.length} of the contributors in this room wrote version ${assignment.task_version} and cannot verify their own work.`,
+            { version: assignment.task_version, excludedAuthors: excluded.length }, false);
+        }
+      }
     }
 
     if (assignment.requires_write) {
@@ -4075,7 +4280,7 @@ export class DevTeamStore extends EventEmitter {
   }
 
   // What a claimed assignment's holder should be told on its next call: whether it has been asked to
-  // stop, and whether the task has run past its budget. Returned by heartbeat and by devteam_wait.
+  // stop, and whether the task has run past its budget. Returned by heartbeat and by devteam_next.
   steeringFor(agentId) {
     const held = this.db.prepare(`
       SELECT a.id, a.title, a.task_id, a.cancel_requested_at, a.cancel_reason
@@ -4400,8 +4605,8 @@ export class DevTeamStore extends EventEmitter {
     if (!task) throw new Error("Task not found.");
     this.assertMembership(agentId, taskId);
     // A message can be aimed at a specific teammate. A directed agent message is pushed to that
-    // teammate (returned by their next devteam_wait / tool call); an undirected one is a
-    // timeline note anyone can read via devteam_state.
+    // teammate (returned by their next devteam_next / tool call); an undirected one is a
+    // timeline note anyone can read via devteam_next with want=state.
     const enriched = { ...metadata };
     let directedTo = null;
     if (metadata.target && String(metadata.target).trim()) {
@@ -4451,7 +4656,7 @@ export class DevTeamStore extends EventEmitter {
         reason: assignment.status !== "claimed"
           ? `This assignment is ${assignment.status}, not an active claim.`
           : "This assignment's lease has moved to a different session.",
-        nextAction: "Do not write further under this claim. Call devteam_wait to pick up current work, or devteam_resume if you are returning to an earlier session.",
+        nextAction: "Do not write further under this claim. Call devteam_next to pick up current work, or devteam_join with your resumeToken if you are returning to an earlier session.",
       },
     };
   }
@@ -4491,137 +4696,6 @@ export class DevTeamStore extends EventEmitter {
   // lease**. An agent that has to release its claim to reorganise the work will not do it — it will
   // grind on instead — and in the gap another agent can take the paths it was midway through
   // editing. So the parent stays claimed by the same agent, at the same generation, throughout.
-  splitAssignment({ agentId, assignmentId, claimToken = null, parts, keepParent = null }) {
-    const agent = this.getAgent(agentId);
-    const parent = this.db.prepare("SELECT * FROM assignments WHERE id = ?").get(assignmentId);
-    if (!parent) throw new Error("Assignment not found.");
-    // Same fence as reporting: only the live claim holder may reshape the work.
-    const ownedByCaller = parent.agent_id === agentId && parent.status === "claimed";
-    const tokenMatches = claimToken == null || (parent.claim_token_hash && this.#hashToken(claimToken) === parent.claim_token_hash);
-    if (!ownedByCaller || !tokenMatches) return this.#claimConflict(parent, agentId);
-    if (parent.verifying_at) throw new Error("This assignment's checks are still running. Wait for that report to settle before splitting it.");
-
-    const requested = (Array.isArray(parts) ? parts : []).slice(0, 12).map((part) => ({
-      title: String(part?.title ?? "").trim().slice(0, 160),
-      description: String(part?.description ?? "").trim().slice(0, 12_000),
-      role: String(part?.role ?? parent.role).trim().slice(0, 40) || parent.role,
-      requiresWrite: part?.requiresWrite === undefined ? Boolean(parent.requires_write) : Boolean(part.requiresWrite),
-      paths: Array.isArray(part?.paths) ? [...new Set(part.paths.map((item) => String(item).trim()).filter(Boolean))].slice(0, 50) : null,
-      dependsOnPart: Number.isInteger(part?.dependsOnPart) ? part.dependsOnPart : null,
-    })).filter((part) => part.title && part.description);
-    if (requested.length < 2) throw new Error("A split needs at least two parts, each with a title and a description. If the work is simply mis-scoped, report it blocked instead.");
-
-    const task = this.getTask(parent.task_id);
-    const parentScope = this.#writeScopeFor(assignmentId);
-    // A child that declares no paths inherits the parent's scope. Inheriting is the safe default:
-    // silently giving a child *no* scope would hand it a whole-project lease, which is the opposite
-    // of what splitting is for.
-    const inheritedScope = parentScope.length ? parentScope : [];
-    const parentDependencies = this.#dependenciesFor(assignmentId).map((item) => item.id);
-    const stamp = now();
-    const created = [];
-
-    this.#transaction(() => {
-      const ids = requested.map(() => randomUUID());
-      requested.forEach((part, index) => {
-        const behaviour = this.roleBehaviour(task.project_id, part.role);
-        const id = ids[index];
-        this.db.prepare(`
-          INSERT INTO assignments (id, task_id, title, description, role, requires_write, target_agent_name, status, created_at, verifies, plans, priority)
-          VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)
-        `).run(id, parent.task_id, part.title, part.description, part.role, part.requiresWrite ? 1 : 0,
-          // Children inherit the parent's targeting: work addressed to a teammate by name stays
-          // addressed to them when it is subdivided, rather than quietly returning to the pool.
-          parent.target_agent_name, stamp, behaviour.verifies ? 1 : 0, behaviour.plans ? 1 : 0, parent.priority || 0);
-        const scope = part.requiresWrite ? (part.paths?.length ? part.paths : inheritedScope) : [];
-        if (scope.length) {
-          this.db.prepare("INSERT OR REPLACE INTO assignment_write_scopes (assignment_id, paths) VALUES (?, ?)")
-            .run(id, json(scope));
-        }
-        // Children inherit whatever the parent was waiting on: a prerequisite of the whole is a
-        // prerequisite of every piece of it.
-        for (const dependencyId of parentDependencies) {
-          this.db.prepare("INSERT OR IGNORE INTO assignment_dependencies (assignment_id, depends_on_assignment_id) VALUES (?, ?)")
-            .run(id, dependencyId);
-        }
-        // Explicit ordering between siblings, by index, so a planner can say "part 2 after part 1".
-        if (part.dependsOnPart !== null && ids[part.dependsOnPart] && part.dependsOnPart !== index) {
-          this.db.prepare("INSERT OR IGNORE INTO assignment_dependencies (assignment_id, depends_on_assignment_id) VALUES (?, ?)")
-            .run(id, ids[part.dependsOnPart]);
-        }
-        created.push({ id, title: part.title, role: part.role, requiresWrite: part.requiresWrite, paths: scope });
-      });
-
-      // Dependency inference between the new siblings (the roadmap's third bullet): two writers whose
-      // declared scopes overlap cannot run at once, and would otherwise discover that by contending
-      // for a lease — one of them sitting blocked with no stated reason. An inferred edge makes the
-      // ordering explicit and deterministic (earlier part first) rather than a race.
-      const writers = created.map((child, index) => ({ ...child, index })).filter((child) => child.requiresWrite && child.paths.length);
-      const inferred = [];
-      for (let left = 0; left < writers.length; left += 1) {
-        for (let right = left + 1; right < writers.length; right += 1) {
-          const overlaps = writers[left].paths.some((first) => writers[right].paths.some((second) => this.#scopesOverlap(first, second)));
-          if (!overlaps) continue;
-          const changed = this.db.prepare("INSERT OR IGNORE INTO assignment_dependencies (assignment_id, depends_on_assignment_id) VALUES (?, ?)")
-            .run(writers[right].id, writers[left].id).changes;
-          if (changed) inferred.push({ after: writers[right].title, before: writers[left].title });
-        }
-      }
-
-      // The parent. Closing it is the default: its work now lives in the children, and leaving it
-      // open would double-count. Keeping it is offered because an agent part-way through real work
-      // often wants to finish the piece it is holding and hand off the rest.
-      const keep = keepParent === null ? false : Boolean(keepParent);
-      if (!keep) {
-        this.db.prepare(`
-          UPDATE assignments SET status = 'done', completed_at = ?, claim_token_hash = NULL, agent_id = ?
-          WHERE id = ?
-        `).run(stamp, agentId, assignmentId);
-        this.db.prepare("UPDATE agents SET status = 'waiting', current_task_id = NULL, last_seen = ? WHERE id = ?").run(stamp, agentId);
-      }
-
-      this.#event(parent.task_id, agentId, "assignment.split",
-        `${agent.name} split “${parent.title}” into ${created.length} pieces.`, {
-          assignmentId,
-          parts: created.map((child) => ({ assignmentId: child.id, title: child.title, role: child.role })),
-          inferredOrder: inferred,
-          parentKept: keep,
-        });
-      for (const child of created) {
-        this.#event(parent.task_id, agentId, "assignment.created", child.title, {
-          assignmentId: child.id, role: child.role, requiresWrite: child.requiresWrite,
-          targetAgentName: parent.target_agent_name, writePaths: child.paths, splitFrom: assignmentId,
-        });
-      }
-      this.#syncTaskStatus(parent.task_id, stamp);
-      this.#splitOutcome = { inferred, keep };
-    });
-
-    // Each child is re-assessed on its own merits — the whole point of splitting is that the pieces
-    // are smaller than the whole, and a runtime gate gating every child as if it were the original
-    // would defeat it. assignmentAssessment is evidence-hashed, so this is not a second opinion.
-    for (const child of created) this.assignmentAssessment({ assignmentId: child.id });
-    const { inferred, keep } = this.#splitOutcome;
-    this.#changed("assignment.split", parent.task_id);
-    return {
-      split: true,
-      taskId: parent.task_id,
-      assignmentId,
-      parentKept: keep,
-      parts: created.map((child) => ({
-        ...child,
-        assessment: this.#assessmentRecord(this.db.prepare(`
-          SELECT * FROM complexity_assessments WHERE assignment_id = ? AND invalidated_at IS NULL
-          ORDER BY created_at DESC LIMIT 1
-        `).get(child.id)),
-      })),
-      inferredOrder: inferred,
-      next: keep
-        ? "The pieces are queued and you still hold the original. Finish what you are holding, then report it."
-        : "The original is closed and its pieces are queued. Call devteam_wait to pick one up, or leave them for teammates.",
-    };
-  }
-
   async completeAssignment({ agentId, assignmentId, message, status = "done", changedFiles = [], checks = [], nextStatus = "waiting", claimToken = null, usage = null }) {
     const agent = this.getAgent(agentId);
     const assignment = this.db.prepare("SELECT * FROM assignments WHERE id = ?").get(assignmentId);
@@ -4796,7 +4870,7 @@ export class DevTeamStore extends EventEmitter {
       if (status === "blocked") {
         // An assignment-level blocker is a triage signal, not permission to stop every teammate.
         // Queue a fresh planner item so the team can re-scope or ask the human while sibling work
-        // and write leases continue. Only the explicit blockTask/devteam_block path is task-wide.
+        // and write leases continue. Only the explicit blockTask/devteam_stuck path is task-wide.
         followUpAssignmentId = randomUUID();
         this.db.prepare(`
           INSERT INTO assignments (id, task_id, title, description, role, requires_write, status, created_at, plans)
@@ -4805,7 +4879,7 @@ export class DevTeamStore extends EventEmitter {
           followUpAssignmentId,
           assignment.task_id,
           `Resolve blocker: ${assignment.title}`,
-          `Review the blocker reported for "${assignment.title}": ${message.trim()}. Re-scope the work, create a replacement assignment, or use devteam_block only if the entire task genuinely requires human input.`,
+          `Review the blocker reported for "${assignment.title}": ${message.trim()}. Re-scope the work, create a replacement assignment, or use devteam_stuck only if the entire task genuinely requires human input.`,
           this.planningRoleFor(task.project_id),
           stamp,
         );
@@ -4888,6 +4962,48 @@ export class DevTeamStore extends EventEmitter {
   #eligibleIndependentApproverLineages(taskId, version) {
     const authors = this.#currentVersionAuthorLineages(taskId, version);
     return new Set([...this.#connectedParticipantLineages(taskId)].filter((lineage) => !authors.has(lineage)));
+  }
+
+  // Reviewer ≠ author, asked at claim time. approveTask has always refused a self-approval, but
+  // refusing it *only* there meant the author was handed the review claim, read the whole diff, and
+  // then found the single exit was to block the assignment: seven blocked assignments on this board
+  // are exactly that refusal, the most recent from 2026-08-27, and they are why 264 completed
+  // assignments produced two requests for changes. Enforcing it where the claim is handed out costs
+  // the team nothing and is the difference between independent review and a rubber stamp.
+  //
+  // No dead-ends, the same rule the rest of consensus follows: with no independent teammate
+  // connected, the author still gets the work and the acceptance is labeled selfReviewed rather than
+  // the assignment sitting claimable-by-nobody.
+  #verifierIsAuthor(agentId, assignment) {
+    const authors = this.#currentVersionAuthorLineages(assignment.task_id, assignment.task_version);
+    if (!authors.has(this.#participantLineage(agentId))) return false;
+    return this.#independentClaimantExists(assignment, authors, agentId);
+  }
+
+  // "Could somebody else actually take this, right now?" — deliberately not "does an independent
+  // teammate exist". The difference is a deadlock, and the property suite found it on the first try:
+  // a teammate who is connected but already holding as much work as it can take will never claim
+  // this item, so excluding the author on its behalf leaves the assignment queued forever with a
+  // reason that reads like a promise nobody is going to keep.
+  //
+  // Asked through the full explanation surface rather than a hand-rolled subset of it, so this can
+  // never drift from what the scan will really do with that teammate.
+  //
+  // The recursion terminates at one level: whyNotClaimable consults #verifierIsAuthor in turn, but
+  // only for the teammates asked about here, and those are non-authors by construction — the lineage
+  // test above returns false for them before reaching this method again.
+  #independentClaimantExists(assignment, authors, excludeAgentId) {
+    const members = this.db.prepare(`
+      SELECT tm.agent_id FROM task_members tm
+      JOIN agents agent ON agent.id = tm.agent_id
+      WHERE tm.task_id = ? AND tm.role = 'contributor' AND agent.status != 'disconnected'
+    `).all(assignment.task_id);
+    for (const member of members) {
+      if (member.agent_id === excludeAgentId) continue;
+      if (authors.has(this.#participantLineage(member.agent_id))) continue;
+      if (this.whyNotClaimable(assignment.id, member.agent_id, { refreshLiveness: false }).claimable) return true;
+    }
+    return false;
   }
 
   // No dead-ends: configured consensus cannot exceed the independent teammates who could
@@ -5131,11 +5247,23 @@ export class DevTeamStore extends EventEmitter {
     this.#event(taskId, null, "agent.standdown", note, { agents: affected.map((a) => a.name) });
   }
 
-  blockTask({ agentId = null, taskId, reason }) {
+  // `kind` defaults only for the human, who blocks from a dashboard button and is not choosing
+  // between six overloaded meanings. Agents are made to name it at the MCP boundary.
+  blockTask({ agentId = null, taskId, reason, kind = "needs-human" }) {
     if (agentId) this.getAgent(agentId);
     const task = this.getTask(taskId);
     if (!task) throw new Error("Task not found.");
     this.assertMembership(agentId, taskId);
+    const blockKind = String(kind || "needs-human").trim();
+    if (!BLOCK_KINDS.includes(blockKind)) {
+      throw new Error(`"${blockKind}" is not a kind of blocker. Use one of: ${BLOCK_KINDS.join(", ")}.`);
+    }
+    const openWork = Number(this.db.prepare(`
+      SELECT COUNT(*) AS count FROM assignments WHERE task_id = ? AND status IN ('queued', 'claimed')
+    `).get(taskId).count);
+    if (!openWork && BLOCK_KINDS_NEEDING_OPEN_WORK.includes(blockKind)) {
+      throw new Error(`Nothing is open on "${task.title}", so there is no work in flight for a ${blockKind} blocker to stop. Finishing is not blocking: if the work is done, approve the current version and let the human accept it. If you genuinely need the human, block with kind "needs-human" and say exactly what you need from them.`);
+    }
     const stamp = now();
     this.#transaction(() => {
       this.db.prepare("UPDATE tasks SET status = 'blocked', updated_at = ? WHERE id = ?").run(stamp, taskId);
@@ -5147,11 +5275,11 @@ export class DevTeamStore extends EventEmitter {
         UPDATE session_checkpoints SET status = 'cancelled', handoff_token_hash = NULL
         WHERE task_id = ? AND status = 'ready'
       `).run(taskId);
-      this.#event(taskId, agentId, "task.blocked", reason.trim(), {});
+      this.#event(taskId, agentId, "task.blocked", reason.trim(), { kind: blockKind });
       this.#standDownTaskAgents(taskId, stamp, "Task was blocked; co-workers were released to other work.");
     });
     this.#changed("task.blocked", taskId);
-    return { blocked: true, taskId, reason: reason.trim() };
+    return { blocked: true, taskId, reason: reason.trim(), kind: blockKind };
   }
 
   // A blocked task is the one dead end that genuinely needs the human: no MCP tool can reopen it.
@@ -5163,9 +5291,11 @@ export class DevTeamStore extends EventEmitter {
     const task = this.getTask(taskId);
     if (!task || task.status !== "blocked") return null;
     const blockEvent = this.db.prepare(`
-      SELECT message, created_at, author_name, author_kind FROM events
+      SELECT message, metadata, created_at, author_name, author_kind FROM events
       WHERE task_id = ? AND type = 'task.blocked' ORDER BY id DESC LIMIT 1
     `).get(taskId);
+    // Blocks recorded before the kind existed have none; say so rather than inventing one.
+    const blockKind = fromJson(blockEvent?.metadata, {}).kind || null;
     const strandedWork = this.db.prepare(`
       SELECT COUNT(*) AS count FROM assignments WHERE task_id = ? AND status = 'blocked'
     `).get(taskId).count;
@@ -5174,6 +5304,7 @@ export class DevTeamStore extends EventEmitter {
       taskTitle: task.title,
       version: task.version,
       reason: blockEvent?.message || null,
+      kind: blockKind,
       blockedBy: blockEvent?.author_kind === "human" ? "the human" : (blockEvent?.author_name || null),
       blockedAt: blockEvent?.created_at || null,
       strandedAssignments: Number(strandedWork),
@@ -5250,12 +5381,33 @@ export class DevTeamStore extends EventEmitter {
     return { resumed: true, taskId, assignmentId, version, status: "planning", targetAgentName: target };
   }
 
-  acceptTaskByHuman({ taskId, summary }) {
+  // `acceptStranded` is the human confirming they know work was stopped mid-flight and are closing the
+  // task anyway. It is never assumed.
+  acceptTaskByHuman({ taskId, summary, acceptStranded = false }) {
     const task = this.getTask(taskId);
     if (!task) throw new Error("Task not found.");
-    if (["blocked", "cancelled"].includes(task.status)) throw new Error(`Cannot accept a ${task.status} task.`);
+    if (task.status === "cancelled") throw new Error("Cannot accept a cancelled task.");
     if (task.status === "accepted") return { accepted: true, taskId, version: task.version, humanOverride: true };
-    if (task.status !== "review") throw new Error("Human acceptance is available only when the task is ready for review.");
+    // A blocked task used to be unacceptable, full stop — and the only way out was Resume, which
+    // bumps the version, clears the approvals and queues a fresh planning assignment. That is the
+    // right treatment for work that genuinely stopped. It is absurd for a task an agent blocked to
+    // *mean finished*, which on this board was six of them: closing already-finished work should not
+    // require replanning it. Twenty tasks are sitting blocked with three resumes ever recorded, and
+    // this is a large part of why.
+    let strandedAssignments = 0;
+    if (task.status === "blocked") {
+      strandedAssignments = Number(this.db.prepare(`
+        SELECT COUNT(*) AS count FROM assignments WHERE task_id = ? AND status = 'blocked'
+      `).get(taskId).count);
+      // Nothing was in flight when it stopped, so there is no unfinished work to bury. Where there
+      // was, say exactly how much and make the human ask for it a second time — accepting is how a
+      // stalled piece of work would get quietly lost.
+      if (strandedAssignments && !acceptStranded) {
+        throw new Error(`"${task.title}" was blocked with ${strandedAssignments} assignment${strandedAssignments === 1 ? "" : "s"} still in flight. Resume it to finish that work, or accept again confirming you are closing it with that work unfinished.`);
+      }
+    } else if (task.status !== "review") {
+      throw new Error("Human acceptance is available only when the task is ready for review.");
+    }
     const cleanSummary = String(summary || "").trim();
     if (!cleanSummary) throw new Error("An acceptance summary is required.");
     const openAssignments = Number(this.db.prepare(`
@@ -5268,13 +5420,15 @@ export class DevTeamStore extends EventEmitter {
     const stamp = now();
     this.#transaction(() => {
       this.db.prepare("UPDATE tasks SET status = 'accepted', updated_at = ? WHERE id = ?").run(stamp, taskId);
-      this.#event(taskId, null, "task.accepted", `Human accepted version ${task.version}: ${cleanSummary}`, {
-        summary: cleanSummary,
-        version: task.version,
-        approvalCount,
-        requiredApprovals: task.required_approvals,
-        humanOverride: true,
-      });
+      this.#event(taskId, null, "task.accepted",
+        `Human accepted version ${task.version}${task.status === "blocked" ? " from blocked" : ""}: ${cleanSummary}`, {
+          summary: cleanSummary,
+          version: task.version,
+          approvalCount,
+          requiredApprovals: task.required_approvals,
+          humanOverride: true,
+          ...(task.status === "blocked" ? { acceptedFromBlocked: true, strandedAssignments } : {}),
+        });
       this.db.prepare(`
         UPDATE agents SET status = 'waiting', current_task_id = NULL, last_seen = ?
         WHERE current_task_id = ? AND status != 'disconnected'
@@ -5471,7 +5625,7 @@ export class DevTeamStore extends EventEmitter {
     return {
       stale: this.knowledge.staleKnowledge(task.project_id, { olderThanDays, limit }),
       disputed,
-      next: "Confirm a stale note with devteam_knowledge_confirm if it still holds, correct it by writing over it, or resolve a disputed pair with devteam_propose.",
+      next: "Correct a stale note by writing over it with devteam_memory action=write, or resolve a disputed pair with devteam_propose.",
     };
   }
 
@@ -5577,7 +5731,7 @@ export class DevTeamStore extends EventEmitter {
   // same card already lists them as blockedBy.
   #schedulingHold(assignment) {
     if (assignment.status !== "queued") return null;
-    const HOLD_PRECEDENCE = ["awaiting_writer", "write_lease_conflict", "target_absent"];
+    const HOLD_PRECEDENCE = ["awaiting_writer", "write_lease_conflict", "verifier_is_author", "target_absent"];
     const { reasons } = this.whyNotClaimable(assignment.id);
     for (const code of HOLD_PRECEDENCE) {
       const hold = reasons.find((reason) => reason.code === code);
@@ -5613,6 +5767,9 @@ export class DevTeamStore extends EventEmitter {
         resolvedFindings: this.#findingsFor(assignment.id, { includeResolved: true }).filter((finding) => finding.resolved_at),
         schedulingHold: this.#schedulingHold(assignment),
         assessment,
+        // The score in the words the human uses for their own models. "Base · Score 0" is DevTeam's
+        // vocabulary, not anyone else's; "Needs Sonnet 5 · medium" is the same fact said usefully.
+        needsRung: assessment ? this.#rungLabelFor(task.project_id, assessment.level) : null,
         runtimeDecision,
       };
     });
@@ -5834,10 +5991,10 @@ export class DevTeamStore extends EventEmitter {
         project_root: clip(currentSource.project_root || task.project_root, 2_000, "currentAssignmentProjectRoot"),
         project_name: clip(currentSource.project_name || task.project_name, 400, "currentAssignmentProjectName"),
         claimGeneration: Number(currentSource.claimGeneration ?? currentSource.claim_generation ?? 0),
-        assessment: this.#assessmentRecord(this.db.prepare(`
+        assessment: this.#assessmentForBrief(this.db.prepare(`
           SELECT * FROM complexity_assessments WHERE assignment_id = ? AND invalidated_at IS NULL
           ORDER BY created_at DESC LIMIT 1
-        `).get(currentSource.id)),
+        `).get(currentSource.id), { gated: Boolean(this.runtimeProfile(agentId)) }),
         runtimeProfile: this.runtimeProfile(agentId),
         ...(currentSource.claimToken ? { claimToken: currentSource.claimToken } : {}),
       };
@@ -5949,8 +6106,10 @@ export class DevTeamStore extends EventEmitter {
     }).map((note) => ({
       ...note,
       title: clip(note.title, 360, "knowledgeTitles"),
-      body: clip(note.body, 1_400, "knowledgeBodies"),
-      relatedFiles: (note.relatedFiles || []).slice(0, 20).map((file) => clip(file, 400, "knowledgePaths")),
+      // Only the few notes that carry a body pay for one. The rest arrive as a headline and a
+      // wikilink, which devteam_memory reads in full when the agent decides it matters.
+      ...(note.body === undefined ? {} : { body: clip(note.body, 1_400, "knowledgeBodies") }),
+      relatedFiles: (note.relatedFiles || []).slice(0, 8).map((file) => clip(file, 400, "knowledgePaths")),
     }));
     const sessionCheckpoint = this.db.prepare(`
       SELECT * FROM session_checkpoints WHERE task_id = ? AND status IN ('ready', 'claimed')
@@ -6018,7 +6177,7 @@ export class DevTeamStore extends EventEmitter {
   }
 
   // The dashboard snapshot as one agent may see it: the pre-selected task detail is limited to a
-  // room the agent belongs to, so a no-taskId devteam_state never hands a non-member another
+  // room the agent belongs to, so a no-taskId devteam_next with want=state never hands a non-member another
   // room's full timeline. The project/agent/task lists stay visible (they carry no room secrets).
   snapshotForAgent(agentId) {
     const tasks = this.listTasks();

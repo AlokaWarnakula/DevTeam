@@ -133,12 +133,22 @@ export function unreadTimelineCount(events = [], lastReadId = 0) {
 // The banner copy for a blocked task. Kept out of the DOM code so the one sentence a stuck human
 // reads is testable: this is the wording that replaces a Resume button buried ~4,800px down the
 // team panel, where it went unfound for a whole session.
+// What each kind of blocker means, in the words the human needs rather than the token the agent
+// sent. Blocks recorded before kinds existed carry none, and say nothing rather than guessing.
+const BLOCK_KIND_COPY = {
+  "needs-human": "needs a decision only you can make",
+  "over-my-head": "beyond the model or effort the agent had",
+  misrouted: "the work could not correctly go to that agent",
+  external: "waiting on something outside the project",
+};
+
 export function blockedBannerCopy(recovery = null) {
   if (!recovery) return null;
   const reason = String(recovery.reason || "").trim();
   const who = recovery.blockedBy ? `Blocked by ${recovery.blockedBy}` : "Blocked";
+  const kind = BLOCK_KIND_COPY[recovery.kind] || null;
   const stranded = Number(recovery.strandedAssignments) || 0;
-  const parts = [who];
+  const parts = [kind ? `${who} — ${kind}` : who];
   if (stranded) parts.push(`${stranded} assignment${stranded === 1 ? "" : "s"} stopped mid-flight`);
   parts.push(`v${recovery.version}`);
   return {

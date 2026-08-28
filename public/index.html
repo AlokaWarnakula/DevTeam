@@ -16,9 +16,11 @@
       <button class="primary full" data-dialog="task-dialog"><span>＋</span> New task</button>
       <button id="open-search" class="secondary search-trigger" type="button" data-dialog="search-dialog"><span>⌕ Search workspace</span><kbd>Ctrl K</kbd></button>
       <nav>
-        <div class="section-label"><span>Projects</span><button class="icon-button" title="Add project" data-dialog="project-dialog">＋</button></div>
+        <div class="section-label"><button class="section-toggle" type="button" data-collapse="projects" aria-expanded="true" aria-controls="project-list" title="Collapse projects">▾</button><span>Projects</span><button class="icon-button" title="Add project" data-dialog="project-dialog">＋</button></div>
+        <div id="project-current" class="section-current"></div>
         <div id="project-list" class="project-list"></div>
-        <div class="section-label"><span>Task history</span><span id="task-count" class="count">0</span></div>
+        <div class="section-label"><button class="section-toggle" type="button" data-collapse="tasks" aria-expanded="true" aria-controls="task-list" title="Collapse task history">▾</button><span>Task history</span><span id="task-count" class="count">0</span></div>
+        <div id="task-current" class="section-current"></div>
         <div id="task-list" class="task-list"></div>
       </nav>
       <div class="local-card">
@@ -37,16 +39,16 @@
           <h1 id="task-title">Bring your AI team together</h1>
           <p id="task-description">Create a task, connect agents through MCP, and watch the plan, implementation, tests, and review happen in one place.</p>
         </div>
-        <div class="header-actions"><span id="task-version" class="version">v1</span><button id="open-task-brief" class="secondary hidden" type="button" data-dialog="task-brief-dialog" aria-haspopup="dialog">Task brief</button><button id="copy-task-invite" class="secondary" title="Copy a task-specific agent prompt">Invite agent</button><button id="edit-task-runtime" class="secondary hidden" type="button" title="Set the real model and effort options normally used for this task">Task runtime</button><button id="edit-task" class="secondary hidden" type="button" title="Edit this task's title, description, or approvals">Edit task</button><button class="secondary" data-dialog="task-dialog">New task</button><button id="toggle-team" class="panel-toggle" type="button" aria-label="Toggle team panel" aria-expanded="true" aria-controls="team-panel" title="Toggle team panel">◧</button></div>
+        <div class="header-actions"><span id="task-version" class="version">v1</span><button id="open-task-brief" class="secondary hidden" type="button" data-dialog="task-brief-dialog" aria-haspopup="dialog">Task brief</button><button id="copy-task-invite" class="secondary" title="Copy a task-specific agent prompt">Invite agent</button><button id="edit-task" class="secondary hidden" type="button" title="Edit this task's title, description, or approvals">Edit task</button><button class="secondary" data-dialog="task-dialog">New task</button><button id="toggle-team" class="panel-toggle" type="button" aria-label="Toggle team panel" aria-expanded="true" aria-controls="team-panel" title="Toggle team panel">◧</button></div>
       </header>
 
       <section id="blocked-banner" class="blocked-banner hidden" role="status">
         <div class="blocked-banner-text">
-          <strong>Task blocked — only you can resume it</strong>
+          <strong>Task stopped — only you can restart or close it</strong>
           <p id="blocked-reason"></p>
           <small id="blocked-meta"></small>
         </div>
-        <button id="resume-task" class="primary" type="button">Resume task</button>
+        <div class="blocked-banner-actions"><button id="close-blocked-task" class="secondary" type="button" title="Close this task as finished, without replanning it">Accept as finished</button><button id="resume-task" class="primary" type="button">Resume task</button></div>
       </section>
 
       <section id="empty-state" class="empty-state">
@@ -101,12 +103,6 @@
       <div id="regressions" class="regressions hidden"></div>
       <div id="assignment-list" class="assignment-list"></div>
       <div class="divider"></div>
-      <div id="checkpoint-section" class="checkpoint-section hidden">
-        <div class="panel-title"><h3>Session handoffs</h3><span id="checkpoint-count" class="count">0</span></div>
-        <p class="memory-scope">Bounded, one-time checkpoints for moving work to a fresh session without releasing the old claim first.</p>
-        <div id="checkpoint-list" class="checkpoint-list" aria-live="polite"></div>
-        <div class="divider"></div>
-      </div>
       <div id="project-blackboard-section" class="blackboard-section hidden">
         <div class="panel-title"><h3>Project memory</h3><span id="project-blackboard-count" class="count">0</span></div>
         <p class="memory-scope">Shared by every DevTeam task in this project.</p>
@@ -247,64 +243,8 @@
     </form>
   </dialog>
 
-  <dialog id="checkpoint-dialog" class="checkpoint-dialog">
-    <form id="checkpoint-form" method="dialog">
-      <div class="dialog-head"><div><span class="eyebrow">SAFE SESSION HANDOFF</span><h2>Create checkpoint & invitation</h2></div><button type="button" class="close">×</button></div>
-      <input type="hidden" name="assignmentId">
-      <p id="checkpoint-assignment-summary" class="checkpoint-assignment-summary"></p>
-      <p class="hint">The current agent keeps its claim until a fresh connected session uses the one-time token successfully. Creating this checkpoint does not disconnect or force-release anyone.</p>
-      <label>Next concrete action<textarea name="nextAction" rows="3" maxlength="2000" placeholder="Inspect the current diff, run the focused test, then continue…"></textarea></label>
-      <label>Decisions <small>one per line</small><textarea name="decisions" rows="3" placeholder="Keep ownership transfer in one database transaction"></textarea></label>
-      <label>Blockers or risks <small>one per line</small><textarea name="blockers" rows="3"></textarea></label>
-      <label>Checks already run <small>one per line</small><textarea name="checks" rows="3" placeholder="node --test test/example.test.mjs — passed"></textarea></label>
-      <label>Failed approaches <small>one per line</small><textarea name="failedApproaches" rows="3"></textarea></label>
-      <label>Invitation expiry<select name="expiresInMinutes"><option value="30">30 minutes</option><option value="60">1 hour</option><option value="240">4 hours</option><option value="1440">24 hours</option></select></label>
-      <div id="checkpoint-result" class="checkpoint-result hidden">
-        <label>Fresh-session invitation<textarea id="checkpoint-invitation" rows="10" readonly aria-label="Fresh-session invitation"></textarea></label>
-        <p class="hint">This is the only display of the raw handoff token. Copy it now; DevTeam stores only its hash and cannot recreate the invitation.</p>
-        <button id="copy-checkpoint-invitation" class="secondary" type="button">Copy invitation</button>
-      </div>
-      <div class="dialog-actions"><button type="button" class="secondary close">Close</button><button id="create-checkpoint" class="primary" value="submit">Create checkpoint</button></div>
-    </form>
-  </dialog>
 
-  <dialog id="runtime-dialog" class="runtime-dialog">
-    <form id="runtime-form" method="dialog">
-      <div class="dialog-head"><div><span class="eyebrow">RUNTIME GATE</span><h2>Switch recommended</h2></div><button type="button" class="close">×</button></div>
-      <input type="hidden" name="assignmentId"><input type="hidden" name="assessmentId">
-      <p id="runtime-assignment-summary" class="runtime-summary"></p>
-      <div id="runtime-reasons" class="runtime-reasons"></div>
-      <label>Agent session<select name="agentId" id="runtime-agent" required></select></label>
-      <p id="runtime-profile-state" class="runtime-profile-state"></p>
-      <button id="runtime-edit-profile" type="button" class="secondary">Set or correct selected agent profile</button>
-      <label>Current model<select name="modelId" id="runtime-model"></select></label>
-      <label>Current effort<select name="effortId" id="runtime-effort"></select></label>
-      <p class="hint">Desktop recommendations are advisory. Choices shown here come only from the selected session’s advertised profile; DevTeam does not invent availability.</p>
-      <label id="runtime-exceptional-confirm" class="runtime-exceptional hidden"><input type="checkbox" name="humanApproved"> I explicitly approve exceptional/maximum settings.</label>
-      <label>Decision note<input name="reason" maxlength="1000" placeholder="Why this choice is appropriate"></label>
-      <div class="dialog-actions runtime-actions">
-        <button type="button" class="secondary" data-runtime-choice="cancel">Cancel</button>
-        <button type="button" class="secondary" data-runtime-choice="reassign">Reassign</button>
-        <button type="button" class="secondary" data-runtime-choice="continue">Continue anyway</button>
-        <button type="button" class="primary" data-runtime-choice="switched">I switched</button>
-      </div>
-    </form>
-  </dialog>
 
-  <dialog id="runtime-profile-dialog" class="runtime-dialog">
-    <form id="runtime-profile-form" method="dialog">
-      <div class="dialog-head"><div><span class="eyebrow">REAL MODEL NAMES</span><h2 id="runtime-profile-title">Set runtime profile</h2></div><button type="button" class="close">×</button></div>
-      <p id="runtime-profile-scope" class="runtime-summary"></p>
-      <p class="hint">Enter only models and effort levels you know this session provides. DevTeam stores this as a human-supplied profile and never invents availability.</p>
-      <label>Profile or provider ID<input name="providerId" maxlength="120" placeholder="my-desktop-runtime" required></label>
-      <label>Switching<select name="switchMode"><option value="user_required">I switch it in the desktop app</option><option value="unsupported">This session cannot switch</option><option value="automatic">Managed adapter switches automatically</option><option value="unknown">Unknown</option></select></label>
-      <div class="profile-model-head"><strong>Available models and efforts</strong><button id="profile-add-model" type="button" class="secondary">Add model</button></div>
-      <div id="profile-model-list" class="profile-model-list"></div>
-      <label>Current model<select id="profile-current-model" name="currentModel" required></select></label>
-      <label>Current effort<select id="profile-current-effort" name="currentEffort" required></select></label>
-      <div class="dialog-actions"><button id="profile-clear-task" type="button" class="secondary hidden">Clear task profile</button><button type="button" class="secondary close">Cancel</button><button class="primary" value="submit">Save profile</button></div>
-    </form>
-  </dialog>
 
   <div id="toast" class="toast"></div>
   <script type="module" src="/app.js"></script>

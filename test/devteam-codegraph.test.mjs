@@ -215,10 +215,22 @@ test("directory and whole-project scopes produce bounded automatic code context"
   assert.ok(directory.some((item) => item.path === "src/feature/a.js"));
   assert.ok(directory.some((item) => item.path === "src/feature/b.js"));
   assert.ok(directory.some((item) => item.path === "src/other/c.js"), "one-hop imported-by neighbor is included");
-  assert.equal(directory.find((item) => item.path === "src/feature/a.js").exports.length, 10);
-  assert.equal(directory.find((item) => item.path === "src/feature/a.js").truncated.exports, true);
+  // What the brief pushes is the part that cannot be read off a file: who imports this module. The
+  // exports, imports and dependency lists sit in the first lines of the file the agent is about to
+  // open, and pushing them was 44% of the largest section of every brief.
+  const pushed = directory.find((item) => item.path === "src/feature/a.js");
+  assert.equal(pushed.exports, undefined, "exports are not pushed; they are in the file");
+  assert.equal(pushed.imports, undefined);
+  assert.equal(pushed.dependencies, undefined);
+  assert.ok(Array.isArray(pushed.importedBy), "reverse dependencies are pushed; a grep for them is not cheap");
+
+  // And nothing is lost: an agent that asks about a module still gets everything.
+  const pulled = store.codegraph.neighborhood(task.id, "src/feature/a.js");
+  assert.equal(pulled.module.exports.length, 10, "the pull path still carries exports");
+  assert.equal(pulled.module.truncated.exports, true);
+
   const whole = store.codegraph.codeContext(task.id, { scopes: [""] });
-  assert.ok(whole.length > 0 && whole.length <= 8);
+  assert.ok(whole.length > 0 && whole.length <= 24);
   assert.ok(Buffer.byteLength(JSON.stringify(whole), "utf8") <= 8 * 1024);
 
   const exact = store.createAssignment({ taskId: task.id, title: "Exact file", description: "Edit one file.", requiresWrite: true, targetAgentName: "Context Agent", paths: ["src/feature/a.js"] });
@@ -265,18 +277,40 @@ test("devteam_wait automatically delivers the same bounded code context and Know
   const client = new Client({ name: "codegraph-test", version: "1.0.0" });
   await client.connect(transport);
   t.after(() => client.close());
-  const connected = await client.callTool({ name: "devteam_connect", arguments: { name: "Graph Agent", provider: "test", taskId: task.id } });
+  const connected = await client.callTool({ name: "devteam_join", arguments: { name: "Graph Agent", provider: "test", taskId: task.id } });
   const agentId = connected.structuredContent.agent.id;
-  const assigned = await client.callTool({ name: "devteam_wait", arguments: { agentId, timeoutSeconds: 1 } });
+  const assigned = await client.callTool({ name: "devteam_next", arguments: { agentId, timeoutSeconds: 1 } });
   assert.equal(assigned.structuredContent.status, "assigned");
   assert.ok(Array.isArray(assigned.structuredContent.codeContext));
   assert.deepEqual(assigned.structuredContent.codeContext, instance.store.taskBrief(agentId, task.id).codeContext);
   assert.ok(Buffer.byteLength(JSON.stringify(assigned.structuredContent.codeContext), "utf8") <= 8 * 1024);
   const tools = await client.listTools();
-  assert.ok(tools.tools.some((tool) => tool.name === "devteam_codegraph"));
-  const neighborhood = await client.callTool({ name: "devteam_codegraph", arguments: { agentId, taskId: task.id, path: "src/a.js" } });
+  assert.ok(tools.tools.some((tool) => tool.name === "devteam_next"));
+  const neighborhood = await client.callTool({ name: "devteam_next", arguments: { agentId, want: "module", taskId: task.id, path: "src/a.js" } });
   assert.equal(neighborhood.structuredContent.module.path, "src/a.js");
   assert.equal(Object.hasOwn(neighborhood.structuredContent.module, "source"), false);
   assert.equal(instance.store.taskDetail(task.id).knowledgeVault.automated, true);
   assert.equal(instance.store.taskDetail(task.id).codeGraph.automated, true);
+});
+
+test("the graph will not write into a knowledge vault another project has claimed", async (t) => {
+  // Graph notes are named from a hash of the project id, so a second project pointed at the same
+  // root does not add a few stray files — it writes a complete duplicate set under different names
+  // and its reconciler deletes the originals. That is what renamed all 52 of this repository's graph
+  // notes on every `npm test`, because server tests use process.cwd() as their workspace root.
+  const { store, project, projectRoot } = await fixture(t, { "src/app.mjs": "export const app = 1;\n" });
+  store.codegraph.fullReconcile(project.id);
+  const first = store.codegraph.exportProject(project.id);
+  assert.ok(first.path, "the first project exports normally");
+  const before = await readdir(path.join(projectRoot, "knowledge", "graph"));
+  assert.ok(before.length > 0);
+
+  // Hand the vault to somebody else, exactly as the knowledge exporter would have.
+  await writeFile(path.join(projectRoot, "knowledge", ".devteam-vault"),
+    JSON.stringify({ projectId: "a-different-project", project: "Somebody else" }), "utf8");
+
+  const second = store.codegraph.exportProject(project.id);
+  assert.equal(second.skipped, "foreign-vault", "the export stands down rather than renaming someone's notes");
+  assert.equal(second.vaultOwner, "Somebody else", "and names who it stood down for");
+  assert.deepEqual(await readdir(path.join(projectRoot, "knowledge", "graph")), before, "nothing on disk moved");
 });

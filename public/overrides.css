@@ -1758,3 +1758,45 @@ body.resizing-panel { cursor: col-resize; user-select: none; }
   .blocked-banner { flex-wrap: wrap; padding: 13px 18px; gap: 11px; }
   .blocked-banner .primary { width: 100%; text-align: center; }
 }
+
+/* Two ways out of a stopped task sit side by side: close it as finished, or resume it. */
+.blocked-banner-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+/* Collapsible navigation sections. Collapsed still shows what is selected — a sidebar that hides
+   which project and task you are in has saved space by removing the answer to the only question it
+   was there to answer. */
+.section-toggle {
+  background: none;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1;
+  opacity: 0.65;
+  padding: 2px 4px;
+  margin-left: -4px;
+  transition: transform 120ms ease, opacity 120ms ease;
+}
+.section-toggle:hover { opacity: 1; }
+.section-toggle[aria-expanded="false"] { transform: rotate(-90deg); }
+.section-current {
+  display: none;
+  padding: 4px 10px 8px 18px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text, #e6e8ea);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.section-current:empty { display: none !important; }
+.section-current small {
+  display: block;
+  font-weight: 400;
+  opacity: 0.6;
+  font-size: 11px;
+}
+nav.projects-collapsed #project-list,
+nav.tasks-collapsed #task-list { display: none; }
+nav.projects-collapsed #project-current,
+nav.tasks-collapsed #task-current { display: block; }

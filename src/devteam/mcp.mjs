@@ -31,18 +31,18 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
   // Without this, any client sharing the bearer token could pass another agent's id and speak,
   // vote, approve, or disconnect as them — making the timeline's provenance untrustworthy.
   const requireIdentity = (agentId) => {
-    if (!session.agentId) throw new Error("This MCP session has not connected. Call devteam_connect first.");
+    if (!session.agentId) throw new Error("This MCP session has not connected. Call devteam_join first.");
     if (agentId !== session.agentId) throw new Error("Identity mismatch: an MCP session may only act as the agent it connected as.");
   };
 
   // Reachability: piggyback any directed/broadcast messages waiting for this agent onto whatever
-  // call it just made, so a *busy* agent (not sitting in devteam_wait) is still reached promptly
+  // call it just made, so a *busy* agent (not sitting in devteam_next) is still reached promptly
   // instead of only when it next goes idle.
   const takeInbox = (agentId) => {
     let pendingMessages = [];
     let pendingProposals = [];
     try { pendingMessages = store.deliverDirectedMessages(agentId); } catch { pendingMessages = []; }
-    // Surface open proposals the same way, so a *busy* agent (not sitting in devteam_wait) is asked to
+    // Surface open proposals the same way, so a *busy* agent (not sitting in devteam_next) is asked to
     // vote on any call it makes instead of a unanimity decision silently stalling until it next goes
     // idle. Only proposals in its rooms that it has not yet voted on are returned.
     try { pendingProposals = store.openProposalsForAgent(store.getAgent(agentId)); } catch { pendingProposals = []; }
@@ -51,7 +51,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
   const withInbox = (agentId, result) => {
     const { pendingMessages, pendingProposals } = takeInbox(agentId);
     // Human steering rides along on whatever call the agent just made, for the same reason messages
-    // do: an agent deep in a long edit is not sitting in devteam_wait, and "stop, this is no longer
+    // do: an agent deep in a long edit is not sitting in devteam_next, and "stop, this is no longer
     // worth doing" is worthless if it only arrives when the agent next goes idle.
     let steering = null;
     try { steering = store.steeringFor(agentId); } catch { steering = null; }
@@ -64,68 +64,112 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
     };
   };
 
-  server.registerTool("devteam_connect", {
-    title: "Connect to DevTeam",
-    description: "Join the local DevTeam as a desktop agent. Call once at the start of a DevTeam session and retain the returned agentId.",
+  // Arriving. Four tools — connect, join, resume, roles — were four ways of saying "I am here, put
+  // me in the room", and an agent had to get the order right before it could do anything at all.
+  // Now one call covers a first arrival, joining a further room, and coming back after a dropped
+  // session, and it answers with the project's own role vocabulary so nobody has to ask separately.
+  // Arriving. Four tools — connect, join, resume, roles — were four ways of saying "I am here, put
+  // me in the room", and an agent had to get the order right before it could do anything at all.
+  // Now one call covers a first arrival, joining a further room, and coming back after a dropped
+  // session, and it answers with the project's own role vocabulary so nobody has to ask separately.
+  server.registerTool("devteam_join", {
+    title: "Join the team",
+    description: "Call this first. With name and provider you arrive as a new session; add taskId to enter that task's room at the same time. Membership is always explicit — until you are in a room, nothing on the board is claimable by you, and the reply lists the rooms you could join. Keep the returned agentId and resumeToken privately: if the session drops, call again with your new agentId plus that resumeToken to reclaim the work, room and missed messages of the old one rather than leaving its claim stuck. Already connected and want another room? Pass your agentId and the taskId. The reply also carries the roles this project defines — a project sets its own vocabulary in .devteam/roles.json and may use `analyst`, `fact-checker` or `domain-expert` rather than software job titles. Two behaviours matter: a role that verifies reads work rather than changing it, so it waits for pending writers and earns the right to pass a verdict; a role that plans decides what the team does next.",
     inputSchema: {
-      name: z.string().min(1).max(80).describe("Agent display name, for example Codex or Claude"),
-      provider: z.string().min(1).max(80).describe("Provider or host, for example OpenAI Codex Desktop or Anthropic Claude Desktop"),
-      capabilities: z.array(z.string().max(80)).max(20).default([]).describe("Useful specialties such as implementation, review, security, or testing"),
-      runtimeProfile: z.any().optional().describe("Provider-neutral host/runtime profile. Report only host-, adapter-, or user-supplied model and effort options; never invent availability."),
-      sessionGeneration: z.number().int().min(1).optional().describe("Host-reported fresh conversation generation when available."),
-      taskId: z.string().uuid().optional().describe("Task room to join on connect. Membership is explicit: without it you join no room and can claim nothing."),
+      name: z.string().min(1).max(80).optional().describe("Your display name on a first arrival, for example Codex or Claude"),
+      provider: z.string().min(1).max(80).optional().describe("Your host on a first arrival, for example OpenAI Codex or Anthropic Claude Code"),
+      capabilities: z.array(z.string().max(80)).max(20).default([]).describe("What you are good at — implementation, review, security, testing, research. DevTeam matches these to work; it never appoints you to a role you did not claim."),
+      model: z.string().max(80).optional().describe("The model you are running as right now, in the name a human would recognise — \"Sonnet 5\", \"Opus 5\". Report what you actually are; do not guess."),
+      effort: z.string().max(40).optional().describe("The effort or thinking level you are running at right now — low, medium, high, maximum — if your host exposes one."),
+      ladder: z.array(z.object({
+        model: z.string().min(1).max(80),
+        effort: z.string().max(40).optional(),
+      })).max(12).optional().describe("The model and effort combinations THIS host can run you at, ordered weakest first. Send it when the reply to a previous join asked for it, or on a first arrival. DevTeam uses it only to say which rung a piece of work needs and whether you are on it — it is never compared against another provider. Report only combinations you know your host offers."),
+      taskId: z.string().uuid().optional().describe("The task room to enter"),
+      role: z.enum(["contributor", "observer"]).default("contributor").describe("Observers watch and never claim work"),
+      agentId: z.string().uuid().optional().describe("Your existing agentId, when joining a further room or resuming"),
+      resumeToken: z.string().max(200).optional().describe("The resumeToken from the session you are reclaiming, alongside your new agentId"),
     },
-  }, safe(async ({ name, provider, capabilities, runtimeProfile, sessionGeneration, taskId }) => {
-    const agent = store.connectAgent({ name, provider, capabilities, runtimeProfile, sessionGeneration, freshTaskId: taskId || null });
+  }, safe(async (args) => {
+    const { name, provider, capabilities, taskId, role, agentId, resumeToken, model, effort, ladder } = args;
+    // Resuming and joining act as an already-connected agent; arriving is the one call that has no
+    // identity yet, and it is what establishes one for this MCP session.
+    if (resumeToken) {
+      if (!agentId) throw new Error("Resuming needs the agentId from your current arrival, plus the earlier session's resumeToken.");
+      requireIdentity(agentId);
+      return withInbox(agentId, store.resumeAgent({ agentId, resumeToken }));
+    }
+    if (agentId) {
+      requireIdentity(agentId);
+      if (!taskId) throw new Error("Pass taskId to say which room you are joining.");
+      const joined = store.joinTask(agentId, taskId, role);
+      const task = store.getTask(taskId);
+      return withInbox(agentId, {
+        ...joined,
+        roles: task ? store.roleCatalogue(task.project_id) : null,
+        runtime: store.runtimeLadder({ agentId, taskId, model, effort, ladder }),
+      });
+    }
+    if (!name || !provider) throw new Error("A first arrival needs name and provider.");
+    const agent = store.connectAgent({ name, provider, capabilities, freshTaskId: taskId || null, model, effort });
     session.agentId = agent.id;
-    const { resumeToken, room, ...agentInfo } = agent;
+    const { resumeToken: token, room, ...agentInfo } = agent;
     const roomStatus = store.roomStatusForAgent(agent.id);
     const roomRequired = roomStatus.joinedTaskIds.length === 0 && roomStatus.activeTasks.length > 0;
+    const task = taskId ? store.getTask(taskId) : null;
+    const runtime = taskId ? store.runtimeLadder({ agentId: agent.id, taskId, model, effort, ladder }) : null;
     return {
       connected: true,
       agent: agentInfo,
       room,
+      ...(task ? { roles: store.roleCatalogue(task.project_id) } : {}),
+      ...(runtime ? { runtime } : {}),
       ...(roomRequired ? { roomRequired: true, availableTasks: roomStatus.activeTasks } : {}),
-      resumeToken,
+      resumeToken: token,
       next: roomRequired
-        ? "You are in no task room, so nothing is claimable. Choose the intended task from availableTasks and call devteam_join before devteam_wait. Keep resumeToken privately: if this session drops, pass it to devteam_resume."
-        : "Call devteam_wait with this agentId. Keep resumeToken privately: if this session drops and you reconnect, pass it to devteam_resume to reclaim this session's work and missed messages.",
+        ? "You are in no room, so nothing is claimable. Pick the intended task from availableTasks and call devteam_join again with your agentId and that taskId, then devteam_next. Keep resumeToken privately."
+        : "Call devteam_next with this agentId. Keep resumeToken privately: if this session drops, join again and pass it to reclaim this session's work and missed messages.",
     };
   }));
 
-  server.registerTool("devteam_resume", {
-    title: "Resume a previous DevTeam session",
-    description: "After reconnecting, reclaim the work, task room, and missed messages of an earlier session using the resumeToken it returned. Use this when the same agent (e.g. the same desktop chat) comes back, instead of leaving its claimed assignment stuck.",
-    inputSchema: {
-      agentId: z.string().uuid().describe("The agentId from your *current* devteam_connect"),
-      resumeToken: z.string().min(1).max(200).describe("The resumeToken returned by the earlier session's devteam_connect"),
-    },
-  }, safe(async ({ agentId, resumeToken }) => {
-    requireIdentity(agentId);
-    return withInbox(agentId, store.resumeAgent({ agentId, resumeToken }));
-  }));
-
-  server.registerTool("devteam_join", {
-    title: "Join a task room",
-    description: "Join a specific task's room so you claim only its work, receive only its messages, and vote only on its proposals. Membership is always explicit: until you join a room (here or via devteam_connect's taskId) nothing on the board is claimable by you.",
+  server.registerTool("devteam_next", {
+    title: "Get your next piece of work, or look something up",
+    description: "Your main loop. With no arguments beyond agentId it blocks locally until DevTeam has an assignment or a message for you — no model tokens are spent while blocked — and returns everything you need to start: the task, your assignment with its claim token, write scope and checklist, the relevant project memory, a map of the code around it, recent decisions and open questions. Returns 'room_required' if you are in no room yet, 'assigned' or 'message' when something arrives, or 'idle' after the timeout. The other modes are lookups, and none of them blocks: want=state reads the compact current state of a task, want=brief re-reads the full briefing for a task you are already working, want=module returns the one-hop neighbourhood of a file from the code graph (paths and symbols, never source), and want=complexity returns the deterministic score and reasons behind one assignment.",
     inputSchema: {
       agentId: z.string().uuid(),
-      taskId: z.string().uuid(),
-      role: z.enum(["contributor", "observer"]).default("contributor"),
+      want: z.enum(["work", "state", "brief", "module", "complexity"]).default("work"),
+      timeoutSeconds: z.number().int().min(1).max(50).default(45).describe("want=work only: how long to block before answering idle"),
+      taskId: z.string().uuid().optional().describe("Required for brief and module; optional for state to narrow it to one task"),
+      path: z.string().max(500).optional().describe("want=module: the project-relative file whose neighbours you want"),
+      assignmentId: z.string().uuid().optional().describe("want=complexity: the assignment to score"),
     },
-  }, safe(async ({ agentId, taskId, role }) => {
-    requireIdentity(agentId);
-    return withInbox(agentId, store.joinTask(agentId, taskId, role));
-  }));
-
-  server.registerTool("devteam_wait", {
-    title: "Wait for DevTeam work or messages",
-    description: "Block locally (no model tokens are spent while blocked) until DevTeam has an assignment or a human message for this agent. A new runtime recommendation is surfaced once; later waits keep blocking while the same recommendation remains undecided. Returns 'room_required' immediately when a multi-task server needs an explicit devteam_join; otherwise returns early with status 'assigned' or 'message', or 'idle' after the timeout.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      timeoutSeconds: z.number().int().min(1).max(50).default(45),
-    },
-  }, safe(async ({ agentId, timeoutSeconds }) => {
+  }, safe(async ({ agentId, want, timeoutSeconds, taskId, path: modulePath, assignmentId }) => {
+    // The lookups first: they are the same act as waiting — "tell me what I need to work" — but
+    // answered from what DevTeam already knows instead of by blocking for something new.
+    if (want === "state") {
+      requireIdentity(agentId);
+      store.heartbeat(agentId);
+      if (taskId) store.assertMembership(agentId, taskId);
+      return withInbox(agentId, taskId ? store.taskDetail(taskId) : store.snapshotForAgent(agentId));
+    }
+    if (want === "brief") {
+      requireIdentity(agentId);
+      store.heartbeat(agentId);
+      if (!taskId) throw new Error("want=brief needs taskId.");
+      const { pendingMessages, pendingProposals } = takeInbox(agentId);
+      return store.taskBrief(agentId, taskId, { pendingMessages, pendingProposals });
+    }
+    if (want === "module") {
+      requireIdentity(agentId);
+      if (!taskId || !modulePath) throw new Error("want=module needs taskId and path.");
+      return withInbox(agentId, store.codeGraphSearch({ agentId, taskId, path: modulePath }));
+    }
+    if (want === "complexity") {
+      requireIdentity(agentId);
+      store.heartbeat(agentId);
+      if (!assignmentId) throw new Error("want=complexity needs assignmentId.");
+      return withInbox(agentId, store.assignmentAssessment({ agentId, assignmentId }));
+    }
     requireIdentity(agentId);
     store.heartbeat(agentId, "waiting");
     // A stop request or a blown budget outranks waiting for more work: an agent should not sit in a
@@ -141,7 +185,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
         keepWaiting: false,
         availableTasks: initialRoomStatus.activeTasks,
         message: "You have joined no task room, so no work here is claimable by you. Choose the intended taskId from availableTasks and call devteam_join before waiting.",
-        next: "Call devteam_join with this agentId, the intended taskId, and role contributor; then call devteam_wait again.",
+        next: "Call devteam_join with this agentId, the intended taskId, and role contributor; then call devteam_next again.",
       };
     }
     const deadline = Date.now() + timeoutSeconds * 1000;
@@ -153,7 +197,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
           status: "message",
           messages,
           keepWaiting: true,
-          next: "Read these messages. If a reply or acknowledgement is expected, post it with devteam_message, then call devteam_wait again to stay responsive to the team.",
+          next: "Read these messages. If a reply or acknowledgement is expected, post it with devteam_message, then call devteam_next again to stay responsive to the team.",
         };
       }
       const proposals = store.openProposalsForAgent(store.getAgent(agentId));
@@ -162,7 +206,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
           status: "proposal",
           proposals,
           keepWaiting: true,
-          next: "The team is deciding how to organise. Review each proposal and vote with devteam_vote (agree or object, with a short reason). A proposal is adopted only when every connected teammate agrees.",
+          next: "The team is deciding how to organise. Review each proposal and vote with devteam_verdict (agree or object, with a short reason). A proposal is adopted only when every connected teammate agrees.",
         };
       }
       const rotation = store.sessionRotationRecommendation(agentId);
@@ -187,7 +231,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
             responseCore: {
               status: "assigned",
               keepWaiting: true,
-              instructions: "Inspect the current project state before acting. Complete this bounded assignment, then call devteam_report — pass back assignment.claimToken so a stale report is fenced if your lease moved. Use devteam_assign to delegate follow-up implementation, testing, or independent review.",
+              instructions: "Inspect the current project state before acting. Complete this bounded assignment, then call devteam_report — pass back assignment.claimToken so a stale report is fenced if your lease moved. Use devteam_plan to delegate follow-up implementation, testing, or independent review.",
             },
           });
         }
@@ -210,161 +254,35 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
         next: blockedRooms[0].agentAction,
       };
     }
+    // Idle because the rest needs a stronger session is a completely different answer from idle
+    // because the work is finished, and the two look identical from here. Say which it is: the
+    // scheduler withheld those assignments rather than blocking the task, so this agent has already
+    // finished everything it could, and what remains is waiting for a model, not for a decision.
+    const aboveRung = store.workAboveCurrentRung(agentId);
+    if (aboveRung) {
+      return {
+        status: "idle",
+        keepWaiting: false,
+        activity,
+        heldForStrongerModel: aboveRung,
+        message: `${aboveRung.message} Everything this session could take is done.`,
+        next: `Tell the human, in these words: ${aboveRung.humanAction} Then stop — do not attempt the held work at this setting, and do not block the task.`,
+      };
+    }
     return {
       status: "idle",
       keepWaiting: activity.active,
       activity,
       ...(blockedRooms.length ? { blockedRooms } : {}),
       message: activity.active
-        ? "No work for you yet, but the team is still active (work is in flight or teammates are busy). Call devteam_wait again to stay assembled. If you have been idle with no assignment or message for about five minutes straight, disconnect and tell the user to invoke $devteam again when there is new work."
+        ? "No work for you yet, but the team is still active (work is in flight or teammates are busy). Call devteam_next again to stay assembled. If you have been idle with no assignment or message for about five minutes straight, disconnect and tell the user to invoke $devteam again when there is new work."
         : "The room is quiet: no open assignments and no busy teammates. Disconnect to save the session; the user can reconnect this agent when new work is ready.",
     };
   }));
 
-  server.registerTool("devteam_state", {
-    title: "Read DevTeam state",
-    description: "Read the compact current state of a task before planning, implementing, or reviewing.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      taskId: z.string().uuid().optional(),
-    },
-  }, safe(async ({ agentId, taskId }) => {
-    requireIdentity(agentId);
-    store.heartbeat(agentId);
-    if (taskId) store.assertMembership(agentId, taskId);
-    return withInbox(agentId, taskId ? store.taskDetail(taskId) : store.snapshotForAgent(agentId));
-  }));
-
-  server.registerTool("devteam_brief", {
-    title: "Read a compact task briefing",
-    description: "Read a bounded, membership-scoped briefing instead of the full task timeline: goal/version/project, your current assignment, open work and dependencies, task/project memory, relevant durable knowledge, automatic bounded code context, recent decisions/findings, and unresolved questions.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      taskId: z.string().uuid(),
-    },
-  }, safe(async ({ agentId, taskId }) => {
-    requireIdentity(agentId);
-    store.heartbeat(agentId);
-    const { pendingMessages, pendingProposals } = takeInbox(agentId);
-    return store.taskBrief(agentId, taskId, { pendingMessages, pendingProposals });
-  }));
-
-  server.registerTool("devteam_runtime_update", {
-    title: "Update this session's runtime profile",
-    description: "Refresh provider-neutral current/available model and effort capabilities for this exact agent session. Use only host-, adapter-, or explicitly user-supplied facts; unknown values must remain unknown.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      profile: z.any(),
-    },
-  }, safe(async ({ agentId, profile }) => {
-    requireIdentity(agentId);
-    return withInbox(agentId, { updated: true, runtimeProfile: store.updateRuntimeProfile({ agentId, profile }) });
-  }));
-
-  server.registerTool("devteam_session_continue", {
-    title: "Continue the current session",
-    description: "Record the human choice to continue this desktop session after a fresh-session recommendation. This is advisory and does not prove context quality.",
-    inputSchema: { agentId: z.string().uuid(), taskId: z.string().uuid() },
-  }, safe(async ({ agentId, taskId }) => {
-    requireIdentity(agentId);
-    return withInbox(agentId, store.continueCurrentSession({ agentId, taskId }));
-  }));
-
-  server.registerTool("devteam_assignment_assessment", {
-    title: "Read an assignment complexity assessment",
-    description: "Return the deterministic provider-neutral score, level, reasons, and normalized runtime requirements for an assignment in this task room.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      assignmentId: z.string().uuid(),
-    },
-  }, safe(async ({ agentId, assignmentId }) => {
-    requireIdentity(agentId);
-    store.heartbeat(agentId);
-    return withInbox(agentId, store.assignmentAssessment({ agentId, assignmentId }));
-  }));
-
-  server.registerTool("devteam_runtime_decision", {
-    title: "Record a runtime gate decision",
-    description: "After runtime_action_required, record switched, continue, reassign, or cancel. Exceptional settings cannot be approved by an agent; the human must approve them in the authenticated dashboard.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      assignmentId: z.string().uuid(),
-      assessmentId: z.string().uuid(),
-      choice: z.enum(["switched", "continue", "reassign", "cancel"]),
-      reason: z.string().max(1000).optional(),
-    },
-  }, safe(async ({ agentId, assignmentId, assessmentId, choice, reason }) => {
-    requireIdentity(agentId);
-    return withInbox(agentId, store.runtimeDecision({ agentId, assignmentId, assessmentId, choice, reason, actor: "agent", humanApproved: false }));
-  }));
-
-  server.registerTool("devteam_session_checkpoint", {
-    title: "Create a safe session checkpoint",
-    description: "Create a redacted, bounded handoff capsule before intentionally replacing this session. If this session owns an assignment, its existing claim stays live until a fresh connected session successfully takes over. Returns a one-time handoff token; keep it private and pass it only to the intended fresh session.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      taskId: z.string().uuid(),
-      assignmentId: z.string().uuid().optional().describe("Active assignment to hand off; omitted means this session's current claim in the task, if any."),
-      decisions: z.array(z.string().max(1200)).max(30).default([]),
-      blockers: z.array(z.string().max(1200)).max(30).default([]),
-      checks: z.array(z.string().max(1000)).max(50).default([]),
-      failedApproaches: z.array(z.string().max(1200)).max(30).default([]),
-      nextAction: z.string().max(2000).default(""),
-      expiresInMinutes: z.number().int().min(1).max(1440).default(30),
-    },
-  }, safe(async ({ expiresInMinutes, ...args }) => {
-    requireIdentity(args.agentId);
-    const result = await store.createSessionCheckpoint({ ...args, expiresInMs: expiresInMinutes * 60_000 });
-    return withInbox(args.agentId, {
-      ...result,
-      next: "Keep the old session and claim intact. Open a fresh session, connect and join this task, then call devteam_session_takeover with checkpoint.id and the one-time handoffToken.",
-    });
-  }));
-
-  server.registerTool("devteam_session_checkpoint_get", {
-    title: "Read a session checkpoint",
-    description: "Read an authorized task's bounded checkpoint capsule without changing assignment ownership. This never returns a stored handoff-token hash, resume token, claim token, agent secret, or source body.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      taskId: z.string().uuid(),
-      checkpointId: z.string().uuid(),
-    },
-  }, safe(async (args) => {
-    requireIdentity(args.agentId);
-    return withInbox(args.agentId, store.sessionCheckpointGet(args));
-  }));
-
-  server.registerTool("devteam_session_takeover", {
-    title: "Safely take over a session checkpoint",
-    description: "Use a one-time handoff token from the old session to atomically continue in this intentionally fresh session. DevTeam verifies task membership, expiry, token, checkpoint generation, and the exact claim; then it bumps the claim generation, issues a new fencing token, consumes the handoff token, and retires the old session in one transaction.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      taskId: z.string().uuid(),
-      checkpointId: z.string().uuid(),
-      handoffToken: z.string().min(16).max(200),
-    },
-  }, safe(async (args) => {
-    requireIdentity(args.agentId);
-    return withInbox(args.agentId, await store.takeoverSessionCheckpoint(args));
-  }));
-
-  server.registerTool("devteam_session_checkpoint_cancel", {
-    title: "Cancel a session checkpoint",
-    description: "Cancel this session's unused checkpoint without releasing its active assignment claim. The one-time handoff token is invalidated immediately.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      taskId: z.string().uuid(),
-      checkpointId: z.string().uuid(),
-      reason: z.string().max(800).default("Session rotation cancelled."),
-    },
-  }, safe(async (args) => {
-    requireIdentity(args.agentId);
-    return withInbox(args.agentId, store.cancelSessionCheckpoint(args));
-  }));
-
   server.registerTool("devteam_message", {
     title: "Post a team message",
-    description: "Post a focused progress note, design decision, review finding, or question. Omit target to post a timeline note the whole room can read; set target to a teammate's name to send a directed message that is pushed to them. Pass replyTo (a timeline event id from devteam_state) to answer a specific message as a thread.",
+    description: "Post a focused progress note, design decision, review finding, or question. Omit target to post a timeline note the whole room can read; set target to a teammate's name to send a directed message that is pushed to them. Pass replyTo (a timeline event id from devteam_next with want=state) to answer a specific message as a thread.",
     inputSchema: {
       agentId: z.string().uuid(),
       taskId: z.string().uuid(),
@@ -379,131 +297,108 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
     return withInbox(agentId, store.postMessage({ agentId, taskId, message, type: `agent.${kind}`, metadata }));
   }));
 
-  server.registerTool("devteam_assign", {
-    title: "Assign team work",
-    description: "Create a bounded implementation, review, testing, research, or planning assignment for another available agent. Reviewer, security-reviewer, and tester assignments automatically carry a checklist so the team covers the usual blind spots; pass your own `checklist` to override it, or an empty array to omit it.",
+  // Putting work on the board, whether you are creating it outright or asking the team to agree
+  // first. Both are the same act from the reader's side — something new is proposed for the queue —
+  // and keeping them apart mostly meant an agent picked whichever schema it found first.
+  server.registerTool("devteam_plan", {
+    title: "Put work on the board",
+    description: "Create a bounded assignment for whoever can take it. Order is the only scheduling vocabulary you need: leave dependsOn empty and it can start now, in parallel with anything else that is ready; name earlier assignments and it waits for them. Declare `paths` for write work so non-overlapping writers run at the same time instead of queueing behind one lease. Roles carry a checklist automatically where they verify. Set agree=true instead to put the plan to the team as a proposal rather than creating it outright — use that for how the team organises itself (who takes which role, moving an assignment to someone else, recording a shared decision), and it takes effect only when every connected teammate agrees.",
     inputSchema: {
       agentId: z.string().uuid(),
       taskId: z.string().uuid(),
-      title: z.string().min(1).max(160),
-      description: z.string().min(1).max(12000),
-      role: z.string().min(1).max(40).default("implementer").describe("A role this project defines. Call devteam_roles to see them — a project may use its own vocabulary (analyst, fact-checker, editor) rather than software job titles. A role that verifies makes this a review assignment to the scheduler."),
+      title: z.string().min(1).max(160).optional().describe("Assignment title; also the proposal's one-line summary when agree=true"),
+      description: z.string().max(12000).optional(),
+      role: z.string().min(1).max(40).default("implementer").describe("A role this project defines — it may use its own vocabulary (analyst, fact-checker, structural-engineer) rather than software job titles; devteam_join returns the list. A role that verifies makes this a review assignment to the scheduler, and DevTeam will not hand it to whoever wrote the version under review."),
       requiresWrite: z.boolean().default(false),
-      targetAgentName: z.string().max(80).optional(),
-      checklist: z.array(z.string().max(300)).max(40).optional().describe("Points the assignee must address; overrides the default checklist for the role"),
-      paths: z.array(z.string().max(500)).max(50).optional().describe("For write work: the file paths/prefixes this assignment will modify (e.g. src/ocean/**). Declaring them lets non-overlapping writers run in parallel; omit for an exclusive whole-project lease."),
-      dependsOn: z.array(z.string().uuid()).max(50).optional().describe("Existing same-task assignment IDs that must be done before this assignment can be claimed"),
+      targetAgentName: z.string().max(80).optional().describe("Address it to one teammate by name; it returns to the general queue if nobody by that name is connected"),
+      checklist: z.array(z.string().max(300)).max(40).optional().describe("Points the assignee must address; overrides the role's default checklist, and an empty array omits it"),
+      paths: z.array(z.string().max(500)).max(50).optional().describe("For write work: the paths this will modify (e.g. src/ocean/**). Declaring them lets non-overlapping writers run in parallel; omit for an exclusive whole-project lease."),
+      dependsOn: z.array(z.string().uuid()).max(50).optional().describe("Same-task assignment IDs that must finish first. Empty means it can run now."),
+      agree: z.boolean().default(false).describe("Put this to the team as a proposal instead of creating it"),
+      kind: z.enum(["role", "handoff", "plan", "decision"]).default("role").describe("agree=true only: role asks that an agent take a role, handoff moves an existing assignment, plan/decision records a shared decision"),
+      assignmentId: z.string().uuid().optional().describe("agree=true with kind=handoff: the assignment to move"),
+      quorum: z.number().min(0).max(1).optional().describe("agree=true only: adoption threshold over the voters present when proposed. 1 (default) is unanimity, 0.5 a simple majority."),
     },
   }, safe(async (args) => {
-    requireIdentity(args.agentId);
-    return withInbox(args.agentId, store.createAssignment(args));
-  }));
-
-  server.registerTool("devteam_propose", {
-    title: "Propose a team decision",
-    description: "Ask the team to agree on how to organise. Use kind 'role' to request that an agent take a role (creates that assignment on adoption), 'handoff' to move an existing assignment to another agent, or 'plan'/'decision' to record a shared decision. Adopted only when every connected teammate agrees.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      taskId: z.string().uuid(),
-      kind: z.enum(["role", "handoff", "plan", "decision"]).default("role"),
-      summary: z.string().min(1).max(2000).describe("One line the team votes on, e.g. 'I take the security-reviewer role'"),
-      details: z.object({
-        role: z.string().min(1).max(40).optional().describe("A role this project defines; see devteam_roles"),
-        targetAgentName: z.string().max(80).optional().describe("Agent the role or handoff is for; defaults to the proposer"),
-        title: z.string().max(160).optional(),
-        description: z.string().max(4000).optional(),
-        requiresWrite: z.boolean().optional(),
-        assignmentId: z.string().uuid().optional().describe("For kind 'handoff': the assignment to move"),
-        quorum: z.number().min(0).max(1).optional().describe("Adoption threshold over the voters present when proposed: 1 (default) = unanimity, 0.5 = simple majority, e.g. 0.67 = two-thirds"),
-      }).default({}),
-    },
-  }, safe(async ({ agentId, taskId, kind, summary, details }) => {
+    const { agentId, taskId, title, description, role, requiresWrite, targetAgentName } = args;
     requireIdentity(agentId);
-    const proposal = store.createProposal({ agentId, taskId, kind, summary, details });
-    return withInbox(agentId, { proposed: true, proposal, next: "Teammates will see this on their next devteam_wait and vote. It is adopted when all connected teammates agree." });
-  }));
-
-  server.registerTool("devteam_vote", {
-    title: "Vote on a team proposal",
-    description: "Agree or object to an open team proposal. When every connected teammate agrees, the proposal is adopted and its effect (new role assignment or handoff) is applied automatically.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      proposalId: z.string().uuid(),
-      vote: z.enum(["agree", "object"]).default("agree"),
-      comment: z.string().max(2000).optional(),
-    },
-  }, safe(async ({ agentId, proposalId, vote, comment }) => {
-    requireIdentity(agentId);
-    return withInbox(agentId, store.voteProposal({ agentId, proposalId, vote, comment }));
-  }));
-
-  server.registerTool("devteam_note_set", {
-    title: "Write shared team memory",
-    description: "Write versioned shared memory. scope=task (default) belongs to this job; scope=project persists across every task in the same project. Project scope is inferred from the authorized taskId, never an arbitrary projectId. Re-read and merge on a version conflict.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      taskId: z.string().uuid(),
-      scope: z.enum(["task", "project"]).default("task").describe("task for this job, project for durable memory shared by every task in the project"),
-      key: z.string().min(1).max(120).describe("e.g. 'world', 'decisions', 'open-questions', 'ownership'"),
-      value: z.string().min(0).max(100000).describe("The new content (plain text or a JSON string)"),
-      expectedVersion: z.number().int().min(0).optional().describe("The version you last read; omit only for a first write you know is uncontended"),
-    },
-  }, safe(async ({ agentId, taskId, scope, key, value, expectedVersion }) => {
-    requireIdentity(agentId);
-    return withInbox(agentId, store.noteSet({ agentId, taskId, scope, key, value, expectedVersion: expectedVersion ?? null }));
-  }));
-
-  server.registerTool("devteam_note_get", {
-    title: "Read shared team memory",
-    description: "Read versioned task or project memory. scope=task (default) is job-specific; scope=project persists across every task in the same project. Omit key to list keys; pass key for its full value and version.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      taskId: z.string().uuid(),
-      scope: z.enum(["task", "project"]).default("task"),
-      key: z.string().max(120).optional(),
-    },
-  }, safe(async ({ agentId, taskId, scope, key }) => {
-    requireIdentity(agentId);
-    store.assertMembership(agentId, taskId);
-    if (key) {
-      const note = store.noteGet(taskId, key, scope, agentId);
-      return withInbox(agentId, note || { scope, key, value: null, version: 0, missing: true });
+    if (args.agree) {
+      if (!title) throw new Error("agree=true needs a title: it is the one line the team votes on.");
+      const proposal = store.createProposal({
+        agentId, taskId, kind: args.kind, summary: title,
+        details: {
+          role, targetAgentName, description, requiresWrite,
+          assignmentId: args.assignmentId, quorum: args.quorum,
+        },
+      });
+      return withInbox(agentId, {
+        proposed: true,
+        proposal,
+        next: "Teammates see this on their next devteam_next and answer with devteam_verdict (agree/object). It takes effect once they all agree.",
+      });
     }
-    return withInbox(agentId, { scope, keys: store.noteList(taskId, scope, agentId) });
+    if (!title || !description) throw new Error("An assignment needs a title and a description.");
+    return withInbox(agentId, store.createAssignment({
+      agentId, taskId, title, description, role, requiresWrite, targetAgentName,
+      checklist: args.checklist, paths: args.paths, dependsOn: args.dependsOn,
+    }));
   }));
 
-  server.registerTool("devteam_knowledge", {
-    title: "Search durable project knowledge",
-    description: "Search the automatic Obsidian-compatible project vault. DevTeam creates and refreshes it from completed assignments, adopted decisions, blockers, findings, and project memory; agents do not need to maintain it manually.",
+  server.registerTool("devteam_memory", {
+    title: "Project memory",
+    description: "The project's memory, in two halves, and it is mostly written for you. DevTeam distils completed work, decisions, blockers and findings into a linked vault by itself, and your brief already carries the most relevant notes as headlines. action=search fetches the full body of a note the brief only summarised, or finds notes by words, path or category — reach for it whenever a headline looks relevant. action=write records a fact the events cannot capture: an API limit, why the obvious approach fails here, a convention the code follows but never states. Not a progress update (use devteam_message) and not a decision the team took (use devteam_propose). action=get and action=set are a small versioned key/value scratchpad — scope=task for this job, scope=project to persist across the project's tasks; re-read and merge on a version conflict.",
     inputSchema: {
       agentId: z.string().uuid(),
       taskId: z.string().uuid(),
-      query: z.string().max(500).default("").describe("Words, file path, component, or decision to find; empty returns the most relevant recent notes"),
-      category: z.enum(["architecture", "decisions", "components", "conventions", "pitfalls", "workflows", "archive"]).optional(),
-      status: z.enum(["verified", "inferred", "disputed", "stale", "archived"]).optional(),
-      limit: z.number().int().min(1).max(50).default(20),
+      action: z.enum(["search", "write", "get", "set"]).default("search"),
+      query: z.string().max(500).default("").describe("search: words, a file path, a component or a decision; empty returns the most relevant recent notes"),
+      category: z.enum(["architecture", "decisions", "components", "conventions", "pitfalls", "workflows", "archive"]).optional()
+        .describe("search: narrow to one kind. write: required — architecture (how it fits together), decisions (a choice and its reason), components (what one part does), conventions (a rule the project follows), pitfalls (what will bite the next person), workflows (how a recurring job is done)."),
+      limit: z.number().int().min(1).max(50).default(20).describe("search only"),
+      title: z.string().min(1).max(200).optional().describe("write: the fact as a statement, not a topic — 'The billing API rate-limits at 30 requests/minute', not 'Billing API'"),
+      body: z.string().min(1).max(4000).optional().describe("write: the fact with enough context to act on. Link related notes inline with [[category/slug]] and they become navigable both ways."),
+      confidence: z.enum(["low", "medium", "high"]).default("medium").describe("write: be honest — a low-confidence note is still worth recording and is ranked accordingly. Notes you write are recorded as 'inferred'; verified means DevTeam observed it."),
+      relatedFiles: z.array(z.string().max(500)).max(20).default([]).describe("write: project-relative files this fact concerns, so it goes stale when they change"),
+      scope: z.enum(["task", "project"]).default("task").describe("get/set only"),
+      key: z.string().max(120).optional().describe("get/set: e.g. 'world', 'open-questions', 'ownership'. Omit on get to list the keys."),
+      value: z.string().min(0).max(100000).optional().describe("set: the new content, plain text or a JSON string"),
+      expectedVersion: z.number().int().min(0).optional().describe("set: the version you last read; omit only for a first write you know is uncontended"),
     },
   }, safe(async (args) => {
-    requireIdentity(args.agentId);
-    return withInbox(args.agentId, store.knowledgeSearch(args));
-  }));
-
-  server.registerTool("devteam_codegraph", {
-    title: "Inspect the automatic code graph",
-    description: "Return a bounded, task-membership-scoped one-hop neighborhood for one indexed module. Results contain paths and symbols only, never source bodies.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      taskId: z.string().uuid(),
-      path: z.string().min(1).max(500).describe("Project-relative module path"),
-    },
-  }, safe(async (args) => {
-    requireIdentity(args.agentId);
-    return withInbox(args.agentId, store.codeGraphSearch({ agentId: args.agentId, taskId: args.taskId, path: args.path }));
+    const { agentId, taskId, action } = args;
+    requireIdentity(agentId);
+    if (action === "write") {
+      if (!args.category || !args.title || !args.body) {
+        throw new Error("action=write needs category, title and body.");
+      }
+      return withInbox(agentId, store.knowledgeWrite({
+        agentId, taskId, category: args.category, title: args.title, body: args.body,
+        confidence: args.confidence, relatedFiles: args.relatedFiles,
+      }));
+    }
+    if (action === "set") {
+      if (!args.key || args.value === undefined) throw new Error("action=set needs key and value.");
+      return withInbox(agentId, store.noteSet({
+        agentId, taskId, scope: args.scope, key: args.key, value: args.value,
+        expectedVersion: args.expectedVersion ?? null,
+      }));
+    }
+    if (action === "get") {
+      store.assertMembership(agentId, taskId);
+      if (args.key) {
+        const note = store.noteGet(taskId, args.key, args.scope, agentId);
+        return withInbox(agentId, note || { scope: args.scope, key: args.key, value: null, version: 0, missing: true });
+      }
+      return withInbox(agentId, { scope: args.scope, keys: store.noteList(taskId, args.scope, agentId) });
+    }
+    return withInbox(agentId, store.knowledgeSearch({
+      agentId, taskId, query: args.query, category: args.category ?? null, limit: args.limit,
+    }));
   }));
 
   server.registerTool("devteam_report", {
     title: "Report completed work",
-    description: "Complete the currently claimed assignment with evidence. Report exact files and checks; changed files advance the task version and invalidate prior approvals. A check may carry a command, which DevTeam runs itself inside the project root and grades by exit code — a report claiming success for a command that actually fails is refused, and your claim is left intact so you can fix it and report again. Checks without a command are recorded as your assertion and labeled as such. While those commands run the assignment shows as verifying and keeps your claim; if this returns completed:false with a verifying payload, an earlier report of yours is still being checked — wait for it rather than reporting again. status=blocked closes only this assignment and queues planner triage; use devteam_block separately only for a genuine task-wide blocker.",
+    description: "Complete the currently claimed assignment with evidence. Report exact files and checks; changed files advance the task version and invalidate prior approvals. A check may carry a command, which DevTeam runs itself inside the project root and grades by exit code — a report claiming success for a command that actually fails is refused, and your claim is left intact so you can fix it and report again. Checks without a command are recorded as your assertion and labeled as such. While those commands run the assignment shows as verifying and keeps your claim; if this returns completed:false with a verifying payload, an earlier report of yours is still being checked — wait for it rather than reporting again. status=blocked closes only this assignment and queues planner triage; use devteam_stuck separately only for a genuine task-wide blocker.",
     inputSchema: {
       agentId: z.string().uuid(),
       assignmentId: z.string().uuid(),
@@ -518,13 +413,8 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
         }),
       ])).max(100).default([]),
       disconnectAfter: z.boolean().default(false),
-      claimToken: z.string().max(200).optional().describe("The claimToken from the assignment you claimed (or from devteam_resume). Lets the server fence a stale report if your lease has since moved."),
-      usage: z.object({
-        inputTokens: z.number().int().min(0).optional(),
-        outputTokens: z.number().int().min(0).optional(),
-        costUsd: z.number().min(0).optional(),
-        model: z.string().max(120).optional(),
-      }).optional().describe("What this assignment cost you, if your host tells you. Recorded and shown as agent-reported — DevTeam cannot measure it and does not pretend to. Report real figures or omit this entirely; never estimate."),
+      claimToken: z.string().max(200).optional().describe("The claimToken from the assignment you claimed (or from devteam_join when you resumed). Lets the server fence a stale report if your lease has since moved."),
+
     },
   }, safe(async ({ disconnectAfter, ...args }) => {
     requireIdentity(args.agentId);
@@ -535,16 +425,57 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
     return disconnectAfter ? result : withInbox(args.agentId, result);
   }));
 
-  server.registerTool("devteam_why_blocked", {
-    title: "Ask why work is not claimable",
-    description: "Idle with work on the board? Ask the scheduler for the full ordered reason chain instead of guessing. Omit assignmentId to get every queued item in your rooms; pass one to ask about a specific assignment. Reason codes name the actual blocker (the writer you wait for, the agent holding an overlapping write lease, each unmet dependency, the runtime gap).",
+  server.registerTool("devteam_verdict", {
+    title: "Pass judgement on someone else's work",
+    description: "Your verdict on work you reviewed. verdict=approve accepts the current task version — only after you completed an independent read-only reviewer or tester assignment on it, and never on a version you wrote yourself; DevTeam will not hand you that review in the first place. verdict=changes sends one assignment back to whoever wrote it with your findings attached, keeping its title, checklist, write scope and history; the author is handed your findings when it re-claims, approvals on the version are cleared, and nobody else's claim is touched. Sending work back is a normal outcome, not a failure — approving work you have doubts about is the failure. verdict=agree and verdict=object answer an open team proposal instead; when every connected teammate agrees it is adopted and its effect applied.",
     inputSchema: {
       agentId: z.string().uuid(),
-      assignmentId: z.string().uuid().optional().describe("A specific queued assignment; omit to explain everything queued in your rooms."),
-      taskId: z.string().uuid().optional().describe("Narrow the bulk answer to one task room."),
+      verdict: z.enum(["approve", "changes", "agree", "object"]),
+      taskId: z.string().uuid().optional().describe("approve/changes"),
+      summary: z.string().max(8000).optional().describe("approve: what you checked and found. changes: one line on why this is going back."),
+      assignmentId: z.string().uuid().optional().describe("changes: the completed assignment that needs work — the author's, not your own review assignment"),
+      findings: z.array(z.union([
+        z.string().max(2000).describe("One thing that must change"),
+        z.object({
+          detail: z.string().min(1).max(2000).describe("What must change and why"),
+          path: z.string().max(500).optional().describe("The project-relative file it concerns, when it concerns one"),
+        }),
+      ])).max(50).default([]).describe("changes: the specific changes required. The author is handed this list on re-claim, so be concrete — and DevTeam reads them across tasks to notice conventions this project keeps having to state."),
+      proposalId: z.string().uuid().optional().describe("agree/object"),
+      comment: z.string().max(2000).optional().describe("agree/object"),
     },
-  }, safe(async ({ agentId, assignmentId, taskId }) => {
+  }, safe(async (args) => {
+    const { agentId, verdict, taskId, summary, assignmentId, findings, proposalId, comment } = args;
     requireIdentity(agentId);
+    if (verdict === "agree" || verdict === "object") {
+      if (!proposalId) throw new Error(`verdict=${verdict} needs proposalId.`);
+      return withInbox(agentId, store.voteProposal({ agentId, proposalId, vote: verdict, comment }));
+    }
+    if (!taskId) throw new Error(`verdict=${verdict} needs taskId.`);
+    if (!summary) throw new Error(`verdict=${verdict} needs a summary saying why.`);
+    if (verdict === "approve") return withInbox(agentId, store.approveTask({ agentId, taskId, summary }));
+    if (!assignmentId) throw new Error("verdict=changes needs the assignmentId of the work going back.");
+    return withInbox(agentId, store.requestChanges({ agentId, taskId, assignmentId, summary, findings }));
+  }));
+
+  server.registerTool("devteam_stuck", {
+    title: "Say you cannot proceed, or ask why",
+    description: "kind=why asks the scheduler for the full ordered reason chain instead of guessing — omit assignmentId for everything queued in your rooms, or pass one to ask about a specific item. The reason codes name the actual blocker: the writer you are waiting on, an overlapping write lease, each unmet dependency, or that you wrote the version you are being asked to check. The other kinds STOP THE WHOLE TASK, which is the heaviest thing you can do: every teammate is stood down, all open work is closed, and only the human can reopen it from the dashboard. needs-human is a decision or authorization only the owner can give; over-my-head means the work exceeds the model or effort you are running, so say what capability is needed; misrouted means this cannot correctly be done by you; external means something outside the project must change first. Finishing is NOT stopping — when the work is done, report it and pass a verdict. One bad assignment is not a task blocker either: report that assignment with status=blocked and the task keeps running.",
+    inputSchema: {
+      agentId: z.string().uuid(),
+      kind: z.enum(["why", "needs-human", "over-my-head", "misrouted", "external"]).default("why"),
+      taskId: z.string().uuid().optional().describe("Required to stop a task; optional with kind=why to narrow the answer to one room"),
+      reason: z.string().max(8000).optional().describe("Required to stop a task: what you need, concretely enough for the human to act on"),
+      assignmentId: z.string().uuid().optional().describe("kind=why: ask about one specific queued assignment"),
+    },
+  }, safe(async (args) => {
+    const { agentId, kind, taskId, reason, assignmentId } = args;
+    requireIdentity(agentId);
+    if (kind !== "why") {
+      if (!taskId) throw new Error(`kind=${kind} stops a task, so it needs taskId.`);
+      if (!reason) throw new Error(`kind=${kind} needs a reason the human can act on.`);
+      return store.blockTask({ agentId, taskId, reason, kind });
+    }
     store.heartbeat(agentId);
     if (!assignmentId) return withInbox(agentId, store.whyNoClaimableWork(agentId, taskId || null));
     // Authorize before computing: whyNotClaimable resolves write scopes on disk, and an unauthorized
@@ -555,220 +486,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
     return withInbox(agentId, store.whyNotClaimable(assignmentId, agentId));
   }));
 
-  server.registerTool("devteam_split", {
-    title: "Divide work that turned out too big",
-    description: "Claimed something and found it is three days of work, or two unrelated jobs wearing one title? Split it into pieces instead of grinding through it or reporting blocked. You keep your claim and your write lease throughout — splitting never costs you the work you are holding. Each piece inherits the parent's write scope (unless it declares its own), its dependencies and its targeting, and is re-assessed on its own merits so a runtime gate does not treat a small piece as if it were the whole. Where two pieces declare overlapping write paths, DevTeam orders them for you rather than letting them contend for a lease. Use this when the shape of the work is wrong, not when it is merely hard.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      assignmentId: z.string().uuid().describe("The assignment you currently hold"),
-      claimToken: z.string().max(200).optional().describe("Your claimToken, so a stale session cannot reshape work whose lease has moved"),
-      keepParent: z.boolean().default(false).describe("Keep holding the original — use when you are part-way through one piece and want to hand off the rest. Default closes it, since its work now lives in the pieces."),
-      parts: z.array(z.object({
-        title: z.string().min(1).max(160),
-        description: z.string().min(1).max(12000),
-        role: z.string().min(1).max(40).optional().describe("Defaults to the parent's role; see devteam_roles"),
-        requiresWrite: z.boolean().optional().describe("Defaults to the parent's setting"),
-        paths: z.array(z.string().max(500)).max(50).optional().describe("This piece's own write scope. Omit to inherit the parent's — never omit it expecting a narrower lease, you will get the parent's."),
-        dependsOnPart: z.number().int().min(0).max(11).optional().describe("Index of an earlier part in this list that must finish first"),
-      })).min(2).max(12).describe("At least two pieces. If the work is simply mis-scoped rather than too big, report it blocked instead."),
-    },
-  }, safe(async (args) => {
-    requireIdentity(args.agentId);
-    return withInbox(args.agentId, store.splitAssignment(args));
-  }));
-
-  server.registerTool("devteam_approve", {
-    title: "Approve current task version",
-    description: "Approve only after completing an independent read-only reviewer or tester assignment on the current version. Consensus accepts the task and keeps its agents assembled briefly for a same-conversation follow-up instead of disconnecting them.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      taskId: z.string().uuid(),
-      summary: z.string().min(1).max(8000),
-    },
-  }, safe(async (args) => {
-    requireIdentity(args.agentId);
-    return withInbox(args.agentId, store.approveTask(args));
-  }));
-
-  server.registerTool("devteam_reliability", {
-    title: "What the team has learned about its members",
-    description: "Rolling per-agent record: work completed, reports refused because a check DevTeam ran failed, work sent back for changes and how many rounds, regressions caused (only where a single agent is the sole suspect) and regressions caught. Use it to decide who to route work to, or to check your own record before claiming something critical. It is not a blame ledger — catching a regression counts for you, and an agent with little history is treated as trustworthy rather than punished for being new.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      taskId: z.string().uuid(),
-      agentName: z.string().max(80).optional().describe("One teammate by name; omit for the whole room"),
-      windowDays: z.number().int().min(1).max(365).default(30),
-    },
-  }, safe(async ({ agentId, taskId, agentName, windowDays }) => {
-    requireIdentity(agentId);
-    store.assertMembership(agentId, taskId);
-    return withInbox(agentId, agentName
-      ? { agent: store.agentReliability(agentName, { windowDays }) }
-      : { team: store.teamReliability({ windowDays }) });
-  }));
-
-  server.registerTool("devteam_regressions", {
-    title: "What is currently broken in this task",
-    description: "Checks that used to pass and now fail, with the work that landed since each was last green. Read this before assuming a failing check is your own fault: if a fix assignment is already queued for someone else, chasing it duplicates their work. Regressions close themselves when the check goes green again.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      taskId: z.string().uuid(),
-    },
-  }, safe(async ({ agentId, taskId }) => {
-    requireIdentity(agentId);
-    store.assertMembership(agentId, taskId);
-    return withInbox(agentId, {
-      regressions: store.openRegressions(taskId),
-      baseline: store.checkBaseline(taskId),
-    });
-  }));
-
-  server.registerTool("devteam_knowledge_write", {
-    title: "Record something you learned",
-    description: "Write a durable note into the project's knowledge vault. Use this the moment you learn a fact the *next* session would otherwise have to rediscover — an API rate limit, why an obvious approach does not work here, a convention the code follows but does not state, a pitfall that cost you an hour. This is not a progress update (use devteam_message) and not a decision the team voted on (use devteam_propose): it is a fact about the project. Link related notes inline with [[category/slug]] and they become navigable both ways. Notes you write are recorded as 'inferred', never 'verified' — verified means DevTeam observed it, not that you were confident.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      taskId: z.string().uuid(),
-      category: z.enum(["architecture", "decisions", "components", "conventions", "pitfalls", "workflows"])
-        .describe("architecture: how the system fits together. decisions: a choice and its reason. components: what one part does. conventions: a rule the project follows. pitfalls: something that will bite the next person. workflows: how a recurring job is done."),
-      title: z.string().min(1).max(200).describe("The fact as a short statement, not a topic — 'The billing API rate-limits at 30 requests/minute', not 'Billing API'"),
-      body: z.string().min(1).max(4000).describe("The fact itself, with enough context to act on. Use [[category/slug]] to link related notes."),
-      confidence: z.enum(["low", "medium", "high"]).default("medium").describe("How sure you are. Be honest: a low-confidence note is still worth recording and is ranked accordingly."),
-      relatedFiles: z.array(z.string().max(500)).max(20).default([]).describe("Project-relative files this fact concerns, so it goes stale when they change"),
-    },
-  }, safe(async (args) => {
-    requireIdentity(args.agentId);
-    return withInbox(args.agentId, store.knowledgeWrite(args));
-  }));
-
-  server.registerTool("devteam_knowledge_maintain", {
-    title: "Knowledge that needs attention",
-    description: "Notes nobody has confirmed in a long time, and notes flagged as contradicting each other. A fact does not become false by getting old, but an unconfirmed one is a weaker basis for acting — and DevTeam ranks it lower until someone checks it. Work this queue when the room is quiet: confirm what still holds with devteam_knowledge_confirm, write over what does not.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      taskId: z.string().uuid(),
-      olderThanDays: z.number().int().min(1).max(3650).default(90),
-      limit: z.number().int().min(1).max(100).default(20),
-    },
-  }, safe(async (args) => {
-    requireIdentity(args.agentId);
-    return withInbox(args.agentId, store.knowledgeMaintenance(args));
-  }));
-
-  server.registerTool("devteam_knowledge_confirm", {
-    title: "Confirm a knowledge note still holds",
-    description: "Say that a note is still true of the project as it stands now. This is the only thing that resets a note's age, so use it only after actually checking — re-reading a note is not confirmation.",
-    inputSchema: { agentId: z.string().uuid(), taskId: z.string().uuid(), noteId: z.string().min(1).max(64) },
-  }, safe(async (args) => {
-    requireIdentity(args.agentId);
-    return withInbox(args.agentId, store.knowledgeConfirm(args));
-  }));
-
-  server.registerTool("devteam_knowledge_dispute", {
-    title: "Flag two knowledge notes as contradicting each other",
-    description: "When two notes about the same subject cannot both be true, say so. Both drop to 'disputed' and stop being served in briefings until resolved — better a gap than confidently serving one of two contradictory facts. devteam_knowledge_write tells you about likely conflicts when you write a note; this is how you act on that.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      taskId: z.string().uuid(),
-      noteIds: z.array(z.string().min(1).max(64)).min(2).max(10),
-      reason: z.string().min(1).max(1000).describe("What the disagreement is"),
-    },
-  }, safe(async (args) => {
-    requireIdentity(args.agentId);
-    return withInbox(args.agentId, store.knowledgeDispute(args));
-  }));
-
-  server.registerTool("devteam_knowledge_share", {
-    title: "Offer a lesson to other projects",
-    description: "Mark a convention or pitfall as worth carrying to other projects on this server, or withdraw it. Only conventions and pitfalls can be shared: an architecture note or a decision is about this system in particular and cannot be true elsewhere. A note containing anything credential-shaped is refused. Read what others have shared with devteam_knowledge_borrowed.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      taskId: z.string().uuid(),
-      noteId: z.string().min(1).max(64),
-      shared: z.boolean().default(true),
-    },
-  }, safe(async (args) => {
-    requireIdentity(args.agentId);
-    return withInbox(args.agentId, store.knowledgeShare(args));
-  }));
-
-  server.registerTool("devteam_knowledge_borrowed", {
-    title: "Lessons other projects have shared",
-    description: "Conventions and pitfalls other projects on this server chose to share. Each says which project it came from. Confirm a borrowed lesson applies here before acting on it — it was learned somewhere else.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      taskId: z.string().uuid(),
-      query: z.string().max(200).default(""),
-      limit: z.number().int().min(1).max(50).default(10),
-    },
-  }, safe(async (args) => {
-    requireIdentity(args.agentId);
-    return withInbox(args.agentId, store.knowledgeShared(args));
-  }));
-
-  server.registerTool("devteam_knowledge_links", {
-    title: "See what references a knowledge note",
-    description: "What points at this note, and what it points at. Use it to judge whether a note is load-bearing before acting against it: a decision with six things referencing it is not one to quietly reverse. Note IDs come from devteam_knowledge results.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      taskId: z.string().uuid(),
-      noteId: z.string().min(1).max(64),
-    },
-  }, safe(async (args) => {
-    requireIdentity(args.agentId);
-    return withInbox(args.agentId, store.knowledgeLinks(args));
-  }));
-
-  server.registerTool("devteam_roles", {
-    title: "List the roles this project uses",
-    description: "The roles this project defines, and what each one means to the scheduler. A project sets these in .devteam/roles.json and may use its own vocabulary — `analyst`, `fact-checker`, `domain-expert`, `copy-editor` — rather than software job titles. Two behaviours matter: a role that `verifies` reads the work rather than changing it, so its assignments wait for pending writers and completing one earns the right to approve or request changes; a role that `plans` decides what the team does next. Read this before devteam_assign if you are creating work in a project you have not seen.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      taskId: z.string().uuid().describe("Any task in the project whose roles you want"),
-    },
-  }, safe(async ({ agentId, taskId }) => {
-    requireIdentity(agentId);
-    store.assertMembership(agentId, taskId);
-    const task = store.getTask(taskId);
-    if (!task) throw new Error("Task not found.");
-    return withInbox(agentId, store.roleCatalogue(task.project_id));
-  }));
-
-  server.registerTool("devteam_request_changes", {
-    title: "Send work back to its author for changes",
-    description: "Found problems in work you reviewed? Send that assignment back to whoever wrote it, with your findings attached, instead of approving it anyway or blocking the task. The original assignment is reopened and addressed to its author, keeping its title, checklist, write scope and history; the author is handed your findings when it re-claims. Approvals on the current version are cleared, because the version you were reviewing is no longer settled. This does not stop the task and does not touch anyone else's claim. Requires the same standing as approving: a completed or in-progress read-only reviewer or tester assignment on the current version.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      taskId: z.string().uuid(),
-      assignmentId: z.string().uuid().describe("The completed assignment that needs changes — the author's work, not your own review assignment"),
-      summary: z.string().min(1).max(4000).describe("One line on why this is going back"),
-      findings: z.array(z.union([
-        z.string().max(2000).describe("One thing that must change"),
-        z.object({
-          detail: z.string().min(1).max(2000).describe("What must change and why"),
-          path: z.string().max(500).optional().describe("The project-relative file it concerns, when it concerns one"),
-        }),
-      ])).max(50).default([]).describe("The specific changes required. The author is handed this list on re-claim, so be concrete."),
-    },
-  }, safe(async (args) => {
-    requireIdentity(args.agentId);
-    return withInbox(args.agentId, store.requestChanges(args));
-  }));
-
-  server.registerTool("devteam_block", {
-    title: "Block a task",
-    description: "Stop the task when human input, authorization, or an external state change is genuinely required. Blocking disconnects assigned agents.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      taskId: z.string().uuid(),
-      reason: z.string().min(1).max(8000),
-    },
-  }, safe(async (args) => {
-    requireIdentity(args.agentId);
-    return store.blockTask(args);
-  }));
-
-  server.registerTool("devteam_disconnect", {
+  server.registerTool("devteam_leave", {
     title: "Disconnect from DevTeam",
     description: "End this desktop agent session after work is finished, blocked, or no longer needed.",
     inputSchema: {

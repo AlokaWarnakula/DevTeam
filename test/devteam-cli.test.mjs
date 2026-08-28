@@ -14,7 +14,7 @@ test("sync-skill copies the packaged skill into a destination folder", async (t)
   const copied = await readFile(path.join(dest, "SKILL.md"), "utf8");
   const source = await readFile(path.join(packagedSkillDir(), "SKILL.md"), "utf8");
   assert.equal(copied, source, "the destination skill matches the packaged source");
-  assert.match(copied, /Stay responsive: the wait loop/, "the current responsive-loop skill was copied");
+  assert.match(copied, /## The nine verbs/, "the current nine-verb skill was copied, not a stale one");
 });
 
 test("skillStatus reports whether a source skill exists", () => {

@@ -54,7 +54,11 @@ test("automatic knowledge vault exports safe Obsidian notes and feeds task brief
   assert.ok(detail.knowledge.length >= 3);
   const brief = store.taskBrief(agent.id, task.id);
   assert.ok(brief.projectKnowledge.length >= 3);
-  assert.ok(brief.projectKnowledge.every((note) => note.body.length <= 1_300));
+  // Only the leading notes carry a body; the rest are a headline and a wikilink, so the brief can
+  // surface many more of them for the same bytes. Every note must still say what it claims.
+  assert.ok(brief.projectKnowledge.every((note) => note.headline && note.headline.length <= 220));
+  assert.ok(brief.projectKnowledge.every((note) => note.body === undefined || note.body.length <= 1_300));
+  assert.ok(brief.projectKnowledge.some((note) => note.body), "the most relevant notes still arrive in full");
   const search = store.knowledgeSearch({ agentId: agent.id, taskId: task.id, query: "serialized", category: "decisions" });
   assert.equal(search.automated, true);
   assert.equal(search.notes.length, 1);
@@ -283,7 +287,7 @@ test("a claim carries a fencing token; a stale report is refused with a structur
   const conflict = await store.completeAssignment({ agentId: planner.id, assignmentId: write.id, message: "Too late.", claimToken: claim.claimToken });
   assert.equal(conflict.completed, false, "a report against a lease that moved on is refused");
   assert.ok(conflict.claimConflict, "and the refusal is structured");
-  assert.match(conflict.claimConflict.nextAction, /devteam_wait|devteam_resume/);
+  assert.match(conflict.claimConflict.nextAction, /devteam_next|devteam_join/);
 
   // A fresh claim gets a new token and generation and can complete normally.
   const reclaim = store.claimNextAssignment(planner.id);
@@ -1120,21 +1124,65 @@ test("the author of a version cannot approve it when a teammate could review ins
   const bob = store.connectAgent({ name: "Bob", provider: "test", freshTaskId: task.id });
   const plan = store.claimNextAssignment(planner.id);
   store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Build", description: "Implement it.", role: "implementer", requiresWrite: true, targetAgentName: "Alice" });
-  store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Alice review", description: "Review current version.", role: "reviewer", targetAgentName: "Alice" });
-  store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Bob review", description: "Independent review.", role: "reviewer", targetAgentName: "Bob" });
+  const review = store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Review", description: "Review the current version.", role: "reviewer" });
   await store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Planned." });
 
   const build = store.claimNextAssignment(alice.id);
   await store.completeAssignment({ agentId: alice.id, assignmentId: build.id, message: "Implemented.", changedFiles: ["package.json"] });
-  const aliceReview = store.claimNextAssignment(alice.id);
-  await store.completeAssignment({ agentId: alice.id, assignmentId: aliceReview.id, message: "Self review." });
-  assert.throws(() => store.approveTask({ agentId: alice.id, taskId: task.id, summary: "I approve my own change." }), /author of the current version cannot approve/);
 
+  // The author is never handed the review of its own version. Refusing this at approval time alone
+  // meant Alice claimed the review, read the whole diff, and only then found the one exit was to
+  // block the assignment — which is what real sessions did, repeatedly.
+  assert.equal(store.claimNextAssignment(alice.id), null, "the author is not handed a review of its own version");
+  const aliceChain = store.whyNotClaimable(review.id, alice.id);
+  assert.ok(aliceChain.reasons.some((reason) => reason.code === "verifier_is_author" && reason.blocking),
+    "and it is told plainly why, instead of finding out after the work is done");
   const bobReview = store.claimNextAssignment(bob.id);
+  assert.equal(bobReview.id, review.id, "the independent teammate is handed exactly that review");
   await store.completeAssignment({ agentId: bob.id, assignmentId: bobReview.id, message: "Independent review passed." });
+
+  // Refusing the claim moves the author's stop one gate earlier: it can no longer complete a
+  // read-only review of its own version at all, so it now fails for want of review evidence rather
+  // than at the self-approval check. That check stays in approveTask as defence in depth for any
+  // path that does not come through the queue — it is simply no longer what fires here.
+  assert.throws(() => store.approveTask({ agentId: alice.id, taskId: task.id, summary: "I approve my own change." }),
+    /Approval requires a completed, read-only reviewer or tester assignment/);
   const outcome = store.approveTask({ agentId: bob.id, taskId: task.id, summary: "Independently reviewed." });
   assert.equal(outcome.accepted, true, "an independent teammate can approve");
   assert.equal(outcome.selfReviewed, false, "and it is not labeled self-reviewed");
+});
+
+test("refusing the author a review of its own work never leaves that review unclaimable", async (t) => {
+  // The rule is "somebody else could actually take this", not "an independent teammate exists". A
+  // teammate who is connected but cannot claim — or who has left — must not hold a review hostage on
+  // the board forever. The randomized scheduler suite found exactly this deadlock on seed 18 the
+  // first time the rule was written the naive way; this pins the case down where it can be read.
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-no-deadend-"));
+  const store = new DevTeamStore(dataDir);
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Solo again project", process.cwd());
+  const task = store.createTask({ projectId: project.id, title: "Author is left alone", description: "The reviewer goes home.", requiredApprovals: 1 });
+  const planner = store.connectAgent({ name: "Planner", provider: "test", freshTaskId: task.id });
+  const alice = store.connectAgent({ name: "Alice", provider: "test", freshTaskId: task.id });
+  const bob = store.connectAgent({ name: "Bob", provider: "test", freshTaskId: task.id });
+  const plan = store.claimNextAssignment(planner.id);
+  store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Build", description: "Implement it.", role: "implementer", requiresWrite: true, targetAgentName: "Alice" });
+  const review = store.createAssignment({ agentId: planner.id, taskId: task.id, title: "Review", description: "Review the current version.", role: "reviewer" });
+  await store.completeAssignment({ agentId: planner.id, assignmentId: plan.id, message: "Planned." });
+
+  const build = store.claimNextAssignment(alice.id);
+  await store.completeAssignment({ agentId: alice.id, assignmentId: build.id, message: "Implemented.", changedFiles: ["package.json"] });
+  assert.equal(store.claimNextAssignment(alice.id), null, "while Bob is here, Alice may not review her own work");
+
+  store.disconnectAgent(bob.id, "Going home.");
+  store.disconnectAgent(planner.id, "Going home.");
+
+  const aliceReview = store.claimNextAssignment(alice.id);
+  assert.equal(aliceReview?.id, review.id, "with nobody else able to take it, the review is handed back rather than stranded");
+  await store.completeAssignment({ agentId: alice.id, assignmentId: aliceReview.id, message: "Self review, honestly labeled." });
+  const outcome = store.approveTask({ agentId: alice.id, taskId: task.id, summary: "Solo run." });
+  assert.equal(outcome.accepted, true, "a genuine solo run still finishes");
+  assert.equal(outcome.selfReviewed, true, "and it is labeled selfReviewed rather than passed off as consensus");
 });
 
 test("a disconnected historical teammate cannot dead-end the remaining solo author", async (t) => {
@@ -1421,7 +1469,7 @@ test("a plain reconnect replays messages missed while the agent was disconnected
   // The human keeps talking to the (now absent) agent.
   store.humanMessage(task.id, "Please pick this up when you return.", "all");
 
-  // A fresh session for the same identity reconnects — no resume token, plain devteam_connect.
+  // A fresh session for the same identity reconnects — no resume token, a plain devteam_join.
   const second = store.connectAgent({ name: "Claude", provider: "Anthropic", freshTaskId: task.id });
   const inbox = store.deliverDirectedMessages(second.id);
   assert.ok(inbox.some((m) => /pick this up/.test(m.message)), "the message sent while away replays on a plain reconnect");
@@ -1693,8 +1741,15 @@ test("updateProject renames a project and repoints its root with validation", as
 test("workspaceSearch spans tasks, timeline messages, assignments, and knowledge safely", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-workspace-search-"));
   const store = new DevTeamStore(dataDir, { knowledge: { enabled: true } });
-  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
-  const project = store.ensureProject("Search project", process.cwd());
+  // A real directory of its own, never process.cwd(): a knowledge-enabled store exports a vault into
+  // its project root, and pointing one at the repository is what deleted this project's own notes.
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "devteam-search-project-"));
+  t.after(async () => {
+    store.close();
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  });
+  const project = store.ensureProject("Search project", projectRoot);
   const task = store.createTask({ projectId: project.id, title: "Searchable nebula task", description: "Investigate a quartz boundary." });
   const otherRoot = await mkdtemp(path.join(os.tmpdir(), "devteam-search-other-"));
   t.after(async () => { await rm(otherRoot, { recursive: true, force: true }); });
@@ -2249,117 +2304,95 @@ async function splitFixture(t) {
   return { store, project, task, agent, big, claim };
 }
 
-test("an agent can divide work that turned out too big, without losing its lease", async (t) => {
-  const { store, task, agent, big, claim } = await splitFixture(t);
-  const before = store.db.prepare("SELECT claim_generation FROM assignments WHERE id = ?").get(big.id).claim_generation;
+test("a finished task cannot be closed by blocking it", async (t) => {
+  // Six task.blocked events on the live board read "Done", "done", "because all work is done".
+  // Blocking stands every teammate down and only the human can undo it, so a task closed that way
+  // has to be reopened purely to be accepted. The kind is what separates the meanings.
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-block-kind-"));
+  const store = new DevTeamStore(dataDir);
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Block kinds", process.cwd());
+  const task = store.createTask({ projectId: project.id, title: "Everything is finished", description: "Nothing is open." });
+  const agent = store.connectAgent({ name: "Claude", provider: "test", freshTaskId: task.id });
+  const plan = store.claimNextAssignment(agent.id);
+  await store.completeAssignment({ agentId: agent.id, assignmentId: plan.id, message: "Planned and finished." });
 
-  const result = store.splitAssignment({
-    agentId: agent.id, assignmentId: big.id, claimToken: claim.claimToken, keepParent: true,
-    parts: [
-      { title: "Rewrite the parser", description: "Just the parsing.", paths: ["src/import/parse.mjs"] },
-      { title: "Rewrite the writer", description: "Just the writing.", paths: ["src/import/write.mjs"] },
-      { title: "Review the rewrite", description: "Read it all.", role: "reviewer", requiresWrite: false },
-    ],
-  });
-  assert.equal(result.split, true);
-  assert.equal(result.parts.length, 3);
-  assert.equal(result.parentKept, true);
+  assert.throws(() => store.blockTask({ agentId: agent.id, taskId: task.id, reason: "Done", kind: "over-my-head" }),
+    /Finishing is not blocking/);
+  assert.throws(() => store.blockTask({ agentId: agent.id, taskId: task.id, reason: "done", kind: "external" }),
+    /no work in flight/);
+  assert.throws(() => store.blockTask({ agentId: agent.id, taskId: task.id, reason: "done", kind: "finished" }),
+    /is not a kind of blocker/);
+  assert.equal(store.getTask(task.id).status, "review", "and none of those refusals closed the task");
 
-  // The lease is untouched — an agent that had to give up its claim to reorganise would not do it.
-  const parent = store.db.prepare("SELECT status, agent_id, claim_generation FROM assignments WHERE id = ?").get(big.id);
-  assert.equal(parent.status, "claimed");
-  assert.equal(parent.agent_id, agent.id);
-  assert.equal(parent.claim_generation, before, "splitting does not bump the generation, so the claim token still works");
-
-  // Each piece has its own scope, and the read-only one takes no lease.
-  const detail = store.taskDetail(task.id);
-  const parse = detail.assignments.find((item) => item.title === "Rewrite the parser");
-  assert.deepEqual(parse.writeScope, ["src/import/parse.mjs"]);
-  const review = detail.assignments.find((item) => item.title === "Review the rewrite");
-  assert.equal(review.requires_write, 0);
-  assert.equal(review.verifies, 1, "a piece can change role, and its behaviour follows");
-
-  // Each is re-assessed on its own merits rather than inheriting the whole job's assessment.
-  assert.ok(result.parts.every((part) => part.assessment), "every piece is assessed in its own right");
-
-  // The split is on the timeline as one event that names the pieces.
-  const splitEvent = detail.events.find((event) => event.type === "assignment.split");
-  assert.ok(splitEvent);
-  assert.equal(splitEvent.metadata.parts.length, 3);
-
-  // The agent can still report the work it is holding.
-  const reported = await store.completeAssignment({
-    agentId: agent.id, assignmentId: big.id, claimToken: claim.claimToken,
-    message: "Did the groundwork; the pieces are queued.", changedFiles: ["src/import/shared.mjs"],
-  });
-  assert.equal(reported.completed, true);
+  // Genuine escalation is still allowed on an empty board: needing the human is not a claim that
+  // work is in flight.
+  const blocked = store.blockTask({ agentId: agent.id, taskId: task.id, reason: "Only you can approve the spend.", kind: "needs-human" });
+  assert.equal(blocked.kind, "needs-human");
+  assert.equal(store.blockedRecovery(task.id).kind, "needs-human", "the kind reaches the recovery banner the human reads");
 });
 
-test("pieces inherit scope, dependencies and targeting, and overlapping writers are ordered", async (t) => {
-  const { store, task, agent, big, claim } = await splitFixture(t);
-  // Give the parent a prerequisite and a target, so inheritance is observable.
-  const prerequisite = store.createAssignment({ taskId: task.id, title: "Groundwork", description: "First.", role: "implementer" });
-  store.db.prepare("INSERT INTO assignment_dependencies (assignment_id, depends_on_assignment_id) VALUES (?, ?)").run(big.id, prerequisite.id);
-  store.db.prepare("UPDATE assignments SET target_agent_name = 'Splitter' WHERE id = ?").run(big.id);
+test("a blocker on work in flight records which kind it was", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-block-inflight-"));
+  const store = new DevTeamStore(dataDir);
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Block in flight", process.cwd());
+  const task = store.createTask({ projectId: project.id, title: "Work is open", description: "Something is queued." });
+  const agent = store.connectAgent({ name: "Claude", provider: "test", freshTaskId: task.id });
+  const plan = store.claimNextAssignment(agent.id);
+  store.createAssignment({ agentId: agent.id, taskId: task.id, title: "Build", description: "Implement it.", role: "implementer", requiresWrite: true });
+  await store.completeAssignment({ agentId: agent.id, assignmentId: plan.id, message: "Planned." });
 
-  const result = store.splitAssignment({
-    agentId: agent.id, assignmentId: big.id, claimToken: claim.claimToken,
-    parts: [
-      { title: "First half", description: "Touches the shared file.", paths: ["src/import/shared.mjs"] },
-      { title: "Second half", description: "Also touches the shared file.", paths: ["src/import/shared.mjs"] },
-      { title: "Unscoped piece", description: "Declares nothing." },
-    ],
-  });
-
-  const detail = store.taskDetail(task.id);
-  const first = detail.assignments.find((item) => item.title === "First half");
-  const second = detail.assignments.find((item) => item.title === "Second half");
-  const unscoped = detail.assignments.find((item) => item.title === "Unscoped piece");
-
-  assert.equal(first.target_agent_name, "Splitter", "targeted work stays addressed to its teammate when subdivided");
-  assert.ok(first.dependsOn.includes(prerequisite.id), "a prerequisite of the whole is a prerequisite of each piece");
-  assert.deepEqual(unscoped.writeScope, ["src/import"], "a piece that declares no paths inherits the parent's, never a whole-project lease");
-
-  // Writers on overlapping paths would otherwise contend for a lease, one sitting blocked with no
-  // stated reason. The ordering is inferred and explicit instead — and note the unscoped piece
-  // inherited `src/import`, which contains both halves, so it overlaps them too: three edges across
-  // three writers, each pointing from the later part to the earlier one.
-  assert.equal(result.inferredOrder.length, 3);
-  assert.deepEqual(result.inferredOrder[0], { after: "Second half", before: "First half" });
-  assert.ok(result.inferredOrder.every((edge) => edge.after !== edge.before));
-  assert.ok(second.dependsOn.includes(first.id));
-  assert.ok(unscoped.dependsOn.includes(first.id), "a parent-scoped piece is ordered after the narrower ones it contains");
-  assert.equal(store.whyNotClaimable(second.id, agent.id).reasons.some((reason) => reason.code === "dependency_pending"), true);
-
-  // The parent closed by default, and its work now lives in the pieces.
-  assert.equal(store.db.prepare("SELECT status FROM assignments WHERE id = ?").get(big.id).status, "done");
-  assert.equal(result.parentKept, false);
+  const blocked = store.blockTask({ agentId: agent.id, taskId: task.id, reason: "This needs a frontier model to do safely.", kind: "over-my-head" });
+  assert.equal(blocked.kind, "over-my-head");
+  const recovery = store.blockedRecovery(task.id);
+  assert.equal(recovery.kind, "over-my-head");
+  assert.equal(recovery.strandedAssignments, 1, "the open work is stranded and counted, as before");
 });
 
-test("only the live claim holder can reshape work, and a split needs real pieces", async (t) => {
-  const { store, task, agent, big, claim } = await splitFixture(t);
-  const other = store.connectAgent({ name: "Someone else", provider: "test", freshTaskId: task.id });
+test("a task blocked to mean “finished” can be closed without replanning it", async (t) => {
+  // Six task.blocked events on the live board read "Done", "done", "because all work is done".
+  // Accepting was refused for anything blocked, so closing already-finished work meant Resume —
+  // version bumped, approvals cleared, a fresh planning assignment queued — to replan work that was
+  // already done. Twenty tasks sat blocked with three resumes ever recorded.
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-accept-blocked-"));
+  const store = new DevTeamStore(dataDir);
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Accept blocked", process.cwd());
+  const task = store.createTask({ projectId: project.id, title: "Everything shipped", description: "Nothing left open." });
+  const agent = store.connectAgent({ name: "Claude", provider: "test", freshTaskId: task.id });
+  const plan = store.claimNextAssignment(agent.id);
+  await store.completeAssignment({ agentId: agent.id, assignmentId: plan.id, message: "Planned and delivered." });
+  store.blockTask({ agentId: agent.id, taskId: task.id, reason: "Needs your sign-off before I close it.", kind: "needs-human" });
+  assert.equal(store.getTask(task.id).status, "blocked");
 
-  const stale = store.splitAssignment({
-    agentId: agent.id, assignmentId: big.id, claimToken: "not-the-right-token",
-    parts: [{ title: "A", description: "a" }, { title: "B", description: "b" }],
-  });
-  assert.equal(stale.split ?? undefined, undefined);
-  assert.ok(stale.claimConflict, "a stale session cannot reshape work whose lease has moved");
+  const accepted = store.acceptTaskByHuman({ taskId: task.id, summary: "Checked it; this was finished." });
+  assert.equal(accepted.accepted, true);
+  assert.equal(store.getTask(task.id).status, "accepted", "closed in place — same task, same timeline, no replan");
+  const event = store.db.prepare("SELECT metadata FROM events WHERE task_id = ? AND type = 'task.accepted' ORDER BY id DESC LIMIT 1").get(task.id);
+  const metadata = JSON.parse(event.metadata);
+  assert.equal(metadata.acceptedFromBlocked, true, "the ledger records that it was closed out of blocked");
+  assert.equal(metadata.strandedAssignments, 0);
+});
 
-  const notMine = store.splitAssignment({
-    agentId: other.id, assignmentId: big.id,
-    parts: [{ title: "A", description: "a" }, { title: "B", description: "b" }],
-  });
-  assert.ok(notMine.claimConflict, "nor can a teammate who does not hold it");
+test("closing a blocked task that still had work in flight takes a second, explicit yes", async (t) => {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-accept-stranded-"));
+  const store = new DevTeamStore(dataDir);
+  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const project = store.ensureProject("Accept stranded", process.cwd());
+  const task = store.createTask({ projectId: project.id, title: "Stopped midway", description: "Real work was open." });
+  const agent = store.connectAgent({ name: "Claude", provider: "test", freshTaskId: task.id });
+  const plan = store.claimNextAssignment(agent.id);
+  store.createAssignment({ agentId: agent.id, taskId: task.id, title: "Build", description: "Implement it.", role: "implementer", requiresWrite: true });
+  await store.completeAssignment({ agentId: agent.id, assignmentId: plan.id, message: "Planned." });
+  store.blockTask({ agentId: agent.id, taskId: task.id, reason: "Needs a key only you have.", kind: "needs-human" });
 
-  assert.throws(() => store.splitAssignment({
-    agentId: agent.id, assignmentId: big.id, claimToken: claim.claimToken,
-    parts: [{ title: "Only one", description: "Not a split." }],
-  }), /at least two parts/i, "a one-part split is a re-scope, and there is a better tool for that");
+  assert.throws(() => store.acceptTaskByHuman({ taskId: task.id, summary: "Close it." }),
+    /1 assignment still in flight/, "unfinished work is never quietly buried by an acceptance");
+  assert.equal(store.getTask(task.id).status, "blocked", "and the refusal changed nothing");
 
-  assert.throws(() => store.splitAssignment({
-    agentId: agent.id, assignmentId: big.id, claimToken: claim.claimToken,
-    parts: [{ title: "", description: "no title" }, { title: "B", description: "" }],
-  }), /at least two parts/i);
+  const accepted = store.acceptTaskByHuman({ taskId: task.id, summary: "Closing it; that work is no longer wanted.", acceptStranded: true });
+  assert.equal(accepted.accepted, true, "but the human can still say so deliberately");
+  const metadata = JSON.parse(store.db.prepare("SELECT metadata FROM events WHERE task_id = ? AND type = 'task.accepted' ORDER BY id DESC LIMIT 1").get(task.id).metadata);
+  assert.equal(metadata.strandedAssignments, 1, "and how much was left unfinished is on the record");
 });

@@ -9,7 +9,6 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { DevTeamStore } from "./store.mjs";
 import { createDevTeamMcpServer } from "./mcp.mjs";
-import { ManagedRuntimeSupervisor } from "./runtime/managed.mjs";
 import { normalizeRuntimeProfile, resolveRuntimeRequirement } from "./runtime/index.mjs";
 import {
   checkExposureRequirements,
@@ -75,7 +74,6 @@ export async function startDevTeamServer({
   knowledge = { enabled: true },
   codegraph = { enabled: true },
   checkpoint = {},
-  managed = {},
 } = {}) {
   if (!dataDir) throw new Error("dataDir is required.");
   // T4.1 — the one place DevTeam declines to start. A server reachable from the network whose
@@ -87,7 +85,6 @@ export async function startDevTeamServer({
   // An operator-supplied token replaces the generated one, so what authenticates is the secret they
   // chose rather than a string sitting in the data directory.
   if (process.env.DEVTEAM_TOKEN) store.setSharedToken(process.env.DEVTEAM_TOKEN);
-  const supervisor = new ManagedRuntimeSupervisor(managed);
   const attachmentRoot = path.resolve(dataDir, "attachments");
   const root = requireDirectory(workspaceRoot);
   store.ensureProject(path.basename(root), root);
@@ -249,20 +246,6 @@ export async function startDevTeamServer({
   // T4.1 — named credentials. One shared token is right for one person on one machine; the moment
   // more than one party is involved, a credential you cannot revoke without re-keying everybody is
   // the problem. The plaintext is returned once here and never again — the server keeps only a hash.
-  app.get("/api/tokens", requireControlAuth, (req, res) => res.json({
-    mode,
-    sharedTokenInUse: true,
-    tokens: store.accessTokens(),
-  }));
-  app.post("/api/tokens", requireControlAuth, (req, res) => {
-    requireFields(req.body, ["label"]);
-    const minted = store.mintAccessToken({ label: req.body.label });
-    res.json({
-      ...minted,
-      note: "Copy this now: DevTeam stores only a hash of it and cannot show it again.",
-    });
-  });
-  app.delete("/api/tokens/:id", requireControlAuth, (req, res) => res.json(store.revokeAccessToken(req.params.id)));
   app.get("/api/state", (req, res) => {
     const taskId = Object.hasOwn(req.query, "taskId") ? req.query.taskId || null : undefined;
     const snapshot = store.snapshot(taskId);
@@ -342,16 +325,6 @@ export async function startDevTeamServer({
     requireFields(req.body, ["title", "description"]);
     res.status(201).json(store.createAssignment({ ...req.body, taskId: req.params.taskId }));
   });
-  app.get("/api/agents/:agentId/runtime", requireControlAuth, (req, res) => {
-    res.json({ agentId: req.params.agentId, runtimeProfile: store.runtimeProfile(req.params.agentId) });
-  });
-  app.put("/api/agents/:agentId/runtime", (req, res) => {
-    res.json({ updated: true, runtimeProfile: store.updateRuntimeProfile({
-      agentId: req.params.agentId,
-      profile: userRuntimeProfile(req.body?.profile || req.body),
-      force: true,
-    }) });
-  });
   app.get("/api/assignments/:assignmentId/assessment", requireControlAuth, (req, res) => {
     res.json(store.assignmentAssessment({ assignmentId: req.params.assignmentId }));
   });
@@ -391,85 +364,6 @@ export async function startDevTeamServer({
   });
   app.patch("/api/assignments/:assignmentId/complexity", (req, res) => {
     res.json(store.setAssignmentComplexityOverride({ assignmentId: req.params.assignmentId, override: req.body?.override ?? req.body ?? null }));
-  });
-  app.post("/api/assignments/:assignmentId/runtime-decisions", (req, res) => {
-    requireFields(req.body, ["choice"]);
-    res.status(201).json(store.runtimeDecision({
-      agentId: typeof req.body?.agentId === "string" ? req.body.agentId : null,
-      assignmentId: req.params.assignmentId,
-      assessmentId: typeof req.body?.assessmentId === "string" ? req.body.assessmentId : null,
-      choice: req.body.choice,
-      actor: "human",
-      reason: req.body?.reason || "Human runtime decision from the dashboard.",
-      humanApproved: req.body?.humanApproved === true,
-    }));
-  });
-  app.post("/api/tasks/:taskId/managed-launch", asyncRoute(async (req, res) => {
-    requireFields(req.body, ["agentId", "assignmentId", "adapterId", "modelId", "effortId"]);
-    const task = store.getTask(req.params.taskId);
-    if (!task) return res.status(404).json({ error: "Task not found." });
-    const assignment = store.db.prepare("SELECT * FROM assignments WHERE id = ? AND task_id = ?").get(req.body.assignmentId, task.id);
-    if (!assignment) throw new Error("Assignment does not belong to this task.");
-    const profile = store.runtimeProfile(req.body.agentId);
-    if (profile?.switchMode !== "automatic") throw new Error("This session did not advertise an automatic managed switch mode.");
-    const assessment = store.assignmentAssessment({ assignmentId: assignment.id });
-    if (assessment.requirements.humanApprovalRequired && req.body?.humanApproved !== true) throw new Error("Exceptional managed settings require explicit human approval.");
-    const advertisedModel = profile.availableModels.find((model) => model.id === req.body.modelId);
-    const advertisedEffort = advertisedModel?.efforts.find((effort) => effort.id === req.body.effortId);
-    if (!advertisedModel || !advertisedEffort) throw new Error("Managed selection must exactly match the host-advertised profile.");
-    const selectedProfile = { ...profile, currentModel: advertisedModel.id, currentEffort: advertisedEffort.id, currentModelClass: advertisedModel.class, currentEffortClass: advertisedEffort.class };
-    if (!resolveRuntimeRequirement(assessment.requirements, selectedProfile).satisfied) throw new Error("The selected managed runtime does not satisfy the current assessment.");
-    const checkpointResult = await store.createSessionCheckpoint({ agentId: req.body.agentId, taskId: task.id, assignmentId: assignment.id, nextAction: "Managed runner should connect and take over this checkpoint." });
-    const invitation = checkpointInvitation(task, checkpointResult);
-    try {
-      const launched = await supervisor.launch({
-        adapterId: req.body.adapterId,
-        selection: { modelId: advertisedModel.id, effortId: advertisedEffort.id },
-        taskInvite: invitation,
-        projectRoot: task.project_root,
-        env: { DEVTEAM_MCP_URL: `${req.protocol}://${req.get("host")}/mcp`, DEVTEAM_TOKEN: store.token },
-      });
-      store.recordManagedLaunch({ taskId: task.id, agentId: req.body.agentId, adapterId: req.body.adapterId, pid: launched.pid, status: "launched", message: "An opt-in managed runner launched; the old claim remains until checkpoint takeover succeeds." });
-      res.status(201).json({ launched: true, pid: launched.pid, adapterId: launched.adapterId, checkpoint: checkpointResult.checkpoint, invitation });
-    } catch (error) {
-      store.cancelSessionCheckpoint({ agentId: req.body.agentId, taskId: task.id, checkpointId: checkpointResult.checkpoint.id, reason: "Managed launch failed; the old claim was kept." });
-      store.recordManagedLaunch({ taskId: task.id, agentId: req.body.agentId, adapterId: req.body.adapterId, status: "failed", message: `Managed launch failed: ${error.message}. The old claim was kept.` });
-      throw error;
-    }
-  }));
-  app.post("/api/tasks/:taskId/checkpoints", asyncRoute(async (req, res) => {
-    const task = store.getTask(req.params.taskId);
-    if (!task) return res.status(404).json({ error: "Task not found." });
-    const assignmentId = typeof req.body?.assignmentId === "string" ? req.body.assignmentId : null;
-    const assignment = assignmentId
-      ? store.db.prepare("SELECT * FROM assignments WHERE id = ? AND task_id = ?").get(assignmentId, task.id)
-      : null;
-    if (assignmentId && !assignment) throw new Error("The assignment does not belong to this task.");
-    const fromAgentId = assignment?.agent_id || (typeof req.body?.fromAgentId === "string" ? req.body.fromAgentId : null);
-    if (!fromAgentId) throw new Error("Choose an active agent or claimed assignment to checkpoint.");
-    const expiresInMinutes = Math.max(1, Math.min(1440, Number(req.body?.expiresInMinutes) || 30));
-    const result = await store.createSessionCheckpoint({
-      agentId: fromAgentId,
-      taskId: task.id,
-      assignmentId,
-      decisions: req.body?.decisions,
-      blockers: req.body?.blockers,
-      checks: req.body?.checks,
-      failedApproaches: req.body?.failedApproaches,
-      nextAction: req.body?.nextAction,
-      expiresInMs: expiresInMinutes * 60_000,
-    });
-    res.status(201).json({ ...result, invitation: checkpointInvitation(task, result) });
-  }));
-  app.get("/api/tasks/:taskId/checkpoints/:checkpointId", requireControlAuth, (req, res) => {
-    res.json(store.sessionCheckpointGet({ taskId: req.params.taskId, checkpointId: req.params.checkpointId }));
-  });
-  app.post("/api/tasks/:taskId/checkpoints/:checkpointId/cancel", (req, res) => {
-    res.json(store.cancelSessionCheckpoint({
-      taskId: req.params.taskId,
-      checkpointId: req.params.checkpointId,
-      reason: req.body?.reason || "Human cancelled session rotation from the dashboard.",
-    }));
   });
   app.post("/api/tasks/:taskId/messages", (req, res) => {
     requireFields(req.body, ["message"]);
@@ -537,13 +431,6 @@ export async function startDevTeamServer({
   app.post("/api/tasks/:taskId/assignments/:assignmentId/cancel", (req, res) => {
     res.json(store.requestCancel({ taskId: req.params.taskId, assignmentId: req.params.assignmentId, reason: req.body?.reason }));
   });
-  app.post("/api/tasks/:taskId/budget", (req, res) => {
-    res.json(store.setTaskBudget({
-      taskId: req.params.taskId,
-      wallClockMinutes: req.body?.wallClockMinutes ?? null,
-      spendUsd: req.body?.spendUsd ?? null,
-    }));
-  });
   // T4.3 — the whole task as a narrative, for when something went wrong and the question is where.
   app.get("/api/tasks/:taskId/replay", (req, res) => {
     const replay = store.taskReplay(req.params.taskId, { limit: Number(req.query.limit) || 1000 });
@@ -564,7 +451,9 @@ export async function startDevTeamServer({
   });
   app.post("/api/tasks/:taskId/accept", (req, res) => {
     requireFields(req.body, ["summary"]);
-    res.json(store.acceptTaskByHuman({ taskId: req.params.taskId, summary: req.body.summary }));
+    res.json(store.acceptTaskByHuman({
+      taskId: req.params.taskId, summary: req.body.summary, acceptStranded: req.body.acceptStranded === true,
+    }));
   });
   app.delete("/api/agents/:agentId", (req, res) => {
     res.json(store.forgetAgent(req.params.agentId, { force: req.body?.force === true }));
@@ -631,7 +520,6 @@ export async function startDevTeamServer({
     mcpUrl: `${url}/mcp`,
     async close() {
       clearInterval(reaper);
-      supervisor.stopAll();
       await Promise.allSettled([...transports.values()].map((transport) => transport.close()));
       await new Promise((resolve, reject) => httpServer.close((error) => error ? reject(error) : resolve()));
       store.close();
