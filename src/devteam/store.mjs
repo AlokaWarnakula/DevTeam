@@ -618,22 +618,6 @@ export class DevTeamStore extends EventEmitter {
       );
       CREATE INDEX IF NOT EXISTS idx_check_regressions_task ON check_regressions(task_id, created_at DESC);
 
-      -- T4.2: what an assignment cost, as the agent reported it. Agent-asserted by nature — DevTeam
-      -- cannot observe another process's token use — and labeled that way everywhere it surfaces.
-      CREATE TABLE IF NOT EXISTS assignment_usage (
-        id TEXT PRIMARY KEY,
-        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-        assignment_id TEXT,
-        agent_id TEXT,
-        agent_name TEXT,
-        model TEXT,
-        input_tokens INTEGER,
-        output_tokens INTEGER,
-        cost_cents INTEGER,
-        created_at TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS idx_assignment_usage_task ON assignment_usage(task_id, created_at DESC);
-
       -- T0.4: work that outlives the call which started it.
       --
       -- Verified checks run off the event loop, so a report can be minutes in flight. Before this
@@ -4154,7 +4138,6 @@ export class DevTeamStore extends EventEmitter {
       for (const extra of rest) lines.push(`  > ${extra.slice(0, 300)}`);
     }
 
-    const usage = this.taskUsage(taskId);
     const regressions = this.openRegressions(taskId);
     lines.push("", "---", "", "## Where it stands", "");
     lines.push(`- **Status:** ${task.status}, version ${task.version}`);
@@ -4166,85 +4149,17 @@ export class DevTeamStore extends EventEmitter {
     if (regressions.length) {
       lines.push(`- **Broken checks:** ${regressions.map((item) => escape(item.label)).join(", ")}`);
     }
-    if (usage) {
-      lines.push(`- **Reported cost:** $${usage.totalCostUsd.toFixed(2)} across ${usage.reports} report${usage.reports === 1 ? "" : "s"} _(agent-reported, not measured)_`);
-    }
     if (events.length >= Math.min(5_000, Number(limit) || 1000)) {
       lines.push("", `_Truncated at ${events.length} events._`);
     }
     return { taskId, title: task.title, events: events.length, markdown: `${lines.join("\n")}\n` };
   }
 
-  // T4.2 — what the work cost.
-  //
-  // Nothing recorded it, so "which agent burned what on which assignment" was unanswerable, and the
-  // wall-clock budget from T2.6 was the only cap available.
-  //
-  // Reported by the agent, and labeled as reported. DevTeam cannot measure another process's token
-  // use and does not pretend to: these are the agent's own figures, exactly like an unverified check,
-  // and the payload says so wherever it is shown. A number that looks measured but is asserted is
-  // worse than an obviously asserted one.
-  #recordUsage({ taskId, assignmentId, agentId, agentName, usage, stamp }) {
-    if (!usage || typeof usage !== "object") return null;
-    const bounded = (value) => {
-      const number = Number(value);
-      return Number.isFinite(number) && number >= 0 ? Math.min(Math.trunc(number), 1_000_000_000) : null;
-    };
-    const inputTokens = bounded(usage.inputTokens);
-    const outputTokens = bounded(usage.outputTokens);
-    // `null` means "not reported" and must not become a zero-cost row: a task showing $0.00 spent
-    // because every agent omitted the figure reads as free, which is the opposite of the truth.
-    const costCents = usage.costUsd != null && Number.isFinite(Number(usage.costUsd)) && Number(usage.costUsd) >= 0
-      ? Math.min(10_000_000, Math.round(Number(usage.costUsd) * 100))
-      : null;
-    const model = String(usage.model || "").trim().slice(0, 120) || null;
-    if (inputTokens === null && outputTokens === null && costCents === null) return null;
-    this.db.prepare(`
-      INSERT INTO assignment_usage (id, task_id, assignment_id, agent_id, agent_name, model, input_tokens, output_tokens, cost_cents, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(randomUUID(), taskId, assignmentId, agentId || null, agentName || null, model,
-      inputTokens, outputTokens, costCents, stamp);
-    return { model, inputTokens, outputTokens, costUsd: costCents === null ? null : costCents / 100 };
-  }
-
-  // What a task has cost so far, per agent and in total. Every figure here is agent-reported.
-  taskUsage(taskId) {
-    const rows = this.db.prepare(`
-      SELECT agent_name, model,
-             COALESCE(SUM(input_tokens), 0) AS input_tokens,
-             COALESCE(SUM(output_tokens), 0) AS output_tokens,
-             COALESCE(SUM(cost_cents), 0) AS cost_cents,
-             COUNT(*) AS reports
-      FROM assignment_usage WHERE task_id = ?
-      GROUP BY agent_name, model ORDER BY cost_cents DESC, agent_name ASC
-    `).all(taskId);
-    if (!rows.length) return null;
-    const total = rows.reduce((sum, row) => ({
-      inputTokens: sum.inputTokens + Number(row.input_tokens),
-      outputTokens: sum.outputTokens + Number(row.output_tokens),
-      costCents: sum.costCents + Number(row.cost_cents),
-      reports: sum.reports + Number(row.reports),
-    }), { inputTokens: 0, outputTokens: 0, costCents: 0, reports: 0 });
-    return {
-      agentAsserted: true,
-      note: "Reported by the agents themselves. DevTeam cannot measure another process's token use and does not pretend to.",
-      byAgent: rows.map((row) => ({
-        agentName: row.agent_name, model: row.model,
-        inputTokens: Number(row.input_tokens), outputTokens: Number(row.output_tokens),
-        costUsd: Number(row.cost_cents) / 100, reports: Number(row.reports),
-      })),
-      totalInputTokens: total.inputTokens,
-      totalOutputTokens: total.outputTokens,
-      totalCostUsd: total.costCents / 100,
-      reports: total.reports,
-    };
-  }
-
   // T2.6 — the three things a human could not do once work was running.
   //
   // Before this, the only mid-flight controls were block (stops everything), force-release (takes a
-  // lease away) and message (advisory). All three are blunt: nothing could say "do this one first",
-  // "stop that, it is no longer worth doing", or "this task has had enough of my afternoon".
+  // lease away) and message (advisory). All three are blunt: nothing could say "do this one first"
+  // or "stop that, it is no longer worth doing".
 
   // Re-prioritise a queued assignment. Higher goes first; the rest of the ordering is unchanged, so
   // priority breaks ties rather than overriding dependencies, leases or the review gate — none of
@@ -4640,7 +4555,7 @@ export class DevTeamStore extends EventEmitter {
   // lease**. An agent that has to release its claim to reorganise the work will not do it — it will
   // grind on instead — and in the gap another agent can take the paths it was midway through
   // editing. So the parent stays claimed by the same agent, at the same generation, throughout.
-  async completeAssignment({ agentId, assignmentId, message, status = "done", changedFiles = [], checks = [], nextStatus = "waiting", claimToken = null, usage = null }) {
+  async completeAssignment({ agentId, assignmentId, message, status = "done", changedFiles = [], checks = [], nextStatus = "waiting", claimToken = null }) {
     const agent = this.getAgent(agentId);
     const assignment = this.db.prepare("SELECT * FROM assignments WHERE id = ?").get(assignmentId);
     if (!assignment) throw new Error("Assignment not found.");
@@ -4764,7 +4679,6 @@ export class DevTeamStore extends EventEmitter {
     let version;
     let followUpAssignmentId = null;
     let regressions = [];
-    let reportedUsage = null;
     this.#transaction(() => {
       const stamp = now();
       this.#cancelReadyCheckpointsForAssignment(assignmentId);
@@ -4797,9 +4711,6 @@ export class DevTeamStore extends EventEmitter {
         }),
       });
       this.#storeReportedChecks(assignmentId, assignment.task_id, checkRecords, stamp);
-      reportedUsage = this.#recordUsage({
-        taskId: assignment.task_id, assignmentId, agentId, agentName: agent.name, usage, stamp,
-      });
       this.#event(assignment.task_id, agentId, status === "blocked" ? "assignment.blocked" : "assignment.completed", message.trim(), {
         assignmentId,
         role: assignment.role,
@@ -4854,7 +4765,6 @@ export class DevTeamStore extends EventEmitter {
       checks: checkRecords,
       verifiedChecks: checkRecords.filter((record) => record.verified).length,
       ...(regressions.length ? { regressions } : {}),
-      ...(reportedUsage ? { usage: reportedUsage } : {}),
       agent: agent.name,
       ...(status === "blocked" ? { taskBlocked: false, followUpAssignmentId } : {}),
     };
@@ -5771,7 +5681,7 @@ export class DevTeamStore extends EventEmitter {
       ...task, assignments, approvals, events, proposals, blackboard, projectBlackboard, knowledge, members, sessionCheckpoints, roleCatalogue,
       blockedRecovery: this.blockedRecovery(taskId),
       regressions: this.openRegressions(taskId), checkBaseline: this.checkBaseline(taskId),
-      reliability: this.teamReliability(), usage: this.taskUsage(taskId),
+      reliability: this.teamReliability(),
       // What this server has been running for the task, including anything a restart cut short.
       jobs: this.jobs(taskId, { limit: 10 }),
       knowledgeVault: {

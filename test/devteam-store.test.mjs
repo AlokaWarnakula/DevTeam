@@ -2147,40 +2147,7 @@ test("a cancel request reaches a working agent and asks rather than kills", asyn
     "queued work is not cancelled, it is deleted or re-prioritised");
 });
 
-// --- T4.2 / T4.3: what it cost, and what happened -------------------------------------------------
-
-test("reported cost is recorded, capped, and never presented as measured", async (t) => {
-  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-usage-"));
-  const store = new DevTeamStore(dataDir);
-  t.after(async () => { store.close(); await rm(dataDir, { recursive: true, force: true }); });
-  const project = store.ensureProject("Usage project", process.cwd());
-  const task = store.createTask({ projectId: project.id, title: "Costly", description: "Watch the spend." });
-  const agent = store.connectAgent({ name: "Spender", provider: "test", freshTaskId: task.id });
-
-  const plan = store.claimNextAssignment(agent.id);
-  const reported = await store.completeAssignment({
-    agentId: agent.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned.",
-    usage: { inputTokens: 12_000, outputTokens: 3_000, costUsd: 0.42, model: "some-model" },
-  });
-  assert.equal(reported.usage.inputTokens, 12_000);
-  assert.equal(reported.usage.costUsd, 0.42);
-
-  const usage = store.taskUsage(task.id);
-  assert.equal(usage.agentAsserted, true, "it is the agent's own figure, and says so");
-  assert.match(usage.note, /cannot measure/i);
-  assert.equal(usage.totalCostUsd, 0.42);
-  assert.equal(usage.byAgent[0].agentName, "Spender");
-
-  // Nonsense is dropped rather than stored: a negative or non-numeric figure is not a cost.
-  const second = store.createAssignment({ taskId: task.id, title: "More work", description: "Do it." });
-  const claim = store.claimNextAssignment(agent.id);
-  const junk = await store.completeAssignment({
-    agentId: agent.id, assignmentId: second.id, claimToken: claim.claimToken, message: "Done.",
-    usage: { inputTokens: -5, outputTokens: "lots", costUsd: null },
-  });
-  assert.equal(junk.usage ?? undefined, undefined);
-  assert.equal(store.taskUsage(task.id).totalCostUsd, 0.42, "nothing was added by a malformed report");
-});
+// --- T4.3: what happened --------------------------------------------------------------------------
 
 test("a task replays as a narrative that reports what happened without re-grading it", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-replay-"));
@@ -2199,7 +2166,7 @@ test("a task replays as a narrative that reports what happened without re-gradin
   await store.completeAssignment({
     agentId: author.id, assignmentId: work.id, claimToken: workClaim.claimToken,
     message: "Wrote it.\nHandles the nested case.", changedFiles: ["src/parser.mjs"],
-    checks: ["I ran it by hand"], usage: { costUsd: 0.2 },
+    checks: ["I ran it by hand"],
   });
   const reviewClaim = store.claimNextAssignment(reviewer.id);
   await store.completeAssignment({ agentId: reviewer.id, assignmentId: reviewClaim.id, claimToken: reviewClaim.claimToken, message: "Read it closely." });
@@ -2216,7 +2183,6 @@ test("a task replays as a narrative that reports what happened without re-gradin
     "an asserted check still reads as asserted — the replay reports, it does not re-grade");
   assert.match(replay.markdown, /changes_requested.*Nested case is wrong/);
   assert.match(replay.markdown, /## Where it stands/);
-  assert.match(replay.markdown, /Reported cost:.*agent-reported, not measured/);
   assert.ok(replay.events > 5);
   assert.throws(() => store.taskReplay("00000000-0000-4000-8000-000000000000"), /Task not found/);
 });
