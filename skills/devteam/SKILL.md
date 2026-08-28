@@ -69,20 +69,25 @@ Never spin a tight loop of many `devteam_wait` calls without letting each one bl
   - `cancelRequested: true` means **stop as soon as you can do so safely**. Do not finish "just this one more thing". Report what you have with `devteam_report` — `status: "blocked"` if it is incomplete — rather than abandoning the claim and leaving a lease held over a half-written tree.
   - `budget` means the task has run past its wall-clock or spend cap. This is advisory and does not stop you, but surface it to the human and ask whether to continue before starting anything large.
 
-## Runtime and model recommendations
+## When the work is beyond your model
 
-**Gating is opt-in, and silence means it is off.** If neither your session nor the task has a usable runtime profile, DevTeam treats you as a legacy client: every claim proceeds and *no model recommendation will ever appear*. If the human is expecting model advice, tell them plainly that no profile is registered and gating is inactive, rather than letting them wait for a prompt that cannot come. The same applies when a task's standing profile has aged out — it falls back to legacy behaviour rather than blocking the queue.
+Every assignment you claim carries a deterministic complexity score in your brief:
+`assessment.level` (`base` → `difficult` → `critical` → `recovery` → `exceptional`), the score, and
+the reasons behind it.
 
-- The check runs **per assignment, at claim time**, not once per session. A stronger runtime is requested only when a specific assignment scores high enough.
-- Complexity is scored deterministically and provider-neutrally: declared paths and roots, verification/security role, dependency depth, checklist depth, prior failed attempts, and risk signals in the assignment text (auth/secrets, schema/migration, concurrency/leases/recovery, architecture breadth). Parent-task text contributes too, but its total is deliberately capped so one risky task does not promote every small assignment under it. The score maps to `base` → `difficult` → `critical` → `recovery` → `exceptional`, and each level to a normalized **class** requirement (`balanced`/`frontier`, `medium`…`maximum`) — never to a provider's model name.
-- Use `devteam_assignment_assessment` to read the score, level, reasons, and normalized requirements for an assignment. Cite those, not brand names. A recommendation may select only options the current profile actually advertises.
-- Runtime profiles belong to one agent session and expire. Refresh them with `devteam_runtime_update` on a host setting change, failed switch, explicit user correction, or when DevTeam says the profile is stale. Do not store routine runtime availability in durable project memory.
-- When the host exposes no profile, the human may register a task base runtime profile or correct a connected session from the dashboard. The gate falls back to the task profile only when the agent has none. Display only model and effort labels present in those profiles; never infer a provider catalog from normalized capability classes or memory.
-- A profile that is internally inconsistent (a current model it does not advertise, a class that contradicts the advertised one) is treated as unusable and **gates every claim**. Sending no profile is safe; sending a guessed one is not.
-- **The gate never interrupts you to downgrade.** If current settings exceed the requirement, continue the current assignment. A cheaper profile can be considered at the next fresh-session boundary.
-- A desktop recommendation is advisory because DevTeam cannot assume it can control the conversation's settings. `continue` records a human risk/continuity choice; it is not evidence that the current runtime is ideal. `reassign` leaves the lease free for a compatible teammate. `reassign` and `cancel` also *remove that assignment from your queue* until a human revisits it — so do not keep re-asking for it.
-- Maximum/exceptional settings always require explicit human approval. Provider-specific model IDs must never be added to the core complexity policy.
-- Treat `switchMode: automatic` as a claim about an explicitly configured managed adapter, not permission for an agent to spawn processes itself. Managed launch remains a human/authenticated control-plane action. The old session keeps its claim until checkpoint takeover succeeds; if launch fails, continue safely under the old claim.
+**Nothing will stop you.** Model gating exists but is off unless a runtime profile has been
+registered, and usually none has — `assessment.guidance` tells you when that is the case. So the
+judgement is yours, and it is a real part of the job:
+
+- If an assignment scores **`difficult` or worse** and it is beyond the model or effort you are
+  actually running, stop before claiming anything else. Call `devteam_block` with
+  `kind: "over-my-head"` and say plainly what capability is needed and why this assignment needs it.
+- Do not guess at model names or catalogs. Describe the capability — "this needs a frontier model at
+  high effort to reconcile four years of history" — not a product you think exists.
+- Do not push on quietly. A wrong answer produced confidently costs the human far more than a
+  blocked assignment does, and blocking with a reason is a normal, expected outcome, not a failure.
+- If your host does expose a real runtime profile, `devteam_runtime_update` records it and the gate
+  will check claims for you. That is a convenience, never a substitute for the judgement above.
 
 ## Do the assignment
 

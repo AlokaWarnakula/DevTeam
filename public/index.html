@@ -37,16 +37,16 @@
           <h1 id="task-title">Bring your AI team together</h1>
           <p id="task-description">Create a task, connect agents through MCP, and watch the plan, implementation, tests, and review happen in one place.</p>
         </div>
-        <div class="header-actions"><span id="task-version" class="version">v1</span><button id="open-task-brief" class="secondary hidden" type="button" data-dialog="task-brief-dialog" aria-haspopup="dialog">Task brief</button><button id="copy-task-invite" class="secondary" title="Copy a task-specific agent prompt">Invite agent</button><button id="edit-task-runtime" class="secondary hidden" type="button" title="Set the real model and effort options normally used for this task">Task runtime</button><button id="edit-task" class="secondary hidden" type="button" title="Edit this task's title, description, or approvals">Edit task</button><button class="secondary" data-dialog="task-dialog">New task</button><button id="toggle-team" class="panel-toggle" type="button" aria-label="Toggle team panel" aria-expanded="true" aria-controls="team-panel" title="Toggle team panel">◧</button></div>
+        <div class="header-actions"><span id="task-version" class="version">v1</span><button id="open-task-brief" class="secondary hidden" type="button" data-dialog="task-brief-dialog" aria-haspopup="dialog">Task brief</button><button id="copy-task-invite" class="secondary" title="Copy a task-specific agent prompt">Invite agent</button><button id="edit-task" class="secondary hidden" type="button" title="Edit this task's title, description, or approvals">Edit task</button><button class="secondary" data-dialog="task-dialog">New task</button><button id="toggle-team" class="panel-toggle" type="button" aria-label="Toggle team panel" aria-expanded="true" aria-controls="team-panel" title="Toggle team panel">◧</button></div>
       </header>
 
       <section id="blocked-banner" class="blocked-banner hidden" role="status">
         <div class="blocked-banner-text">
-          <strong>Task blocked — only you can resume it</strong>
+          <strong>Task stopped — only you can restart or close it</strong>
           <p id="blocked-reason"></p>
           <small id="blocked-meta"></small>
         </div>
-        <button id="resume-task" class="primary" type="button">Resume task</button>
+        <div class="blocked-banner-actions"><button id="close-blocked-task" class="secondary" type="button" title="Close this task as finished, without replanning it">Accept as finished</button><button id="resume-task" class="primary" type="button">Resume task</button></div>
       </section>
 
       <section id="empty-state" class="empty-state">
@@ -276,7 +276,6 @@
       <div id="runtime-reasons" class="runtime-reasons"></div>
       <label>Agent session<select name="agentId" id="runtime-agent" required></select></label>
       <p id="runtime-profile-state" class="runtime-profile-state"></p>
-      <button id="runtime-edit-profile" type="button" class="secondary">Set or correct selected agent profile</button>
       <label>Current model<select name="modelId" id="runtime-model"></select></label>
       <label>Current effort<select name="effortId" id="runtime-effort"></select></label>
       <p class="hint">Desktop recommendations are advisory. Choices shown here come only from the selected session’s advertised profile; DevTeam does not invent availability.</p>
@@ -291,20 +290,6 @@
     </form>
   </dialog>
 
-  <dialog id="runtime-profile-dialog" class="runtime-dialog">
-    <form id="runtime-profile-form" method="dialog">
-      <div class="dialog-head"><div><span class="eyebrow">REAL MODEL NAMES</span><h2 id="runtime-profile-title">Set runtime profile</h2></div><button type="button" class="close">×</button></div>
-      <p id="runtime-profile-scope" class="runtime-summary"></p>
-      <p class="hint">Enter only models and effort levels you know this session provides. DevTeam stores this as a human-supplied profile and never invents availability.</p>
-      <label>Profile or provider ID<input name="providerId" maxlength="120" placeholder="my-desktop-runtime" required></label>
-      <label>Switching<select name="switchMode"><option value="user_required">I switch it in the desktop app</option><option value="unsupported">This session cannot switch</option><option value="automatic">Managed adapter switches automatically</option><option value="unknown">Unknown</option></select></label>
-      <div class="profile-model-head"><strong>Available models and efforts</strong><button id="profile-add-model" type="button" class="secondary">Add model</button></div>
-      <div id="profile-model-list" class="profile-model-list"></div>
-      <label>Current model<select id="profile-current-model" name="currentModel" required></select></label>
-      <label>Current effort<select id="profile-current-effort" name="currentEffort" required></select></label>
-      <div class="dialog-actions"><button id="profile-clear-task" type="button" class="secondary hidden">Clear task profile</button><button type="button" class="secondary close">Cancel</button><button class="primary" value="submit">Save profile</button></div>
-    </form>
-  </dialog>
 
   <div id="toast" class="toast"></div>
   <script type="module" src="/app.js"></script>

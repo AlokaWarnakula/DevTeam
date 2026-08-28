@@ -1758,3 +1758,6 @@ body.resizing-panel { cursor: col-resize; user-select: none; }
   .blocked-banner { flex-wrap: wrap; padding: 13px 18px; gap: 11px; }
   .blocked-banner .primary { width: 100%; text-align: center; }
 }
+
+/* Two ways out of a stopped task sit side by side: close it as finished, or resume it. */
+.blocked-banner-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
