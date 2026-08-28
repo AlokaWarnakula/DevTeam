@@ -269,7 +269,7 @@ export class DevTeamStore extends EventEmitter {
         .run(stamp, "Interrupted by a server restart before it finished.", job.id);
       const detail = fromJson(job.detail, {});
       const commands = Array.isArray(detail.commands) ? detail.commands.join(", ") : "";
-      this.#event(job.task_id, null, "job.interrupted",
+      this._event(job.task_id, null, "job.interrupted",
         `A server restart interrupted the checks DevTeam was running${commands ? ` (${commands})` : ""}. Nothing was recorded from that run; the claim is untouched, so the agent holding it can report again.`,
         { jobId: job.id, assignmentId: job.assignment_id || null, kind: job.kind });
     }
@@ -373,7 +373,16 @@ export class DevTeamStore extends EventEmitter {
     return { kind: "agent", id: row.id, label: row.label };
   }
 
-  #transaction(callback) {
+  // _transaction, _event and _changed are the three things almost every method in this class needs,
+  // and they are the reason the rest of the split is possible at all. A JavaScript `#private` is
+  // lexically bound to the class body it is declared in, so a method composed onto the prototype
+  // from another file cannot see one — no mixin can call this.#event, ever.
+  //
+  // So these three are internals by convention rather than by the language: an underscore says "not
+  // part of the public surface" to a reader, where `#` said it to the compiler. That is a real loss
+  // and it is the price of the file being separable at all. Nothing outside DevTeamStore and its
+  // mixins should call them.
+  _transaction(callback) {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const result = callback();
@@ -388,7 +397,7 @@ export class DevTeamStore extends EventEmitter {
   // Authorship is denormalized onto the row at write time. agent_id is a nullable foreign key that
   // gets cleared when an agent is purged from the roster, so it cannot be the record of who spoke:
   // relying on it silently reattributed every purged agent's message to the human.
-  #event(taskId, agentId, type, message, metadata = {}) {
+  _event(taskId, agentId, type, message, metadata = {}) {
     const stamp = now();
     const author = agentId
       ? this.db.prepare("SELECT name FROM agents WHERE id = ?").get(agentId)
@@ -401,7 +410,7 @@ export class DevTeamStore extends EventEmitter {
     return Number(info.lastInsertRowid);
   }
 
-  #changed(type, taskId = null) {
+  _changed(type, taskId = null) {
     const knowledgeChanges = new Set([
       "task.created", "task.continued", "task.updated", "task.accepted", "task.blocked", "task.unblocked",
       "assignment.created", "assignment.completed", "assignment.blocked",
@@ -474,7 +483,7 @@ export class DevTeamStore extends EventEmitter {
       WHERE id = ?
     `).run(stamp, stamp, agent.id);
     for (const taskId of taskIds) {
-      this.#event(taskId, agent.id, "agent.disconnected", `${agent.name} disconnected and released unfinished work.`, {
+      this._event(taskId, agent.id, "agent.disconnected", `${agent.name} disconnected and released unfinished work.`, {
         reason,
         releasedAssignments: released,
       });
@@ -496,7 +505,7 @@ export class DevTeamStore extends EventEmitter {
     const affectedTasks = new Set();
     let presenceChanged = false;
     let purged = false;
-    this.#transaction(() => {
+    this._transaction(() => {
       // Idle (waiting) agents that went silent are simply gone; they own nothing to protect.
       const goneIdle = this.db.prepare(`
         SELECT * FROM agents WHERE status = 'waiting' AND last_seen < ?
@@ -519,7 +528,7 @@ export class DevTeamStore extends EventEmitter {
       `).all(staleWorkBefore);
       for (const row of recoverable) {
         this.db.prepare("UPDATE assignments SET status = 'queued', agent_id = NULL, claimed_at = NULL, claim_token_hash = NULL WHERE id = ?").run(row.id);
-        this.#event(row.task_id, null, "assignment.released", `${row.agent_name}'s read-only assignment was recovered after a long silence.`, { assignmentId: row.id, reason: "stale-readonly-recovery" });
+        this._event(row.task_id, null, "assignment.released", `${row.agent_name}'s read-only assignment was recovered after a long silence.`, { assignmentId: row.id, reason: "stale-readonly-recovery" });
         this.#syncTaskStatus(row.task_id, stamp);
         affectedTasks.add(row.task_id);
       }
@@ -541,8 +550,8 @@ export class DevTeamStore extends EventEmitter {
         purged = true;
       }
     });
-    for (const taskId of affectedTasks) this.#changed("assignment.released", taskId);
-    if (presenceChanged || purged) this.#changed("agent.disconnected");
+    for (const taskId of affectedTasks) this._changed("assignment.released", taskId);
+    if (presenceChanged || purged) this._changed("agent.disconnected");
     return [];
   }
 
@@ -555,7 +564,7 @@ export class DevTeamStore extends EventEmitter {
     `).all();
     if (!orphans.length) return [];
     const stamp = now();
-    this.#transaction(() => {
+    this._transaction(() => {
       this.db.prepare(`
         UPDATE assignments SET status = 'queued', agent_id = NULL, claimed_at = NULL, claim_token_hash = NULL
         WHERE status = 'claimed' AND (
@@ -563,11 +572,11 @@ export class DevTeamStore extends EventEmitter {
         )
       `).run();
       for (const orphan of orphans) {
-        this.#event(orphan.task_id, orphan.agent_id, "assignment.released", `${orphan.agent_name}'s orphaned assignment was returned to the queue.`, { reason });
+        this._event(orphan.task_id, orphan.agent_id, "assignment.released", `${orphan.agent_name}'s orphaned assignment was returned to the queue.`, { reason });
         this.#syncTaskStatus(orphan.task_id, stamp);
       }
     });
-    for (const taskId of new Set(orphans.map((orphan) => orphan.task_id))) this.#changed("assignment.released", taskId);
+    for (const taskId of new Set(orphans.map((orphan) => orphan.task_id))) this._changed("assignment.released", taskId);
     return orphans;
   }
 
@@ -592,13 +601,13 @@ export class DevTeamStore extends EventEmitter {
     `).all(before);
     if (!stale.length) return [];
     const stamp = now();
-    this.#transaction(() => {
+    this._transaction(() => {
       for (const proposal of stale) {
         this.db.prepare("UPDATE proposals SET escalated_at = ? WHERE id = ?").run(stamp, proposal.id);
-        this.#event(proposal.task_id, null, "proposal.needs_human", `A proposal has been open past the decision window and needs a human decision: ${proposal.summary}`, { proposalId: proposal.id });
+        this._event(proposal.task_id, null, "proposal.needs_human", `A proposal has been open past the decision window and needs a human decision: ${proposal.summary}`, { proposalId: proposal.id });
       }
     });
-    for (const taskId of new Set(stale.map((proposal) => proposal.task_id))) this.#changed("proposal.needs_human", taskId);
+    for (const taskId of new Set(stale.map((proposal) => proposal.task_id))) this._changed("proposal.needs_human", taskId);
     return stale;
   }
 
@@ -689,7 +698,7 @@ export class DevTeamStore extends EventEmitter {
     if (!mine.length) return [];
     const stamp = now();
     const taskIds = new Set();
-    this.#transaction(() => {
+    this._transaction(() => {
       for (const event of mine) {
         this.db.prepare(`
           INSERT INTO message_receipts (event_id, agent_id, delivered_at)
@@ -700,7 +709,7 @@ export class DevTeamStore extends EventEmitter {
       }
       this.db.prepare("UPDATE agents SET last_seen = ? WHERE id = ?").run(stamp, agentId);
     });
-    for (const taskId of taskIds) this.#changed("message.delivered", taskId);
+    for (const taskId of taskIds) this._changed("message.delivered", taskId);
     return mine.map((event) => ({
       id: event.id,
       taskId: event.task_id,
@@ -719,7 +728,7 @@ export class DevTeamStore extends EventEmitter {
       UPDATE message_receipts SET seen_at = ?
       WHERE agent_id = ? AND delivered_at IS NOT NULL AND seen_at IS NULL
     `).run(now(), agentId).changes;
-    if (changed) this.#changed("message.seen");
+    if (changed) this._changed("message.seen");
     return changed;
   }
 
@@ -811,7 +820,7 @@ export class DevTeamStore extends EventEmitter {
     // the proposer. A teammate connecting mid-vote afterwards can neither block an almost-adopted
     // proposal nor be silently conscripted into it.
     const snapshotVoters = this.#connectedMemberIds(taskId).filter((memberId) => memberId !== agentId);
-    this.#transaction(() => {
+    this._transaction(() => {
       this.db.prepare(`
         INSERT INTO proposals (id, task_id, proposer_id, proposer_name, kind, summary, details, status, created_at, required_ratio)
         VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
@@ -828,9 +837,9 @@ export class DevTeamStore extends EventEmitter {
           VALUES (?, ?, ?, 'agree', NULL, ?)
         `).run(id, agentId, proposerName, stamp);
       }
-      this.#event(taskId, agentId, "proposal.created", summary.trim(), { proposalId: id, kind, details, requiredVoters: snapshotVoters.length, quorum: ratio });
+      this._event(taskId, agentId, "proposal.created", summary.trim(), { proposalId: id, kind, details, requiredVoters: snapshotVoters.length, quorum: ratio });
     });
-    this.#changed("proposal.created", taskId);
+    this._changed("proposal.created", taskId);
     return this.getProposal(id);
   }
 
@@ -850,7 +859,7 @@ export class DevTeamStore extends EventEmitter {
       if (owning) this.assertMembership(agentId, owning.task_id);
     }
     let outcome;
-    this.#transaction(() => {
+    this._transaction(() => {
       const proposal = this.db.prepare("SELECT * FROM proposals WHERE id = ?").get(proposalId);
       if (!proposal) throw new Error("Proposal not found.");
       if (proposal.status !== "open") { outcome = { proposalId, taskId: proposal.task_id, status: proposal.status, alreadyResolved: true }; return; }
@@ -871,15 +880,15 @@ export class DevTeamStore extends EventEmitter {
         VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(proposal_id, voter_id) DO UPDATE SET vote = excluded.vote, comment = excluded.comment, created_at = excluded.created_at
       `).run(proposalId, voterId, voterName, vote, comment?.trim() || null, stamp);
-      this.#event(proposal.task_id, agentId, "proposal.vote", `${voterName} ${vote === "agree" ? "agreed to" : "objected to"}: ${proposal.summary}`, { proposalId, vote, comment: comment?.trim() || null });
+      this._event(proposal.task_id, agentId, "proposal.vote", `${voterName} ${vote === "agree" ? "agreed to" : "objected to"}: ${proposal.summary}`, { proposalId, vote, comment: comment?.trim() || null });
       outcome = this.#evaluateProposal(proposal, stamp);
     });
     this.markMessagesSeen(agentId || "");
     // A resolution always signals (even when reached by re-evaluating an identical decisive vote); a
     // vote that merely stays open signals once, and a true no-op stays silent.
-    if (outcome?.status === "adopted") this.#changed("proposal.adopted", outcome.taskId);
-    else if (outcome?.status === "declined") this.#changed("proposal.declined", outcome.taskId);
-    else if (!outcome?.unchanged && !outcome?.alreadyResolved) this.#changed("proposal.vote", outcome?.taskId);
+    if (outcome?.status === "adopted") this._changed("proposal.adopted", outcome.taskId);
+    else if (outcome?.status === "declined") this._changed("proposal.declined", outcome.taskId);
+    else if (!outcome?.unchanged && !outcome?.alreadyResolved) this._changed("proposal.vote", outcome?.taskId);
     return outcome;
   }
 
@@ -900,14 +909,14 @@ export class DevTeamStore extends EventEmitter {
     }
     if (humanVote && humanVote.vote === "object") {
       this.db.prepare("UPDATE proposals SET status = 'declined', resolved_at = ? WHERE id = ?").run(stamp, proposal.id);
-      this.#event(proposal.task_id, null, "proposal.declined", `Proposal declined: ${proposal.summary}`, { proposalId: proposal.id });
+      this._event(proposal.task_id, null, "proposal.declined", `Proposal declined: ${proposal.summary}`, { proposalId: proposal.id });
       return { proposalId: proposal.id, taskId: proposal.task_id, status: "declined" };
     }
     const authoritative = new Set([...snapshot, "human"]); // late joiners can neither block nor carry a vote
     const objection = votes.find((v) => v.vote === "object" && authoritative.has(v.voter_id));
     if (objection) {
       this.db.prepare("UPDATE proposals SET status = 'declined', resolved_at = ? WHERE id = ?").run(stamp, proposal.id);
-      this.#event(proposal.task_id, null, "proposal.declined", `Proposal declined: ${proposal.summary}`, { proposalId: proposal.id });
+      this._event(proposal.task_id, null, "proposal.declined", `Proposal declined: ${proposal.summary}`, { proposalId: proposal.id });
       return { proposalId: proposal.id, taskId: proposal.task_id, status: "declined" };
     }
     const agreed = new Set(votes.filter((v) => v.vote === "agree").map((v) => v.voter_id));
@@ -966,7 +975,7 @@ export class DevTeamStore extends EventEmitter {
         const writePaths = [...new Set(details.paths.map((p) => String(p).trim()).filter(Boolean))].slice(0, 50);
         if (writePaths.length) this.db.prepare("INSERT OR REPLACE INTO assignment_write_scopes (assignment_id, paths) VALUES (?, ?)").run(assignmentId, json(writePaths));
       }
-      this.#event(proposal.task_id, proposal.proposer_id, "assignment.created", title, { assignmentId, role: details.role, requiresWrite: Boolean(details.requiresWrite), targetAgentName: details.targetAgentName?.trim() || null, viaProposal: proposal.id, checklist: adoptedChecklist || [] });
+      this._event(proposal.task_id, proposal.proposer_id, "assignment.created", title, { assignmentId, role: details.role, requiresWrite: Boolean(details.requiresWrite), targetAgentName: details.targetAgentName?.trim() || null, viaProposal: proposal.id, checklist: adoptedChecklist || [] });
       this.#syncTaskStatus(proposal.task_id, stamp);
     } else if (proposal.kind === "handoff") {
       const assignment = this.db.prepare("SELECT * FROM assignments WHERE id = ?").get(details.assignmentId);
@@ -977,11 +986,11 @@ export class DevTeamStore extends EventEmitter {
         } else {
           this.db.prepare("UPDATE assignments SET target_agent_name = ? WHERE id = ?").run(target, assignment.id);
         }
-        this.#event(proposal.task_id, proposal.proposer_id, "assignment.reassigned", `Reassigned "${assignment.title}"${target ? ` to ${target}` : ""}.`, { assignmentId: assignment.id, targetAgentName: target, viaProposal: proposal.id });
+        this._event(proposal.task_id, proposal.proposer_id, "assignment.reassigned", `Reassigned "${assignment.title}"${target ? ` to ${target}` : ""}.`, { assignmentId: assignment.id, targetAgentName: target, viaProposal: proposal.id });
         this.#syncTaskStatus(proposal.task_id, stamp);
       }
     }
-    this.#event(proposal.task_id, null, "proposal.adopted", `Team adopted: ${proposal.summary}`, { proposalId: proposal.id, kind: proposal.kind });
+    this._event(proposal.task_id, null, "proposal.adopted", `Team adopted: ${proposal.summary}`, { proposalId: proposal.id, kind: proposal.kind });
   }
 
   // Open proposals a waiting agent should weigh in on (in its rooms, not its own, not yet voted).
@@ -1034,7 +1043,7 @@ export class DevTeamStore extends EventEmitter {
     catch (error) { this.knowledgeErrors.set(`project:${project.id}`, { message: error.message, at: now() }); }
     try { this.codegraph.initializeProject(project.id); this.codegraphErrors.delete(`project:${project.id}`); }
     catch (error) { this.codegraphErrors.set(`project:${project.id}`, { message: error.message, at: now() }); }
-    this.#changed("project.created");
+    this._changed("project.created");
     return project;
   }
 
@@ -1074,7 +1083,7 @@ export class DevTeamStore extends EventEmitter {
       try { this.codegraph.initializeProject(projectId); this.codegraphErrors.delete(`project:${projectId}`); }
       catch (error) { this.codegraphErrors.set(`project:${projectId}`, { message: error.message, at: now() }); }
     }
-    this.#changed("project.updated");
+    this._changed("project.updated");
     return this.db.prepare("SELECT * FROM projects WHERE id = ?").get(projectId);
   }
 
@@ -1086,7 +1095,7 @@ export class DevTeamStore extends EventEmitter {
     const stamp = now();
     const approvals = Math.max(1, Math.min(8, Number(requiredApprovals) || 2));
     const planningRoleName = this.planningRoleFor(projectId);
-    this.#transaction(() => {
+    this._transaction(() => {
       this.db.prepare(`
         INSERT INTO tasks (id, project_id, title, description, status, version, required_approvals,
           session_policy, session_policy_version, created_at, updated_at)
@@ -1098,10 +1107,10 @@ export class DevTeamStore extends EventEmitter {
         INSERT INTO assignments (id, task_id, title, description, role, requires_write, status, created_at, plans)
         VALUES (?, ?, ?, ?, ?, 0, 'queued', ?, 1)
       `).run(plannerAssignmentId, taskId, "Create the implementation plan", "Inspect the project, propose a concrete plan, then assign implementation and review work to the team.", planningRoleName, stamp);
-      this.#event(taskId, null, "task.created", `Task created: ${title.trim()}`, { projectId, requiredApprovals: approvals });
+      this._event(taskId, null, "task.created", `Task created: ${title.trim()}`, { projectId, requiredApprovals: approvals });
     });
     this.assignmentAssessment({ assignmentId: plannerAssignmentId });
-    this.#changed("task.created", taskId);
+    this._changed("task.created", taskId);
     return this.getTask(taskId);
   }
 
@@ -1206,13 +1215,13 @@ export class DevTeamStore extends EventEmitter {
       nextPolicy !== task.session_policy ? "session policy" : null,
     ].filter(Boolean);
     const stamp = now();
-    this.#transaction(() => {
+    this._transaction(() => {
       this.db.prepare(`UPDATE tasks SET title = ?, description = ?, required_approvals = ?, session_policy = ?,
         session_policy_version = session_policy_version + ?, updated_at = ? WHERE id = ?`)
         .run(nextTitle, nextDescription, nextApprovals, nextPolicy, nextPolicy === task.session_policy ? 0 : 1, stamp, taskId);
-      this.#event(taskId, null, "task.updated", `Task details edited (${changed.join(", ")}).`, { changed, requiredApprovals: nextApprovals, sessionPolicy: nextPolicy });
+      this._event(taskId, null, "task.updated", `Task details edited (${changed.join(", ")}).`, { changed, requiredApprovals: nextApprovals, sessionPolicy: nextPolicy });
     });
-    this.#changed("task.updated", taskId);
+    this._changed("task.updated", taskId);
     return this.getTask(taskId);
   }
 
@@ -1229,7 +1238,7 @@ export class DevTeamStore extends EventEmitter {
     if (connectedAgents) throw new Error("Disconnect agents working on this project before deleting it.");
     const taskCount = Number(this.db.prepare("SELECT COUNT(*) AS count FROM tasks WHERE project_id = ?").get(projectId).count);
     const deletedTaskIds = this.db.prepare("SELECT id FROM tasks WHERE project_id = ?").all(projectId).map((row) => row.id);
-    this.#transaction(() => {
+    this._transaction(() => {
       this.db.prepare(`
         UPDATE agents SET current_task_id = NULL
         WHERE current_task_id IN (SELECT id FROM tasks WHERE project_id = ?)
@@ -1237,7 +1246,7 @@ export class DevTeamStore extends EventEmitter {
       this.db.prepare("DELETE FROM projects WHERE id = ?").run(projectId);
     });
     for (const deletedTaskId of deletedTaskIds) this.briefHealth.delete(deletedTaskId);
-    this.#changed("project.deleted");
+    this._changed("project.deleted");
     return { deleted: true, projectId, projectName: project.name, taskCount, filesDeleted: false };
   }
 
@@ -1251,7 +1260,7 @@ export class DevTeamStore extends EventEmitter {
       SELECT COUNT(*) AS count FROM agents WHERE status != 'disconnected' AND current_task_id = ?
     `).get(taskId).count);
     if (connectedAgents) throw new Error("Disconnect agents working on this task before deleting its history.");
-    this.#transaction(() => {
+    this._transaction(() => {
       this.db.prepare("UPDATE agents SET current_task_id = NULL WHERE current_task_id = ?").run(taskId);
       this.db.prepare("DELETE FROM tasks WHERE id = ?").run(taskId);
     });
@@ -1262,7 +1271,7 @@ export class DevTeamStore extends EventEmitter {
     } catch (error) {
       this.knowledgeErrors.set(`project:${task.project_id}`, { message: error.message, at: now() });
     }
-    this.#changed("task.deleted", taskId);
+    this._changed("task.deleted", taskId);
     return { deleted: true, taskId, title: task.title, filesDeleted: false };
   }
 
@@ -1354,7 +1363,7 @@ export class DevTeamStore extends EventEmitter {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(id, assignmentId, assignment.assignment_version, assignment.task_version, assessed.evidenceHash,
       assessed.policyVersion, assessed.score, assessed.level, json(assessed.reasons), json(assessed.requirements), stamp);
-    this.#event(assignment.task_id, agentId, "assignment.complexity_assessed", `Assessed “${assignment.title}” as ${assessed.level} (${assessed.score}).`, {
+    this._event(assignment.task_id, agentId, "assignment.complexity_assessed", `Assessed “${assignment.title}” as ${assessed.level} (${assessed.score}).`, {
       assignmentId, assessmentId: id, score: assessed.score, level: assessed.level,
       requirements: assessed.requirements, invalidatedAssessmentId: current?.id || null,
     });
@@ -1372,7 +1381,7 @@ export class DevTeamStore extends EventEmitter {
       UPDATE assignments SET complexity_override = ?, assignment_version = assignment_version + 1 WHERE id = ?
     `).run(override == null ? null : json({ level: level || null, score: Number.isFinite(Number(override.score)) ? Math.max(0, Math.floor(Number(override.score))) : null }), assignmentId);
     const assessment = this.assignmentAssessment({ assignmentId, refresh: true });
-    this.#changed("assignment.complexity_override", assignment.task_id);
+    this._changed("assignment.complexity_override", assignment.task_id);
     return assessment;
   }
 
@@ -1390,7 +1399,7 @@ export class DevTeamStore extends EventEmitter {
     // A returning identity that reconnects within this window inherits its prior session's read floor
     // (below) so it still sees what it missed while away; older sessions are left as history.
     const RECONNECT_REPLAY_MS = 6 * 60 * 60 * 1000;
-    this.#transaction(() => {
+    this._transaction(() => {
       this.db.prepare(`
         INSERT INTO agents (id, name, provider, capabilities, status, connected_at, last_seen, resume_token_hash, session_generation, fresh_task_id, current_model, current_effort)
         VALUES (?, ?, ?, ?, 'waiting', ?, ?, ?, ?, ?, ?, ?)
@@ -1409,7 +1418,7 @@ export class DevTeamStore extends EventEmitter {
         this.db.prepare("UPDATE agents SET message_floor = ? WHERE id = ?").run(prior.message_floor || prior.connected_at, id);
       }
     });
-    this.#changed("agent.connected");
+    this._changed("agent.connected");
     // A connect that names its task room joins it here, as a real membership with a real joined
     // event — not a second implicit path. An earlier version instead pinned a connecting agent to
     // whichever task happened to be the only active one, which then hid every later task from it;
@@ -1447,7 +1456,7 @@ export class DevTeamStore extends EventEmitter {
     const stamp = now();
     let reclaimed = 0;
     let claimToken = null;
-    this.#transaction(() => {
+    this._transaction(() => {
       // Move any live claim from the prior session to this one, re-issuing a fresh fencing token
       // and bumping the generation so the retired session's old token can no longer complete it.
       const priorClaim = this.db.prepare("SELECT id FROM assignments WHERE agent_id = ? AND status = 'claimed' LIMIT 1").get(prior.id);
@@ -1474,10 +1483,10 @@ export class DevTeamStore extends EventEmitter {
         UPDATE agents SET status = 'disconnected', current_task_id = NULL, disconnected_at = ?, resume_token_hash = NULL WHERE id = ?
       `).run(stamp, prior.id);
       if (prior.current_task_id) {
-        this.#event(prior.current_task_id, agentId, "agent.resumed", `${current.name} resumed a previous session and reclaimed its work.`, { reclaimedAssignments: reclaimed });
+        this._event(prior.current_task_id, agentId, "agent.resumed", `${current.name} resumed a previous session and reclaimed its work.`, { reclaimedAssignments: reclaimed });
       }
     });
-    this.#changed("agent.resumed", prior.current_task_id);
+    this._changed("agent.resumed", prior.current_task_id);
     return { resumed: true, agentId, reclaimedAssignments: reclaimed, taskId: prior.current_task_id || null, claimToken };
   }
 
@@ -1525,17 +1534,17 @@ export class DevTeamStore extends EventEmitter {
     const cleanRole = ["contributor", "observer"].includes(role) ? role : "contributor";
     const stamp = now();
     const isNew = !this.db.prepare("SELECT 1 FROM task_members WHERE task_id = ? AND agent_id = ?").get(taskId, agentId);
-    this.#transaction(() => {
+    this._transaction(() => {
       this.db.prepare(`
         INSERT INTO task_members (task_id, agent_id, role, joined_at) VALUES (?, ?, ?, ?)
         ON CONFLICT(task_id, agent_id) DO UPDATE SET role = excluded.role
       `).run(taskId, agentId, cleanRole, stamp);
       this.db.prepare("UPDATE agents SET last_seen = ? WHERE id = ?").run(stamp, agentId);
       if (isNew) {
-        this.#event(taskId, agentId, "agent.joined", `${agent.name} joined the task room${cleanRole === "observer" ? " as observer" : ""}.`, { role: cleanRole });
+        this._event(taskId, agentId, "agent.joined", `${agent.name} joined the task room${cleanRole === "observer" ? " as observer" : ""}.`, { role: cleanRole });
       }
     });
-    if (isNew) this.#changed("agent.joined", taskId);
+    if (isNew) this._changed("agent.joined", taskId);
     return { joined: true, taskId, agentId, role: cleanRole };
   }
 
@@ -1609,9 +1618,9 @@ export class DevTeamStore extends EventEmitter {
   disconnectAgent(agentId, summary = "") {
     const agent = this.getAgent(agentId);
     const stamp = now();
-    const affectedTaskIds = this.#transaction(() => this.#releaseAgentClaims(agent, stamp, summary || "Agent disconnected normally."));
-    this.#changed("agent.disconnected", agent.current_task_id);
-    for (const taskId of affectedTaskIds) this.#changed("assignment.released", taskId);
+    const affectedTaskIds = this._transaction(() => this.#releaseAgentClaims(agent, stamp, summary || "Agent disconnected normally."));
+    this._changed("agent.disconnected", agent.current_task_id);
+    for (const taskId of affectedTaskIds) this._changed("assignment.released", taskId);
     return { disconnected: true, agentId, summary };
   }
 
@@ -1635,9 +1644,9 @@ export class DevTeamStore extends EventEmitter {
     if (!force && !["disconnected", "unresponsive"].includes(agent.status)) {
       throw new Error("Agent is still connected. Disconnect it, or wait for it to go unresponsive, before removing it.");
     }
-    const affectedTaskIds = this.#transaction(() => this.#purgeAgent(agentId));
-    for (const taskId of affectedTaskIds) this.#changed("assignment.released", taskId);
-    this.#changed("agent.forgotten");
+    const affectedTaskIds = this._transaction(() => this.#purgeAgent(agentId));
+    for (const taskId of affectedTaskIds) this._changed("assignment.released", taskId);
+    this._changed("agent.forgotten");
     return { forgotten: true, agentId, name: agent.name };
   }
 
@@ -1657,7 +1666,7 @@ export class DevTeamStore extends EventEmitter {
         "UPDATE assignments SET status = 'queued', agent_id = NULL, claimed_at = NULL, claim_token_hash = NULL WHERE agent_id = ? AND status = 'claimed'",
       ).run(agentId);
       for (const taskId of claimedTaskIds) {
-        this.#event(taskId, null, "assignment.released", `${name}'s work returned to the queue when the agent was removed.`, { reason: "agent-forgotten" });
+        this._event(taskId, null, "assignment.released", `${name}'s work returned to the queue when the agent was removed.`, { reason: "agent-forgotten" });
         this.#syncTaskStatus(taskId, stamp);
       }
     }
@@ -1687,12 +1696,12 @@ export class DevTeamStore extends EventEmitter {
       throw new Error("Force release requires the exact assignment title as confirmation.");
     }
     const stamp = now();
-    this.#transaction(() => {
+    this._transaction(() => {
       this.db.prepare("UPDATE assignments SET status = 'queued', agent_id = NULL, claimed_at = NULL, claim_token_hash = NULL WHERE id = ?").run(assignmentId);
-      this.#event(assignment.task_id, assignment.agent_id, "assignment.released", reason, { assignmentId, reason: "force-release", requiresWrite: Boolean(assignment.requires_write) });
+      this._event(assignment.task_id, assignment.agent_id, "assignment.released", reason, { assignmentId, reason: "force-release", requiresWrite: Boolean(assignment.requires_write) });
       this.#syncTaskStatus(assignment.task_id, stamp);
     });
-    this.#changed("assignment.released", assignment.task_id);
+    this._changed("assignment.released", assignment.task_id);
     return { released: true, assignmentId, taskId: assignment.task_id, requiresWrite: Boolean(assignment.requires_write) };
   }
 
@@ -1724,7 +1733,7 @@ export class DevTeamStore extends EventEmitter {
       if (dependencies.length !== dependencyIds.length) throw new Error("Every dependency must reference an existing assignment.");
       if (dependencies.some((dependency) => dependency.task_id !== taskId)) throw new Error("Assignment dependencies must belong to the same task.");
     }
-    this.#transaction(() => {
+    this._transaction(() => {
       this.db.prepare(`
         INSERT INTO assignments (id, task_id, title, description, role, requires_write, target_agent_name, status, created_at, verifies, plans)
         VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
@@ -1737,7 +1746,7 @@ export class DevTeamStore extends EventEmitter {
           .run(assignment.id, dependencyId);
       }
       this.#syncTaskStatus(taskId);
-      this.#event(taskId, agentId, "assignment.created", assignment.title, {
+      this._event(taskId, agentId, "assignment.created", assignment.title, {
         assignmentId: assignment.id,
         role: assignment.role,
         verifies: behaviour.verifies,
@@ -1749,7 +1758,7 @@ export class DevTeamStore extends EventEmitter {
       });
     });
     this.assignmentAssessment({ assignmentId: assignment.id });
-    this.#changed("assignment.created", taskId);
+    this._changed("assignment.created", taskId);
     return { ...this.db.prepare("SELECT * FROM assignments WHERE id = ?").get(assignment.id), checklist: resolvedChecklist || [], writePaths, dependsOn: dependencyIds };
   }
 
@@ -1925,7 +1934,7 @@ export class DevTeamStore extends EventEmitter {
     if (Array.isArray(ladder) && ladder.length) {
       saved = saveLadder(root, agent.provider, { ladder, reportedBy: agent.name });
       if (saved.written) {
-        this.#event(taskId, agentId, "agent.progress",
+        this._event(taskId, agentId, "agent.progress",
           `${agent.name} reported what ${agent.provider} can be run as: ${saved.rungs} rungs, weakest first.`,
           { ladderRungs: saved.rungs, provider: agent.provider });
       }
@@ -2064,7 +2073,7 @@ export class DevTeamStore extends EventEmitter {
       return null;
     }
     const predicates = this.#claimPredicates({ agentName: agent.name, memberRooms, claimRooms, holdsWriteClaim });
-    const assignment = this.#transaction(() => {
+    const assignment = this._transaction(() => {
       // The eligible queue is the conjunction of the named predicates above — membership,
       // targeting, dependencies and review gating — each of which whyNotClaimable can also evaluate
       // on its own to say which one held an assignment back. The write lease is not part of it: it
@@ -2149,7 +2158,7 @@ export class DevTeamStore extends EventEmitter {
         `).run(candidate.task_id, agentId, stamp);
         this.#syncTaskStatus(candidate.task_id, stamp);
         const writeScope = candidate.requires_write ? this.#writeScopeFor(candidate.id) : [];
-        this.#event(candidate.task_id, agentId, "assignment.claimed", `${agent.name} claimed: ${candidate.title}`, {
+        this._event(candidate.task_id, agentId, "assignment.claimed", `${agent.name} claimed: ${candidate.title}`, {
           assignmentId: candidate.id,
           role: candidate.role,
           requiresWrite: Boolean(candidate.requires_write),
@@ -2181,7 +2190,7 @@ export class DevTeamStore extends EventEmitter {
       this.db.prepare("UPDATE agents SET status = 'waiting', last_seen = ? WHERE id = ?").run(now(), agentId);
       return null;
     });
-    if (assignment) this.#changed("assignment.claimed", assignment.task_id);
+    if (assignment) this._changed("assignment.claimed", assignment.task_id);
     return assignment;
   }
 
@@ -2479,7 +2488,7 @@ export class DevTeamStore extends EventEmitter {
       entries.push({ ...entry, argv: resolveLocalBinary(project.root, entry.argv) });
     }
     const stamp = now();
-    this.#transaction(() => {
+    this._transaction(() => {
       this.db.prepare("DELETE FROM project_check_commands WHERE project_id = ?").run(projectId);
       for (const entry of entries) {
         this.db.prepare("INSERT INTO project_check_commands (project_id, name, argv, created_at) VALUES (?, ?, ?, ?)")
@@ -2487,7 +2496,7 @@ export class DevTeamStore extends EventEmitter {
       }
       if (sandbox !== null) this.db.prepare("UPDATE projects SET check_sandbox = ? WHERE id = ?").run(sandbox ? 1 : 0, projectId);
     });
-    this.#changed("project.check_commands");
+    this._changed("project.check_commands");
     return {
       projectId, commands: entries, verificationEnabled: entries.length > 0,
       sandbox: this.projectCheckSandbox(projectId),
@@ -2719,7 +2728,7 @@ export class DevTeamStore extends EventEmitter {
           this.db.prepare("INSERT OR REPLACE INTO assignment_write_scopes (assignment_id, paths) VALUES (?, ?)")
             .run(fixAssignmentId, json(scope));
         }
-        this.#event(taskId, null, "assignment.created", `Fix the regression in “${regression.label}”`, {
+        this._event(taskId, null, "assignment.created", `Fix the regression in “${regression.label}”`, {
           assignmentId: fixAssignmentId, role: "implementer", requiresWrite: true,
           targetAgentName: soleSuspect?.author || null, regressionOf: regression.commandKey, writePaths: scope,
         });
@@ -2729,7 +2738,7 @@ export class DevTeamStore extends EventEmitter {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(regression.id, taskId, regression.commandKey, regression.label, assignmentId,
         regression.lastPassedAssignmentId, json(regression.suspects), fixAssignmentId, stamp);
-      this.#event(taskId, null, "check.regressed",
+      this._event(taskId, null, "check.regressed",
         `“${regression.label}” passed before and now fails${soleSuspect ? `, first failing after “${soleSuspect.title}”` : ""}.`, {
           label: regression.label,
           command: regression.command,
@@ -2848,9 +2857,9 @@ export class DevTeamStore extends EventEmitter {
     if (!assignment) throw new Error("Assignment not found in this task.");
     const value = Math.max(-100, Math.min(100, Math.trunc(Number(priority) || 0)));
     this.db.prepare("UPDATE assignments SET priority = ? WHERE id = ?").run(value, assignmentId);
-    this.#event(taskId, null, "assignment.prioritized",
+    this._event(taskId, null, "assignment.prioritized",
       `Priority for “${assignment.title}” set to ${value}.`, { assignmentId, priority: value });
-    this.#changed("assignment.prioritized", taskId);
+    this._changed("assignment.prioritized", taskId);
     return { assignmentId, taskId, priority: value };
   }
 
@@ -2865,9 +2874,9 @@ export class DevTeamStore extends EventEmitter {
     const stamp = now();
     const cleanReason = String(reason || "").trim().slice(0, 1000) || "The human asked for this work to stop.";
     this.db.prepare("UPDATE assignments SET cancel_requested_at = ?, cancel_reason = ? WHERE id = ?").run(stamp, cleanReason, assignmentId);
-    this.#event(taskId, assignment.agent_id, "assignment.cancel_requested",
+    this._event(taskId, assignment.agent_id, "assignment.cancel_requested",
       `Stop requested for “${assignment.title}”: ${cleanReason}`, { assignmentId, reason: cleanReason });
-    this.#changed("assignment.cancel_requested", taskId);
+    this._changed("assignment.cancel_requested", taskId);
     return { assignmentId, taskId, cancelRequested: true, reason: cleanReason };
   }
 
@@ -3153,13 +3162,13 @@ export class DevTeamStore extends EventEmitter {
       enriched.senderName = agent.name;
       directedTo = enriched.targetLabel;
     }
-    this.#transaction(() => {
-      this.#event(taskId, agentId, type, message.trim(), enriched);
+    this._transaction(() => {
+      this._event(taskId, agentId, type, message.trim(), enriched);
       this.db.prepare("UPDATE agents SET last_seen = ? WHERE id = ?").run(now(), agentId);
       this.db.prepare("UPDATE tasks SET updated_at = ? WHERE id = ?").run(now(), taskId);
     });
     this.markMessagesSeen(agentId);
-    this.#changed(type, taskId);
+    this._changed(type, taskId);
     return { posted: true, agent: agent.name, taskId, directedTo };
   }
 
@@ -3277,9 +3286,9 @@ export class DevTeamStore extends EventEmitter {
         agentId,
         detail: { commands: this.#reportedCheckCommands(task, checks), title: assignment.title },
       });
-      this.#event(assignment.task_id, agentId, "assignment.verifying",
+      this._event(assignment.task_id, agentId, "assignment.verifying",
         `DevTeam is running the checks ${agent.name} reported for “${assignment.title}”.`, { assignmentId, role: assignment.role, jobId });
-      this.#changed("assignment.verifying", assignment.task_id);
+      this._changed("assignment.verifying", assignment.task_id);
     }
     let checkRecords;
     try {
@@ -3309,7 +3318,7 @@ export class DevTeamStore extends EventEmitter {
     if (status !== "blocked" && failedChecks.length) {
       const stamp = now();
       let regressions = [];
-      this.#transaction(() => {
+      this._transaction(() => {
         // A refused report is still evidence, and is in fact where a regression is usually first
         // seen: the agent that trips over someone else's breakage is the one running the suite.
         const detected = this.#recordCheckBaselines({
@@ -3319,7 +3328,7 @@ export class DevTeamStore extends EventEmitter {
           taskId: assignment.task_id, assignmentId, regressions: detected, stamp, projectId: task?.project_id,
         });
         this.#storeReportedChecks(assignmentId, assignment.task_id, checkRecords, stamp);
-        this.#event(assignment.task_id, agentId, "assignment.check_failed",
+        this._event(assignment.task_id, agentId, "assignment.check_failed",
           `${agent.name} reported “${assignment.title}” as done, but ${failedChecks.length === 1 ? "a check" : `${failedChecks.length} checks`} DevTeam ran failed.`, {
             assignmentId,
             role: assignment.role,
@@ -3328,7 +3337,7 @@ export class DevTeamStore extends EventEmitter {
             ...(regressions.length ? { regressions: regressions.map((item) => item.label) } : {}),
           });
       });
-      this.#changed("assignment.check_failed", assignment.task_id);
+      this._changed("assignment.check_failed", assignment.task_id);
       // Distinguish "you broke this" from "you found this broken". Every failing check being the
       // reporter's fault was never true, and telling an agent to fix a regression it did not cause
       // is how a team wastes an afternoon.
@@ -3358,7 +3367,7 @@ export class DevTeamStore extends EventEmitter {
     let version;
     let followUpAssignmentId = null;
     let regressions = [];
-    this.#transaction(() => {
+    this._transaction(() => {
       const stamp = now();
       this.db.prepare("UPDATE assignments SET status = ?, completed_at = ?, claim_token_hash = NULL WHERE id = ?")
         .run(status === "blocked" ? "blocked" : "done", stamp, assignmentId);
@@ -3389,7 +3398,7 @@ export class DevTeamStore extends EventEmitter {
         }),
       });
       this.#storeReportedChecks(assignmentId, assignment.task_id, checkRecords, stamp);
-      this.#event(assignment.task_id, agentId, status === "blocked" ? "assignment.blocked" : "assignment.completed", message.trim(), {
+      this._event(assignment.task_id, agentId, status === "blocked" ? "assignment.blocked" : "assignment.completed", message.trim(), {
         assignmentId,
         role: assignment.role,
         changedFiles: cleanChanged,
@@ -3416,7 +3425,7 @@ export class DevTeamStore extends EventEmitter {
           this.planningRoleFor(task.project_id),
           stamp,
         );
-        this.#event(assignment.task_id, agentId, "assignment.created", `Resolve blocker: ${assignment.title}`, {
+        this._event(assignment.task_id, agentId, "assignment.created", `Resolve blocker: ${assignment.title}`, {
           assignmentId: followUpAssignmentId,
           role: this.planningRoleFor(task.project_id),
           requiresWrite: false,
@@ -3432,7 +3441,7 @@ export class DevTeamStore extends EventEmitter {
         this.#syncTaskStatus(assignment.task_id, stamp);
       }
     });
-    this.#changed(status === "blocked" ? "assignment.blocked" : "assignment.completed", assignment.task_id);
+    this._changed(status === "blocked" ? "assignment.blocked" : "assignment.completed", assignment.task_id);
     return {
       completed: true,
       taskId: assignment.task_id,
@@ -3574,7 +3583,7 @@ export class DevTeamStore extends EventEmitter {
       throw new Error("The author of the current version cannot approve it; an independent reviewer or tester must.");
     }
     let outcome;
-    this.#transaction(() => {
+    this._transaction(() => {
       const stamp = now();
       // Independence is recorded on the approval, not recomputed later. Whether the approver was the
       // author is a fact about the moment of approving; recomputing it lets the record change as
@@ -3586,7 +3595,7 @@ export class DevTeamStore extends EventEmitter {
         ON CONFLICT(task_id, agent_id, version) DO UPDATE SET summary = excluded.summary, created_at = excluded.created_at,
           independent = excluded.independent, verified_evidence = excluded.verified_evidence
       `).run(taskId, agentId, task.version, summary.trim(), stamp, independent ? 1 : 0, verifiedEvidence ? 1 : 0);
-      this.#event(taskId, agentId, "task.approved",
+      this._event(taskId, agentId, "task.approved",
         `${agent.name} approved version ${task.version}${independent ? "" : " (self-review: no independent teammate was available)"}.`,
         { summary: summary.trim(), version: task.version, independent, verifiedEvidence });
       const approvers = this.#approvers(taskId, task.version);
@@ -3599,7 +3608,7 @@ export class DevTeamStore extends EventEmitter {
       const selfReviewed = authors.size > 0 ? independentApprovalCount === 0 : approvers.size <= 1;
       if (accepted) {
         this.db.prepare("UPDATE tasks SET status = 'accepted', updated_at = ? WHERE id = ?").run(stamp, taskId);
-        this.#event(taskId, null, "task.accepted", `${selfReviewed ? "Self-reviewed acceptance" : "Consensus reached"} for version ${task.version}.`, { approvalCount, requiredApprovals: effectiveRequired, selfReviewed });
+        this._event(taskId, null, "task.accepted", `${selfReviewed ? "Self-reviewed acceptance" : "Consensus reached"} for version ${task.version}.`, { approvalCount, requiredApprovals: effectiveRequired, selfReviewed });
         // Keep the room's agents assembled (status 'waiting', membership intact) rather than force-
         // disconnecting them on acceptance, so the human can send a same-conversation follow-up that
         // continueTask reopens and the still-waiting agents pick up without restarting their sessions.
@@ -3613,7 +3622,7 @@ export class DevTeamStore extends EventEmitter {
       }
       outcome = { accepted, approvalCount, requiredApprovals: effectiveRequired, configuredApprovals: task.required_approvals, openAssignments, version: task.version, selfReviewed };
     });
-    this.#changed(outcome.accepted ? "task.accepted" : "task.approved", taskId);
+    this._changed(outcome.accepted ? "task.accepted" : "task.approved", taskId);
     return outcome;
   }
 
@@ -3661,7 +3670,7 @@ export class DevTeamStore extends EventEmitter {
       ? (this.db.prepare("SELECT name FROM agents WHERE id = ?").get(assignment.agent_id)?.name || null)
       : null;
     let outcome;
-    this.#transaction(() => {
+    this._transaction(() => {
       const stamp = now();
       const reworkCount = Number(assignment.rework_count || 0) + 1;
       // Back to queued, addressed to whoever wrote it. Targeting is a preference, not a lock: the
@@ -3685,7 +3694,7 @@ export class DevTeamStore extends EventEmitter {
       // approvals: if the rework changes files the version bumps and they would have gone anyway,
       // and if it changes none they would otherwise have survived a reviewer saying "not yet".
       const clearedApprovals = this.db.prepare("DELETE FROM approvals WHERE task_id = ? AND version = ?").run(taskId, task.version).changes;
-      this.#event(taskId, agentId, "assignment.changes_requested",
+      this._event(taskId, agentId, "assignment.changes_requested",
         `${agent?.name || "The human"} sent “${assignment.title}” back for changes: ${cleanSummary}`, {
           assignmentId,
           role: assignment.role,
@@ -3708,7 +3717,7 @@ export class DevTeamStore extends EventEmitter {
         version: Number(task.version),
       };
     });
-    this.#changed("assignment.changes_requested", taskId);
+    this._changed("assignment.changes_requested", taskId);
     return {
       ...outcome,
       next: outcome.routedTo
@@ -3760,7 +3769,7 @@ export class DevTeamStore extends EventEmitter {
       UPDATE agents SET status = 'waiting', current_task_id = NULL, last_seen = ?
       WHERE current_task_id = ? AND status != 'disconnected'
     `).run(stamp, taskId);
-    this.#event(taskId, null, "agent.standdown", note, { agents: affected.map((a) => a.name) });
+    this._event(taskId, null, "agent.standdown", note, { agents: affected.map((a) => a.name) });
   }
 
   // `kind` defaults only for the human, who blocks from a dashboard button and is not choosing
@@ -3781,16 +3790,16 @@ export class DevTeamStore extends EventEmitter {
       throw new Error(`Nothing is open on "${task.title}", so there is no work in flight for a ${blockKind} blocker to stop. Finishing is not blocking: if the work is done, approve the current version and let the human accept it. If you genuinely need the human, block with kind "needs-human" and say exactly what you need from them.`);
     }
     const stamp = now();
-    this.#transaction(() => {
+    this._transaction(() => {
       this.db.prepare("UPDATE tasks SET status = 'blocked', updated_at = ? WHERE id = ?").run(stamp, taskId);
       this.db.prepare(`
         UPDATE assignments SET status = 'blocked', completed_at = COALESCE(completed_at, ?), claim_token_hash = NULL
         WHERE task_id = ? AND status IN ('queued', 'claimed')
       `).run(stamp, taskId);
-      this.#event(taskId, agentId, "task.blocked", reason.trim(), { kind: blockKind });
+      this._event(taskId, agentId, "task.blocked", reason.trim(), { kind: blockKind });
       this.#standDownTaskAgents(taskId, stamp, "Task was blocked; co-workers were released to other work.");
     });
-    this.#changed("task.blocked", taskId);
+    this._changed("task.blocked", taskId);
     return { blocked: true, taskId, reason: reason.trim(), kind: blockKind };
   }
 
@@ -3871,7 +3880,7 @@ export class DevTeamStore extends EventEmitter {
       ? ` This plan is addressed to ${target}: route the work it creates to ${target} unless the project state makes that impossible, and say so if it does.`
       : "";
     let version;
-    this.#transaction(() => {
+    this._transaction(() => {
       this.db.prepare("UPDATE tasks SET status = 'planning', version = version + 1, updated_at = ? WHERE id = ?")
         .run(stamp, taskId);
       this.db.prepare("DELETE FROM approvals WHERE task_id = ?").run(taskId);
@@ -3880,8 +3889,8 @@ export class DevTeamStore extends EventEmitter {
         VALUES (?, ?, 'Plan resumed task', ?, ?, 0, ?, 'queued', ?, 1)
       `).run(assignmentId, taskId, `The human resumed this blocked task: ${cleanReason}. Inspect the current project state and create fresh implementation and review assignments; do not revive stale claims.${routing}`, planningRoleName, target, stamp);
       version = this.db.prepare("SELECT version FROM tasks WHERE id = ?").get(taskId).version;
-      this.#event(taskId, null, "task.unblocked", `Human resumed the task: ${cleanReason}`, { reason: cleanReason, version, targetAgentName: target });
-      this.#event(taskId, null, "assignment.created", "Plan resumed task", {
+      this._event(taskId, null, "task.unblocked", `Human resumed the task: ${cleanReason}`, { reason: cleanReason, version, targetAgentName: target });
+      this._event(taskId, null, "assignment.created", "Plan resumed task", {
         assignmentId,
         role: planningRoleName,
         requiresWrite: false,
@@ -3889,7 +3898,7 @@ export class DevTeamStore extends EventEmitter {
         resumed: true,
       });
     });
-    this.#changed("task.unblocked", taskId);
+    this._changed("task.unblocked", taskId);
     return { resumed: true, taskId, assignmentId, version, status: "planning", targetAgentName: target };
   }
 
@@ -3930,9 +3939,9 @@ export class DevTeamStore extends EventEmitter {
       SELECT COUNT(*) AS count FROM approvals WHERE task_id = ? AND version = ?
     `).get(taskId, task.version).count);
     const stamp = now();
-    this.#transaction(() => {
+    this._transaction(() => {
       this.db.prepare("UPDATE tasks SET status = 'accepted', updated_at = ? WHERE id = ?").run(stamp, taskId);
-      this.#event(taskId, null, "task.accepted",
+      this._event(taskId, null, "task.accepted",
         `Human accepted version ${task.version}${task.status === "blocked" ? " from blocked" : ""}: ${cleanSummary}`, {
           summary: cleanSummary,
           version: task.version,
@@ -3946,7 +3955,7 @@ export class DevTeamStore extends EventEmitter {
         WHERE current_task_id = ? AND status != 'disconnected'
       `).run(stamp, taskId);
     });
-    this.#changed("task.accepted", taskId);
+    this._changed("task.accepted", taskId);
     return {
       accepted: true,
       taskId,
@@ -3963,15 +3972,15 @@ export class DevTeamStore extends EventEmitter {
     const normalized = String(target || "all").trim() || "all";
     const targetKey = normalized.toLowerCase();
     let eventId;
-    this.#transaction(() => {
-      eventId = this.#event(taskId, null, "human.message", message.trim(), {
+    this._transaction(() => {
+      eventId = this._event(taskId, null, "human.message", message.trim(), {
         target: targetKey,
         targetLabel: targetKey === "all" ? "all agents" : normalized,
         ...(replyTo ? { replyTo: Number(replyTo) } : {}),
       });
       this.db.prepare("UPDATE tasks SET updated_at = ? WHERE id = ?").run(now(), taskId);
     });
-    this.#changed("human.message", taskId);
+    this._changed("human.message", taskId);
     return { posted: true, eventId, target: targetKey };
   }
 
@@ -3992,8 +4001,8 @@ export class DevTeamStore extends EventEmitter {
     const firstLine = cleanMessage.split("\n")[0].slice(0, 120) || "new request";
     const stamp = now();
     let result;
-    this.#transaction(() => {
-      const eventId = this.#event(taskId, null, "human.message", cleanMessage, {
+    this._transaction(() => {
+      const eventId = this._event(taskId, null, "human.message", cleanMessage, {
         target: targetKey,
         targetLabel: targetKey === "all" ? "all agents" : normalized,
         continuation: true,
@@ -4017,12 +4026,12 @@ export class DevTeamStore extends EventEmitter {
         INSERT INTO assignments (id, task_id, title, description, role, requires_write, target_agent_name, status, created_at, plans)
         VALUES (?, ?, ?, ?, ?, 0, NULL, 'queued', ?, 1)
       `).run(assignmentId, taskId, title, `Plan the follow-up requested in chat: "${firstLine}". Split it into implementation and review work as needed.`, planningRoleName, stamp);
-      this.#event(taskId, byAgentId, "assignment.created", title, { assignmentId, role: planningRoleName, requiresWrite: false, targetAgentName: null, continuesEvent: eventId });
+      this._event(taskId, byAgentId, "assignment.created", title, { assignmentId, role: planningRoleName, requiresWrite: false, targetAgentName: null, continuesEvent: eventId });
       this.#syncTaskStatus(taskId, stamp);
       const version = this.db.prepare("SELECT version FROM tasks WHERE id = ?").get(taskId).version;
       result = { taskId, eventId, reopened, version, assignmentId };
     });
-    this.#changed("task.continued", taskId);
+    this._changed("task.continued", taskId);
     return result;
   }
 
@@ -4051,7 +4060,7 @@ export class DevTeamStore extends EventEmitter {
     const author = agentId ? this.getAgent(agentId) : null;
     const stamp = now();
     let result;
-    this.#transaction(() => {
+    this._transaction(() => {
       const current = this.db.prepare(`SELECT version FROM ${target.table} WHERE ${target.idColumn} = ? AND key = ?`).get(target.id, cleanKey);
       const currentVersion = current?.version || 0;
       if (expectedVersion !== null && Number(expectedVersion) !== currentVersion) {
@@ -4064,10 +4073,10 @@ export class DevTeamStore extends EventEmitter {
         VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(${target.idColumn}, key) DO UPDATE SET value = excluded.value, version = excluded.version, updated_by = excluded.updated_by, updated_by_name = excluded.updated_by_name, updated_at = excluded.updated_at
       `).run(target.id, cleanKey, cleanValue, nextVersion, agentId, author?.name || "human", stamp);
-      this.#event(taskId, agentId, "blackboard.updated", `${target.scope === "project" ? "Project" : "Task"} memory "${cleanKey}" updated (v${nextVersion}).`, { scope: target.scope, key: cleanKey, version: nextVersion });
+      this._event(taskId, agentId, "blackboard.updated", `${target.scope === "project" ? "Project" : "Task"} memory "${cleanKey}" updated (v${nextVersion}).`, { scope: target.scope, key: cleanKey, version: nextVersion });
       result = { ok: true, scope: target.scope, key: cleanKey, version: nextVersion, updatedBy: author?.name || "human", updatedAt: stamp };
     });
-    if (result.ok) this.#changed("blackboard.updated", taskId);
+    if (result.ok) this._changed("blackboard.updated", taskId);
     return result;
   }
 
@@ -4109,7 +4118,7 @@ export class DevTeamStore extends EventEmitter {
     this.assertMembership(agentId, taskId);
     const agent = agentId ? this.getAgent(agentId) : null;
     const author = agent?.name || "the human";
-    const eventId = this.#event(taskId, agentId, "agent.finding", `${author} recorded: ${String(title || "").trim()}`, {
+    const eventId = this._event(taskId, agentId, "agent.finding", `${author} recorded: ${String(title || "").trim()}`, {
       category: String(category || "").trim().toLowerCase(),
       confidence,
       knowledgeNote: true,
@@ -4121,7 +4130,7 @@ export class DevTeamStore extends EventEmitter {
     if (result.written) {
       try { this.knowledge.exportProject(task.project_id); } catch { /* the vault export is best-effort, as elsewhere */ }
     }
-    this.#changed("knowledge.written", taskId);
+    this._changed("knowledge.written", taskId);
     return { ...result, vaultPath: path.join(task.project_root, "knowledge") };
   }
 
@@ -4150,8 +4159,8 @@ export class DevTeamStore extends EventEmitter {
     const agent = agentId ? this.getAgent(agentId) : null;
     const result = this.knowledge.confirmNote(task.project_id, noteId, { author: agent?.name || "the human" });
     if (!result.confirmed) throw new Error("Note not found in this project.");
-    this.#event(taskId, agentId, "agent.finding", `${agent?.name || "The human"} confirmed a knowledge note still holds.`, { noteId, confirmed: true });
-    this.#changed("knowledge.confirmed", taskId);
+    this._event(taskId, agentId, "agent.finding", `${agent?.name || "The human"} confirmed a knowledge note still holds.`, { noteId, confirmed: true });
+    this._changed("knowledge.confirmed", taskId);
     return result;
   }
 
@@ -4164,10 +4173,10 @@ export class DevTeamStore extends EventEmitter {
     const agent = agentId ? this.getAgent(agentId) : null;
     const result = this.knowledge.disputeNotes(task.project_id, noteIds, reason);
     if (!result.disputed) throw new Error("Give at least two note IDs from this project that disagree.");
-    this.#event(taskId, agentId, "agent.finding",
+    this._event(taskId, agentId, "agent.finding",
       `${agent?.name || "The human"} flagged ${result.disputed} knowledge notes as contradicting each other.`,
       { noteIds: result.noteIds, reason: String(reason || "").slice(0, 500) });
-    this.#changed("knowledge.disputed", taskId);
+    this._changed("knowledge.disputed", taskId);
     return { ...result, next: "Disputed notes are excluded from briefings until resolved. Decide which is right and write over the other, or raise it with devteam_propose." };
   }
 
@@ -4178,10 +4187,10 @@ export class DevTeamStore extends EventEmitter {
     this.assertMembership(agentId, taskId);
     const agent = agentId ? this.getAgent(agentId) : null;
     const result = this.knowledge.shareNote(task.project_id, noteId, { shared });
-    this.#event(taskId, agentId, "agent.finding",
+    this._event(taskId, agentId, "agent.finding",
       `${agent?.name || "The human"} ${shared ? "shared a lesson with other projects" : "withdrew a lesson from other projects"}.`,
       { noteId, shared: Boolean(shared) });
-    this.#changed("knowledge.shared", taskId);
+    this._changed("knowledge.shared", taskId);
     return result;
   }
 
