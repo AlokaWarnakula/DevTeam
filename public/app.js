@@ -66,36 +66,8 @@ function activityLine(agent) {
   return relativeTime(agent.last_seen);
 }
 
-function runtimeSelectionLabel(selection) {
-  if (!selection?.modelLabel || !selection?.effortLabel) return null;
-  const effort = selection.effortLabel === selection.effortClass
-    ? selection.effortLabel
-    : `${selection.effortLabel} (${selection.effortClass})`;
-  return `${selection.modelLabel} (${selection.modelClass}) · ${effort}`;
-}
 
-function runtimeProfileLabel(profile) {
-  if (!profile) return null;
-  const model = profile.availableModels?.find((item) => item.id === profile.currentModel);
-  const effort = model?.efforts?.find((item) => item.id === profile.currentEffort);
-  if (!model || !effort) return null;
-  return runtimeSelectionLabel({
-    modelLabel: model.label,
-    modelClass: model.class,
-    effortLabel: effort.label,
-    effortClass: effort.class,
-  });
-}
 
-function assignmentRuntimeLabel(assignment) {
-  const resolution = assignment.runtimeResolution;
-  const advertised = runtimeSelectionLabel(resolution?.recommendation);
-  if (advertised) return `${resolution.satisfied ? "Current" : "Needs at least"} ${advertised}`;
-  // Nothing at all when no profile is registered, which is the normal case. Announcing that a gate
-  // is inactive on every queued card told the reader about a feature rather than about their work.
-  if (!assignment.runtimeProfileSource) return "";
-  return resolution?.reason || "No advertised model/effort combination matches this assignment.";
-}
 let state = null;
 let selectedTaskId = new URLSearchParams(location.search).get("task");
 let selectedProjectId = null;
@@ -501,7 +473,10 @@ function renderTask(task) {
     // says nothing rather than taking a line to announce its own absence on every card.
     const assessment = item.assessment;
     const assessmentView = assessment && leaseIsLive
-      ? `<div class="complexity"><strong>${escapeHtml(assessment.level)} · score ${Number(assessment.score)}</strong>${assignmentRuntimeLabel(item) ? `<span>${escapeHtml(assignmentRuntimeLabel(item))}</span>` : ""}<small>${assessment.reasons.slice(0, 2).map((reason) => escapeHtml(reason.detail)).join(" · ") || "Scoped baseline work."}</small></div>`
+      // Lead with the model this needs, in the names the ladder reported. The level and score are
+      // DevTeam's own vocabulary and stay as the small print — useful when you want to know why, and
+      // meaningless as a headline. With no ladder reported yet, the level leads instead.
+      ? `<div class="complexity"><strong>${item.needsRung ? `Needs ${escapeHtml(item.needsRung)}` : escapeHtml(assessment.level)}</strong>${item.needsRung ? `<span>${escapeHtml(assessment.level)} · score ${Number(assessment.score)}</span>` : ""}<small>${assessment.reasons.slice(0, 2).map((reason) => escapeHtml(reason.detail)).join(" · ") || "Ordinary scoped work."}</small></div>`
       : "";
     const runtimeDecision = item.runtimeDecision && leaseIsLive
       ? `<small class="runtime-decision">Runtime: ${escapeHtml(item.runtimeDecision.choice)} by ${escapeHtml(item.runtimeDecision.actor)}</small>`
@@ -740,11 +715,9 @@ function renderAgentList() {
     const forget = agent.status === "unresponsive"
       ? `<button class="row-delete" data-forget-agent="${agent.id}" data-forget-name="${escapeHtml(agent.name)}" title="Remove this unresponsive agent from DevTeam" aria-label="Remove ${escapeHtml(agent.name)}">×</button>`
       : "";
-    const profile = agent.runtimeProfile;
-    const profileLabel = runtimeProfileLabel(profile);
-    const runtime = profile
-      ? `<small class="runtime-profile">${escapeHtml(profileLabel || "Registered profile has no valid current selection")} · ${escapeHtml(profile.source)}${profile.stale ? " · expired" : ""}</small>`
-      : "";
+    // What this session says it is running, in the words it reported at join.
+    const running = [agent.current_model, agent.current_effort].filter(Boolean).join(" · ");
+    const runtime = running ? `<small class="runtime-profile">${escapeHtml(running)}</small>` : "";
     return `<div class="agent"><div class="avatar">${initials(agent.name)}</div><div class="agent-info"><strong>${escapeHtml(agent.name)}${unread}</strong><small>${escapeHtml(agent.provider)} · ${escapeHtml(agent.status)} · session ${Number(agent.session_generation || 1)}</small>${runtime}<small class="activity">${escapeHtml(activityLine(agent))}</small></div><span class="agent-actions"><span class="agent-status ${agent.status} ${freshness(agent.last_seen)}" title="${escapeHtml(agent.status)} · seen ${relativeTime(agent.last_seen)}"></span>${forget}</span></div>`;
   }).join("") || `<p class="hint">No agents connected. Copy the MCP setup, then invoke <code>$devteam</code> in an AI desktop.</p>`;
   renderReconnectList();

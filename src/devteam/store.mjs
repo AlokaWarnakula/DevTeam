@@ -8,6 +8,7 @@ import { CodeGraph } from "./codegraph.mjs";
 import { KnowledgeVault } from "./knowledge.mjs";
 import { buildBudgetedBrief, clipUtf8, DEFAULT_BRIEF_BUDGET } from "./brief.mjs";
 import { DEFAULT_ROLES, loadProjectRoles, planningRole, roleBehaviour, ROLES_CONFIG_PATH } from "./roles.mjs";
+import { currentRung, ladderIsStale, loadLadders, requiredRung, rungLabel, saveLadder } from "./models.mjs";
 import { hashToken, mintToken, normalizeTokenLabel, tokensMatch } from "./access.mjs";
 import {
   boundedCheckpointText,
@@ -705,6 +706,11 @@ export class DevTeamStore extends EventEmitter {
       ["agents", "fresh_task_id", "TEXT"],
       ["agents", "replaced_by_agent_id", "TEXT"],
       ["agents", "session_policy_ack_task_id", "TEXT"],
+      // What this session reports it is running right now. Free text in the agent's own words: it is
+      // the one party that actually knows, and DevTeam compares it only against that provider's own
+      // reported ladder, never across vendors.
+      ["agents", "current_model", "TEXT"],
+      ["agents", "current_effort", "TEXT"],
       ["events", "author_name", "TEXT"],                                   // who wrote it, kept even after the agent row is purged
       ["events", "author_kind", "TEXT"],
       ["projects", "check_sandbox", "INTEGER NOT NULL DEFAULT 0"],       // confine node checks to the project root
@@ -2615,7 +2621,7 @@ export class DevTeamStore extends EventEmitter {
     };
   }
 
-  connectAgent({ name, provider, capabilities = [], runtimeProfile = null, sessionGeneration = 1, freshTaskId = null }) {
+  connectAgent({ name, provider, capabilities = [], runtimeProfile = null, sessionGeneration = 1, freshTaskId = null, model = null, effort = null }) {
     const cleanName = name.trim();
     const cleanProvider = provider.trim();
     if (!cleanName || !cleanProvider) throw new Error("Agent name and provider are required.");
@@ -2631,9 +2637,10 @@ export class DevTeamStore extends EventEmitter {
     const RECONNECT_REPLAY_MS = 6 * 60 * 60 * 1000;
     this.#transaction(() => {
       this.db.prepare(`
-        INSERT INTO agents (id, name, provider, capabilities, status, connected_at, last_seen, resume_token_hash, session_generation, fresh_task_id)
-        VALUES (?, ?, ?, ?, 'waiting', ?, ?, ?, ?, ?)
-      `).run(id, cleanName, cleanProvider, json(capabilities), stamp, stamp, this.#hashToken(resumeToken), Math.max(1, Number(sessionGeneration) || 1), freshTaskId || null);
+        INSERT INTO agents (id, name, provider, capabilities, status, connected_at, last_seen, resume_token_hash, session_generation, fresh_task_id, current_model, current_effort)
+        VALUES (?, ?, ?, ?, 'waiting', ?, ?, ?, ?, ?, ?, ?)
+      `).run(id, cleanName, cleanProvider, json(capabilities), stamp, stamp, this.#hashToken(resumeToken), Math.max(1, Number(sessionGeneration) || 1), freshTaskId || null,
+        String(model || "").trim().slice(0, 80) || null, String(effort || "").trim().slice(0, 40) || null);
       // A returning identity (same name+provider) that recently disconnected should still see what it
       // missed while away, even on a plain reconnect that carries no resume token. Inherit that prior
       // session's read floor — never its claim or write lease — so the backlog of directed/broadcast
@@ -3186,6 +3193,143 @@ export class DevTeamStore extends EventEmitter {
     return [...new Set([...this.#claimableTaskIds(agent.id), ...invitedRooms])];
   }
 
+  // Cache what an agent reported it can be run as, and say whether we should ask again.
+  //
+  // Asking the agent is the only honest source: it is the one party that knows what its host offers,
+  // and the alternative — a catalogue typed in by hand — is exactly the dialog nobody ever filled in.
+  // It is cached because interrogating every session is wasteful, and it expires because a list of
+  // models written once in March is wrong by June.
+  runtimeLadder({ agentId, taskId, model = null, effort = null, ladder = null }) {
+    const agent = this.getAgent(agentId);
+    if (!agent) throw new Error("Agent not found.");
+    const stamp = now();
+    if (model || effort) {
+      this.db.prepare("UPDATE agents SET current_model = COALESCE(?, current_model), current_effort = COALESCE(?, current_effort) WHERE id = ?")
+        .run(model ? String(model).trim().slice(0, 80) : null, effort ? String(effort).trim().slice(0, 40) : null, agentId);
+    }
+    const task = taskId ? this.getTask(taskId) : null;
+    if (!task) return { known: false, askForLadder: false, reason: "no project in view yet" };
+    const root = task.project_root;
+    let saved = null;
+    if (Array.isArray(ladder) && ladder.length) {
+      saved = saveLadder(root, agent.provider, { ladder, reportedBy: agent.name });
+      if (saved.written) {
+        this.#event(taskId, agentId, "agent.progress",
+          `${agent.name} reported what ${agent.provider} can be run as: ${saved.rungs} rungs, weakest first.`,
+          { ladderRungs: saved.rungs, provider: agent.provider });
+      }
+    }
+    const ladders = loadLadders(root);
+    const entry = ladders.providers[agent.provider];
+    const stale = ladderIsStale(entry, Date.parse(stamp));
+    const rung = this.agentRung({ ...agent, current_model: model || agent.current_model, current_effort: effort || agent.current_effort }, root);
+    return {
+      known: Boolean(entry?.ladder?.length),
+      askForLadder: stale,
+      ...(saved ? { ladderSaved: saved.written, ...(saved.written ? {} : { notSaved: saved.reason }) } : {}),
+      ...(entry?.ladder?.length ? {
+        ladder: entry.ladder.map((step) => rungLabel(step)),
+        ladderSource: entry.source,
+        ladderReportedAt: entry.reportedAt,
+      } : {}),
+      ...(rung && rung.at >= 0 ? { running: rungLabel(rung.ladder[rung.at]), rung: rung.at } : {}),
+      ...(rung && rung.at < 0 && entry?.ladder?.length ? {
+        running: null,
+        note: "This session's model is not on the reported ladder, so DevTeam cannot tell whether work is above it. Nothing will be withheld from you.",
+      } : {}),
+      next: stale
+        ? "Call devteam_join again with `ladder`: the model and effort combinations this host can run you at, ordered weakest first. It is cached for a week and is what lets DevTeam name the model a hard assignment needs."
+        : null,
+    };
+  }
+
+  // The rung a difficulty level needs, named from whatever ladder this project has cached. Any
+  // provider will do: they are all describing the same piece of work, and the human recognises the
+  // names either way. Null when no ladder has been reported yet, and the dashboard then says nothing
+  // rather than falling back to a score nobody can act on.
+  #rungLabelFor(projectId, level) {
+    const project = this.db.prepare("SELECT root FROM projects WHERE id = ?").get(projectId);
+    if (!project?.root) return null;
+    let ladders;
+    try { ladders = loadLadders(project.root); } catch { return null; }
+    const entry = Object.values(ladders.providers)[0];
+    if (!entry?.ladder?.length) return null;
+    return rungLabel(entry.ladder[requiredRung(level, entry.ladder.length)]);
+  }
+
+  // The ladder this provider reported, and where this session sits on it. Everything about model
+  // selection reads through here, so there is one place that decides what "too hard for you" means.
+  //
+  // A missing ladder, an unrecognised current model, or a session that never said what it is running
+  // all resolve to "cannot judge", and cannot-judge never withholds work. Silence has to mean the
+  // team keeps working, or one unreported field stalls the board.
+  agentRung(agent, projectRoot) {
+    if (!agent?.provider) return null;
+    let ladders;
+    try { ladders = loadLadders(projectRoot); } catch { return null; }
+    const entry = ladders.providers[agent.provider];
+    if (!entry?.ladder?.length) return null;
+    const at = currentRung(entry.ladder, agent.current_model, agent.current_effort);
+    return { ladder: entry.ladder, at, source: entry.source, reportedAt: entry.reportedAt };
+  }
+
+  #aboveCurrentRung(agent, candidate) {
+    const rung = this.agentRung(agent, candidate.project_root);
+    if (!rung || rung.at < 0) return false;
+    const assessment = this.db.prepare(`
+      SELECT level FROM complexity_assessments WHERE assignment_id = ? AND invalidated_at IS NULL
+      ORDER BY created_at DESC LIMIT 1
+    `).get(candidate.id);
+    if (!assessment) return false;
+    return requiredRung(assessment.level, rung.ladder.length) > rung.at;
+  }
+
+  // What is waiting for a stronger session, in the words the human will recognise. Returned with the
+  // idle answer so "nothing for me" can never be mistaken for "the work is finished".
+  workAboveCurrentRung(agentId) {
+    const agent = this.getAgent(agentId);
+    if (!agent) return null;
+    const rooms = this.#claimableTaskIds(agentId);
+    if (!rooms.length) return null;
+    const placeholders = rooms.map(() => "?").join(", ");
+    const queued = this.db.prepare(`
+      SELECT a.id, a.title, a.task_id, t.title AS task_title, p.root AS project_root
+      FROM assignments a
+      JOIN tasks t ON t.id = a.task_id
+      JOIN projects p ON p.id = t.project_id
+      WHERE a.status = 'queued' AND a.task_id IN (${placeholders})
+    `).all(...rooms);
+    const held = [];
+    let rung = null;
+    for (const candidate of queued) {
+      rung = rung || this.agentRung(agent, candidate.project_root);
+      if (!rung || rung.at < 0) return null;
+      if (!this.#aboveCurrentRung(agent, candidate)) continue;
+      const assessment = this.db.prepare(`
+        SELECT level FROM complexity_assessments WHERE assignment_id = ? AND invalidated_at IS NULL
+        ORDER BY created_at DESC LIMIT 1
+      `).get(candidate.id);
+      held.push({
+        assignmentId: candidate.id,
+        title: candidate.title,
+        taskId: candidate.task_id,
+        taskTitle: candidate.task_title,
+        level: assessment?.level || null,
+        needs: rungLabel(rung.ladder[requiredRung(assessment?.level, rung.ladder.length)]),
+      });
+    }
+    if (!held.length) return null;
+    const needed = [...new Set(held.map((item) => item.needs).filter(Boolean))];
+    return {
+      running: rungLabel(rung.ladder[rung.at]),
+      needs: needed,
+      assignments: held.slice(0, 10),
+      count: held.length,
+      message: `${held.length} assignment${held.length === 1 ? "" : "s"} on this board ${held.length === 1 ? "needs" : "need"} ${needed.join(" or ")}, and this session is running ${rungLabel(rung.ladder[rung.at])}.`,
+      humanAction: "Start a fresh session on that model and join this same task. Nothing is lost and nothing needs replanning: the task, its queue, its history and its memory are all still here, and the new session picks up exactly where this one stopped.",
+    };
+  }
+
   claimNextAssignment(agentId) {
     this.#reapStaleAgents();
     this.#recoverOrphanedClaims();
@@ -3266,6 +3410,11 @@ export class DevTeamStore extends EventEmitter {
         // depends on session lineage and on who is connected right now, neither of which the scan's
         // single query can see.
         if (candidate.verifies && this.#verifierIsAuthor(agentId, candidate)) continue;
+        // Above this session's rung: skipped, not blocked. The agent goes on to take everything it
+        // *can* do, and only when nothing claimable is left does it go idle saying what remains and
+        // what that work needs. Stopping at the first hard item instead would strand work the
+        // current model was perfectly capable of finishing.
+        if (this.#aboveCurrentRung(agent, candidate)) continue;
         const gate = this.#runtimeGate(agent, candidate);
         if (gate.skip) continue;
         // Preserve the queue's targeted-first ordering for recommendations, but do not let one
@@ -5618,6 +5767,9 @@ export class DevTeamStore extends EventEmitter {
         resolvedFindings: this.#findingsFor(assignment.id, { includeResolved: true }).filter((finding) => finding.resolved_at),
         schedulingHold: this.#schedulingHold(assignment),
         assessment,
+        // The score in the words the human uses for their own models. "Base · Score 0" is DevTeam's
+        // vocabulary, not anyone else's; "Needs Sonnet 5 · medium" is the same fact said usefully.
+        needsRung: assessment ? this.#rungLabelFor(task.project_id, assessment.level) : null,
         runtimeDecision,
       };
     });

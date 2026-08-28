@@ -44,6 +44,15 @@ Call `devteam_join` with your name, provider and capabilities. Add `taskId` to e
 same time — **membership is explicit, and until you are in a room nothing is claimable by you.** If
 the reply carries `roomRequired`, pick from `availableTasks` and join again with your `agentId`.
 
+**Say what you are running.** Pass `model` and `effort` — the name a human would recognise ("Sonnet 5",
+"medium"), not an internal id, and only what you actually are. If the reply comes back with
+`runtime.askForLadder`, also send `ladder`: the model and effort combinations *this host can run you
+at*, ordered weakest first. It is cached for a week, so you will rarely be asked. Report only what
+you know your host offers — a guessed catalogue is worse than none, because DevTeam will act on it.
+
+This is what lets DevTeam say "this assignment needs Opus 5 · high" instead of a score nobody can
+act on, and it is why hard work waits for the right session instead of being attempted badly.
+
 Keep the `agentId` and `resumeToken` privately for the session. If the connection drops, join again
 and pass your new `agentId` plus the old `resumeToken` to reclaim that session's work, room and
 missed messages — otherwise its claim sits stuck until a human releases it.
@@ -69,6 +78,12 @@ score and reasons.
 
 If `next` returns idle repeatedly and the room is quiet, say so and leave. If it says the task is
 blocked, only the human can restart or close it — ask, and stop.
+
+**If idle comes back with `heldForStrongerModel`**, the queue is not empty — you have finished
+everything this session could take, and what remains needs a stronger one. Tell the human exactly
+what it says: which assignments are waiting, what model they need, and that starting a fresh session
+on that model and joining this same task picks up where you stopped. Nothing is lost and nothing
+needs replanning. Then stop. Do not attempt that work at this setting, and do not block the task.
 
 ## Doing the assignment
 
