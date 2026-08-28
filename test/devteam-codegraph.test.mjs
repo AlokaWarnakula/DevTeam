@@ -215,10 +215,22 @@ test("directory and whole-project scopes produce bounded automatic code context"
   assert.ok(directory.some((item) => item.path === "src/feature/a.js"));
   assert.ok(directory.some((item) => item.path === "src/feature/b.js"));
   assert.ok(directory.some((item) => item.path === "src/other/c.js"), "one-hop imported-by neighbor is included");
-  assert.equal(directory.find((item) => item.path === "src/feature/a.js").exports.length, 10);
-  assert.equal(directory.find((item) => item.path === "src/feature/a.js").truncated.exports, true);
+  // What the brief pushes is the part that cannot be read off a file: who imports this module. The
+  // exports, imports and dependency lists sit in the first lines of the file the agent is about to
+  // open, and pushing them was 44% of the largest section of every brief.
+  const pushed = directory.find((item) => item.path === "src/feature/a.js");
+  assert.equal(pushed.exports, undefined, "exports are not pushed; they are in the file");
+  assert.equal(pushed.imports, undefined);
+  assert.equal(pushed.dependencies, undefined);
+  assert.ok(Array.isArray(pushed.importedBy), "reverse dependencies are pushed; a grep for them is not cheap");
+
+  // And nothing is lost: an agent that asks about a module still gets everything.
+  const pulled = store.codegraph.neighborhood(task.id, "src/feature/a.js");
+  assert.equal(pulled.module.exports.length, 10, "the pull path still carries exports");
+  assert.equal(pulled.module.truncated.exports, true);
+
   const whole = store.codegraph.codeContext(task.id, { scopes: [""] });
-  assert.ok(whole.length > 0 && whole.length <= 8);
+  assert.ok(whole.length > 0 && whole.length <= 24);
   assert.ok(Buffer.byteLength(JSON.stringify(whole), "utf8") <= 8 * 1024);
 
   const exact = store.createAssignment({ taskId: task.id, title: "Exact file", description: "Edit one file.", requiresWrite: true, targetAgentName: "Context Agent", paths: ["src/feature/a.js"] });

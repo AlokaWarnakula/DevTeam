@@ -4,8 +4,12 @@ export const DEFAULT_BRIEF_BUDGET = Object.freeze({
   assignmentBytes: 6_144,
   taskMemoryBytes: 5_120,
   projectMemoryBytes: 4_096,
-  knowledgeBytes: 6_144,
-  codeContextBytes: 7_168,
+  // The two memories are the point of the brief, so they get the room. A knowledge note now costs
+  // ~440 bytes instead of ~1,550 and a code module ~262 instead of ~741, so raising one budget and
+  // lowering the other still leaves both carrying far more than they used to: the vault goes from 3
+  // notes to a dozen, and the map from 8 modules to around 19.
+  knowledgeBytes: 8_192,
+  codeContextBytes: 5_120,
   activityBytes: 4_096,
 });
 
@@ -79,16 +83,20 @@ export function buildBudgetedBrief({ core, sections, budget = {}, clipped = {}, 
     bytes: 0,
     limitBytes: limits.totalBytes,
     truncated: false,
+    // included/omitted stay complete even where they are zero: callers subtract one from the other,
+    // and a missing key is NaN rather than nothing.
     included,
     omitted: omittedCounts,
     clipped: Object.fromEntries(Object.entries(clipped).filter(([, count]) => Number(count) > 0)),
-    fetchMore: {
+    // fetchMore is different — it is prose, five sentences of it, charged to the same budget as the
+    // brief itself. A pointer to more is worth its bytes only where there is more to fetch.
+    fetchMore: Object.fromEntries(Object.entries({
       taskMemory: "Use devteam_note_get or devteam_note_list.",
       projectMemory: "Use devteam_note_get or devteam_note_list with scope=project.",
       projectKnowledge: "Use devteam_knowledge.",
       codeContext: "Use devteam_codegraph.",
       activity: "Use devteam_state for the full authorized task view.",
-    },
+    }).filter(([key]) => Number(omittedCounts[key === "activity" ? "recent" : key]) > 0)),
   };
   payload.briefMeta.truncated = Object.values(omittedCounts).some((count) => Number(count) > 0)
     || Object.keys(payload.briefMeta.clipped).length > 0;

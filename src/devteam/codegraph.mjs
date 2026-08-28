@@ -580,12 +580,31 @@ export class CodeGraph {
     return Array.isArray(declared) && declared.length ? declared.map((item) => String(item)) : [""];
   }
 
-  #moduleContext(modulePath, modulesByPath, outgoing, incoming) {
+  // `lean` is the difference between what is pushed and what is pulled.
+  //
+  // Measured on a real brief: codeContext was 5,931 bytes — 35%, the largest section, more than the
+  // knowledge vault got. Of that, `exports`, `imports` and `dependencies` came to 2,618 bytes, and
+  // every one of them is visible in the first twenty lines of the file the agent is about to open
+  // anyway. `importedBy` is the one that is genuinely expensive to derive: reverse dependencies need
+  // a search across the whole project, and that is what a graph is for.
+  //
+  // So the brief carries the part that cannot be read off a file, and `devteam_codegraph` returns
+  // everything when an agent asks about a specific module. Push what cannot be derived, pull what
+  // can — the same rule the knowledge vault now follows.
+  #moduleContext(modulePath, modulesByPath, outgoing, incoming, { lean = false } = {}) {
     const module = modulesByPath.get(modulePath);
     if (!module) return null;
     const exports = uniqueSorted(parseJson(module.exports, []));
     const imports = uniqueSorted(outgoing.get(modulePath) || []);
     const importedBy = uniqueSorted(incoming.get(modulePath) || []);
+    if (lean) {
+      return {
+        path: module.path,
+        language: module.language || null,
+        importedBy: importedBy.slice(0, 10),
+        truncated: { importedBy: importedBy.length > 10 },
+      };
+    }
     return {
       path: module.path,
       // The graph is no longer single-language, so what kind of artifact this is has become part of
@@ -642,8 +661,11 @@ export class CodeGraph {
     const context = [];
     const byteLimit = Math.max(1024, Math.min(8 * 1024, Number(maxBytes) || this.maxContextBytes));
     for (const modulePath of ordered) {
-      if (context.length >= 8) break;
-      const item = this.#moduleContext(modulePath, modulesByPath, outgoing, incoming);
+      // Was 8. A lean module costs roughly a quarter of a detailed one, so the same budget carries a
+      // far wider map — and a map's whole value is breadth. The byte limit below is still the real
+      // guard; this only stops one enormous project from filling the brief with neighbours.
+      if (context.length >= 24) break;
+      const item = this.#moduleContext(modulePath, modulesByPath, outgoing, incoming, { lean: true });
       if (!item) continue;
       const candidate = [...context, item];
       if (Buffer.byteLength(JSON.stringify(candidate), "utf8") > byteLimit) break;
