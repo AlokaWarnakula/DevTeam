@@ -9,7 +9,7 @@ import {
   unlinkSync,
 } from "node:fs";
 import path from "node:path";
-import { atomicWrite, redact, secretLike, slugify } from "./knowledge.mjs";
+import { atomicWrite, redact, secretLike, slugify, vaultOwner } from "./knowledge.mjs";
 import { buildParserRegistry, MAX_EXPORTS, MAX_IMPORTS, MAX_SPECIFIER_LENGTH, MAX_SYMBOL_LENGTH } from "./parsers.mjs";
 
 // Which file types are artifacts, and how each is read, now comes from the parser registry rather
@@ -491,6 +491,15 @@ export class CodeGraph {
   exportProject(projectId) {
     if (!this.enabled) return null;
     const { project, realRoot } = this.#projectRoot(projectId);
+    // The graph shares the knowledge vault's directory, so it honours the vault's claim. Skipping
+    // entirely rather than writing-without-deleting, which is what the knowledge exporter does: every
+    // graph note is named from a hash of the project id, so a second project does not add a few
+    // stray files, it writes a complete duplicate set under different names. And unlike knowledge,
+    // nothing here is lost by skipping — the graph is derived from the code and rebuilds on demand.
+    const owner = vaultOwner(path.join(realRoot, "knowledge"));
+    if (owner && owner.projectId !== projectId) {
+      return { path: null, skipped: "foreign-vault", vaultOwner: owner.project || owner.projectId };
+    }
     const graphRoot = path.join(realRoot, "knowledge", "graph");
     mkdirSync(graphRoot, { recursive: true });
     const state = this.#ensureState(projectId);

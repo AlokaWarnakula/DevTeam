@@ -13,7 +13,80 @@ import {
 import path from "node:path";
 
 const CATEGORIES = ["architecture", "decisions", "components", "conventions", "pitfalls", "workflows"];
+// Which DevTeam project a vault on disk belongs to. Every generated note carries the same
+// `generated_by: DevTeam` header, and the exporter deletes any such file its own database does not
+// account for — so two databases pointed at one project root meant the second export silently
+// deleted everything the first had written. The easy way to arrange that is not exotic: a test whose
+// project root is `process.cwd()` is a second database pointed at the repository, and running the
+// suite wiped this repository's own vault of 64 notes.
+const VAULT_MARKER = ".devteam-vault";
+
+// Who a vault on disk belongs to, or null for one nobody has claimed yet. Exported because CodeGraph
+// writes into the same `knowledge/` tree and has to honour the same claim — it reconciles by
+// deleting too, and its notes are named from a hash of the project id, so a foreign project does not
+// merely add files, it renames all of them.
+//
+// An unreadable or hand-edited marker reads as unclaimed rather than as an error: this exists to
+// prevent a deletion, and a broken marker must never turn into a failed export.
+export function vaultOwner(vaultRoot) {
+  const file = path.join(vaultRoot, VAULT_MARKER);
+  if (!existsSync(file)) return null;
+  try {
+    const owner = JSON.parse(readFileSync(file, "utf8"));
+    return owner && typeof owner.projectId === "string" ? owner : null;
+  } catch {
+    return null;
+  }
+}
 const MAX_NOTE_BODY = 24_000;
+// `conventions/` had no automatic source: every generated note came from the event stream, which can
+// only ever say what was *done*. A convention is different — it is something the project keeps
+// having to be told, and the honest evidence for it is a reviewer saying the same thing on separate
+// pieces of work.
+//
+// The source is `assignment_findings` — the structured findings attached to a request for changes —
+// and deliberately NOT `agent.finding` events, which look like a bigger corpus (102 of them) but are
+// free-form narrative: status reports, handoff checklists, arguments between agents. Clustering
+// those produces confident nonsense, which is worse than an empty folder.
+//
+// The thresholds below are meant to under-fire. Three findings is not much, but requiring two
+// distinct tasks is the part that matters: three bullets in one review is one reviewer being
+// thorough, whereas the same objection raised on separate work is a rule the project has and has
+// never written down.
+const CONVENTION_MIN_FINDINGS = 3;
+const CONVENTION_MIN_TASKS = 2;
+const CONVENTION_SIGNATURE_WORDS = 6;
+const CONVENTION_MIN_SIGNATURE_WORDS = 3;
+// Words that carry no subject matter. Kept small on purpose: an aggressive list starts deciding what
+// a finding is about, and that judgement is the thing this feature must not make.
+const FINDING_STOPWORDS = new Set([
+  "this", "that", "these", "those", "there", "then", "than", "with", "without", "from", "into",
+  "have", "has", "had", "been", "being", "does", "did", "not", "but", "and", "the", "for", "are",
+  "was", "were", "will", "would", "should", "could", "must", "can", "should", "when", "what",
+  "which", "while", "here", "still", "also", "only", "just", "very", "more", "most", "some", "any",
+  "each", "every", "your", "you", "its", "it", "they", "them", "their", "please", "needs", "need",
+]);
+
+// Crude stemming, and crude on purpose: `clamp` and `clamped` are the same objection, and a real
+// stemmer is a dependency and a whole class of surprises for a gain of one word ending.
+const stem = (word) => word.replace(/(ing|ed|es|s)$/u, "") || word;
+
+// A stable key for "the same objection". Two findings match only when their significant vocabulary
+// matches exactly, which is strict — this is designed to miss real repetitions rather than to invent
+// one. Returns null for anything too short to be about a subject at all.
+export function findingSignature(detail) {
+  const words = String(detail || "")
+    .toLowerCase()
+    .replace(/`[^`]*`/gu, " ")
+    .replace(/https?:\/\/\S+/gu, " ")
+    .replace(/[^\p{L}\s]+/gu, " ")
+    .split(/\s+/u)
+    .map((word) => stem(word))
+    .filter((word) => word.length > 3 && !FINDING_STOPWORDS.has(word));
+  const unique = [...new Set(words)].sort();
+  if (unique.length < CONVENTION_MIN_SIGNATURE_WORDS) return null;
+  return unique.slice(0, CONVENTION_SIGNATURE_WORDS).join(" ");
+}
 const MAX_LEGACY_FILES = 20;
 const MAX_LEGACY_BYTES = 100_000;
 
@@ -445,6 +518,7 @@ export class KnowledgeVault {
     this.db.prepare("INSERT OR IGNORE INTO knowledge_state (project_id, last_event_id) VALUES (?, 0)").run(projectId);
     this.#importLegacy(projectId);
     this.#syncProjectEvents(projectId);
+    this.#syncConventions(projectId);
     return this.exportProject(projectId);
   }
 
@@ -457,7 +531,73 @@ export class KnowledgeVault {
     this.db.prepare("INSERT OR IGNORE INTO knowledge_state (project_id, last_event_id) VALUES (?, 0)").run(task.project_id);
     this.#importLegacy(task.project_id);
     this.#syncProjectEvents(task.project_id);
+    this.#syncConventions(task.project_id);
     return this.exportProject(task.project_id);
+  }
+
+  // Recompute the whole project's recurring-finding conventions. Cheap enough to redo wholesale
+  // rather than maintain incrementally: request-for-changes is a rare event, and recomputing means a
+  // note can never drift from the findings that justify it — including downwards, when a note that
+  // no longer clears the threshold is archived rather than left standing as a rule nobody agreed to.
+  #syncConventions(projectId) {
+    const rows = this.db.prepare(`
+      SELECT f.id, f.detail, f.path, f.requested_by_name, f.created_at, f.task_id
+      FROM assignment_findings f
+      JOIN tasks t ON t.id = f.task_id
+      WHERE t.project_id = ?
+      ORDER BY f.created_at ASC
+    `).all(projectId);
+    const groups = new Map();
+    for (const row of rows) {
+      const signature = findingSignature(row.detail);
+      if (!signature) continue;
+      if (!groups.has(signature)) groups.set(signature, []);
+      groups.get(signature).push(row);
+    }
+    for (const [signature, findings] of groups) {
+      const slug = `recurring-${createHash("sha256").update(signature).digest("hex").slice(0, 10)}`;
+      const distinctTasks = new Set(findings.map((finding) => finding.task_id)).size;
+      const qualifies = findings.length >= CONVENTION_MIN_FINDINGS && distinctTasks >= CONVENTION_MIN_TASKS;
+      const existing = this.db.prepare("SELECT id, status FROM knowledge_notes WHERE id = ?")
+        .get(KnowledgeVault.noteId(projectId, "conventions", slug));
+      if (!qualifies) {
+        // Never invent a rule, and never leave one standing once its evidence stops meeting the bar.
+        if (existing && existing.status !== "archived") {
+          this.db.prepare("UPDATE knowledge_notes SET status = 'archived', status_changed_at = ? WHERE id = ?")
+            .run(new Date().toISOString(), existing.id);
+        }
+        continue;
+      }
+      const latest = findings[findings.length - 1];
+      // The body is quotation, not summary. DevTeam has no opinion about what the rule *is* — it
+      // reports that the same objection keeps being raised and hands over the evidence, so a reader
+      // draws the conclusion rather than trusting one this file invented.
+      const quoted = findings.map((finding) => {
+        const where = finding.path ? ` (\`${finding.path}\`)` : "";
+        return `- “${short(String(finding.detail).replace(/\s+/gu, " "), 400)}”${where}\n  — ${finding.requested_by_name}, ${String(finding.created_at).slice(0, 10)}`;
+      }).join("\n");
+      const body = [
+        `Reviewers have raised the same objection **${findings.length} times across ${distinctTasks} separate tasks**.`,
+        "That makes it a convention this project has and has not written down.",
+        "",
+        "## The findings",
+        "",
+        quoted,
+        "",
+        "Recorded automatically from requests for changes. If this is not a real convention, dispute the note;",
+        "if it is, writing it down properly here is better than being told again.",
+      ].join("\n");
+      this.#upsert({
+        projectId, category: "conventions", slug,
+        title: `Recurring review finding: ${signature}`,
+        body, status: "proposed", confidence: "medium",
+        sourceTaskId: latest.task_id, sourceEventId: null,
+        sourceAuthor: "DevTeam (recurring review findings)",
+        provenance: { type: "knowledge.recurring_finding", taskId: latest.task_id, at: latest.created_at },
+        createdAt: findings[0].created_at,
+        relatedFiles: findings.map((finding) => finding.path).filter(Boolean),
+      });
+    }
   }
 
   #syncProjectEvents(projectId) {
@@ -717,9 +857,25 @@ export class KnowledgeVault {
     }
     for (const relative of this.#writeCurrent(project, vault)) expected.add(relative);
     this.#writeIndex(project, vault, notes);
-    this.#reconcileGeneratedFiles(vault, expected);
+    // A vault belongs to exactly one project. When it belongs to somebody else, refreshing the notes
+    // is still right — but deleting is not, because "this file is not in my database" no longer means
+    // "this file is obsolete". Leaving a stale file behind is a far cheaper mistake than deleting
+    // someone's memory, so an unowned vault loses only its cleanup.
+    const owner = vaultOwner(vault);
+    const ownsVault = !owner || owner.projectId === projectId;
+    if (!owner) {
+      atomicWrite(path.join(vault, VAULT_MARKER),
+        `${JSON.stringify({ projectId, project: project.name, claimedAt: new Date().toISOString() }, null, 2)}\n`);
+    }
+    if (ownsVault) this.#reconcileGeneratedFiles(vault, expected);
     this.db.prepare("UPDATE knowledge_state SET exported_at = ? WHERE project_id = ?").run(new Date().toISOString(), projectId);
-    return { path: vault, noteCount: notes.length, updatedAt: new Date().toISOString() };
+    return {
+      path: vault,
+      noteCount: notes.length,
+      updatedAt: new Date().toISOString(),
+      reconciled: ownsVault,
+      ...(ownsVault ? {} : { foreignVault: { project: owner.project || null, projectId: owner.projectId || null } }),
+    };
   }
 
   #writeCurrent(project, vault) {
@@ -1031,7 +1187,30 @@ export class KnowledgeVault {
     }));
   }
 
-  relevant(projectId, taskId, limit = 12, context = {}) {
+  // The claim a note makes, taken from its own first sentence. Generated notes lead with their
+  // conclusion — "Security review complete — do not approve v2 yet", "RESEARCH COMPLETE — ALG6
+  // onboarding integration map" — so the first sentence is the note, and the rest is evidence for it.
+  static headline(body) {
+    for (const line of String(body || "").split(/\r?\n/u)) {
+      const cleaned = line.trim().replace(/^#+\s*/u, "").replace(/^[-*]\s+/u, "").trim();
+      if (!cleaned) continue;
+      return short(cleaned.split(/(?<=[.!?])\s+/u)[0] || cleaned, 200);
+    }
+    return "";
+  }
+
+  // Headlines for breadth, bodies for the few that are almost certainly relevant.
+  //
+  // Measured before this existed: the ranker did the work of choosing the best 30 notes out of 626,
+  // handed back 46 KB of them, and the brief's 6 KB knowledge budget admitted **three**. Twenty-seven
+  // ranked notes were dropped for want of bytes, every single brief. Paying 1.5 KB per note to see
+  // three of them is the least efficient possible use of that budget.
+  //
+  // A note's first sentence is its claim, and a claim is what tells an agent whether it needs the
+  // rest. So the top few keep their bodies — that detail is worth pushing unasked — and the tail
+  // arrives as one line each with its `[[wikilink]]`, which `devteam_knowledge` reads in full on
+  // demand. Same budget, an order of magnitude more of the vault visible.
+  relevant(projectId, taskId, limit = 12, context = {}, { bodyCount = 2, bodyBytes = 800 } = {}) {
     const rows = this.db.prepare(`
       SELECT notes.id, notes.category, notes.slug, notes.title, notes.body, notes.status, notes.confidence,
              notes.source_task_id, notes.source_event_id, notes.source_author, notes.related_files,
@@ -1044,11 +1223,27 @@ export class KnowledgeVault {
       LIMIT 500
     `).all(projectId, taskId);
     const candidates = rows.map((note) => ({ ...note, relatedFiles: parseJson(note.related_files, []) }));
-    return rankKnowledgeNotes(candidates, { ...context, taskId }, Math.max(1, Math.min(30, Number(limit) || 12))).map((note) => ({
-      ...note, title: short(note.title, 200), body: clip(note.body, 1_200), relatedFiles: parseJson(note.related_files, []), related_files: undefined,
-      source_metadata: undefined, sourceAssignmentId: undefined,
-      link: `[[${note.status === "archived" || note.category === "archive" ? "archive" : note.category}/${note.slug}]]`,
-    }));
+    const ranked = rankKnowledgeNotes(candidates, { ...context, taskId }, Math.max(1, Math.min(30, Number(limit) || 12)));
+    return ranked.map((note, index) => {
+      // Deliberately a small, fixed shape rather than the whole row. Revision counters, event ids,
+      // validation stamps and status timestamps are bookkeeping the reader cannot act on, and they
+      // were being charged to the same budget as the knowledge itself.
+      const lean = {
+        id: note.id,
+        category: note.category,
+        title: short(note.title, 200),
+        headline: KnowledgeVault.headline(note.body),
+        status: note.status,
+        confidence: note.confidence,
+        // A headline-only note is a pointer; four paths is plenty to judge relevance by, and the
+        // full list comes with the body when the agent asks for it.
+        relatedFiles: parseJson(note.related_files, []).slice(0, index < bodyCount ? 20 : 4),
+        whyIncluded: note.whyIncluded,
+        link: `[[${note.status === "archived" || note.category === "archive" ? "archive" : note.category}/${note.slug}]]`,
+      };
+      if (index < bodyCount) lean.body = clip(note.body, bodyBytes);
+      return lean;
+    });
   }
 
   search(projectId, taskId, { query = "", category = null, status = null, limit = 20 } = {}) {

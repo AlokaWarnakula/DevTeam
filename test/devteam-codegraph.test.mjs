@@ -280,3 +280,25 @@ test("devteam_wait automatically delivers the same bounded code context and Know
   assert.equal(instance.store.taskDetail(task.id).knowledgeVault.automated, true);
   assert.equal(instance.store.taskDetail(task.id).codeGraph.automated, true);
 });
+
+test("the graph will not write into a knowledge vault another project has claimed", async (t) => {
+  // Graph notes are named from a hash of the project id, so a second project pointed at the same
+  // root does not add a few stray files — it writes a complete duplicate set under different names
+  // and its reconciler deletes the originals. That is what renamed all 52 of this repository's graph
+  // notes on every `npm test`, because server tests use process.cwd() as their workspace root.
+  const { store, project, projectRoot } = await fixture(t, { "src/app.mjs": "export const app = 1;\n" });
+  store.codegraph.fullReconcile(project.id);
+  const first = store.codegraph.exportProject(project.id);
+  assert.ok(first.path, "the first project exports normally");
+  const before = await readdir(path.join(projectRoot, "knowledge", "graph"));
+  assert.ok(before.length > 0);
+
+  // Hand the vault to somebody else, exactly as the knowledge exporter would have.
+  await writeFile(path.join(projectRoot, "knowledge", ".devteam-vault"),
+    JSON.stringify({ projectId: "a-different-project", project: "Somebody else" }), "utf8");
+
+  const second = store.codegraph.exportProject(project.id);
+  assert.equal(second.skipped, "foreign-vault", "the export stands down rather than renaming someone's notes");
+  assert.equal(second.vaultOwner, "Somebody else", "and names who it stood down for");
+  assert.deepEqual(await readdir(path.join(projectRoot, "knowledge", "graph")), before, "nothing on disk moved");
+});
