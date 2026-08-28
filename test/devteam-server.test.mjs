@@ -402,17 +402,17 @@ test("shared blackboard round-trips over MCP and a stuck write lease can be forc
   const agentId = connected.structuredContent.agent.id;
 
   // Shared memory writes and reads back over MCP with provenance.
-  await client.callTool({ name: "devteam_note_set", arguments: { agentId, taskId: task.id, key: "world", value: "goal: ship it" } });
-  const got = await client.callTool({ name: "devteam_note_get", arguments: { agentId, taskId: task.id, key: "world" } });
+  await client.callTool({ name: "devteam_memory", arguments: { agentId, taskId: task.id, action: "set", key: "world", value: "goal: ship it" } });
+  const got = await client.callTool({ name: "devteam_memory", arguments: { agentId, taskId: task.id, action: "get", key: "world" } });
   assert.equal(got.structuredContent.value, "goal: ship it");
   assert.equal(got.structuredContent.version, 1);
   assert.equal(got.structuredContent.scope, "task");
 
-  await client.callTool({ name: "devteam_note_set", arguments: { agentId, taskId: task.id, scope: "project", key: "architecture", value: "local-first" } });
-  const projectNote = await client.callTool({ name: "devteam_note_get", arguments: { agentId, taskId: task.id, scope: "project", key: "architecture" } });
+  await client.callTool({ name: "devteam_memory", arguments: { agentId, taskId: task.id, action: "set", scope: "project", key: "architecture", value: "local-first" } });
+  const projectNote = await client.callTool({ name: "devteam_memory", arguments: { agentId, taskId: task.id, action: "get", scope: "project", key: "architecture" } });
   assert.equal(projectNote.structuredContent.scope, "project");
   assert.equal(projectNote.structuredContent.value, "local-first");
-  const projectKeys = await client.callTool({ name: "devteam_note_get", arguments: { agentId, taskId: task.id, scope: "project" } });
+  const projectKeys = await client.callTool({ name: "devteam_memory", arguments: { agentId, taskId: task.id, action: "get", scope: "project" } });
   assert.equal(projectKeys.structuredContent.scope, "project");
   assert.deepEqual(projectKeys.structuredContent.keys.map((item) => item.key), ["architecture"]);
   assert.equal(instance.store.taskDetail(task.id).projectBlackboard[0].value, "local-first");

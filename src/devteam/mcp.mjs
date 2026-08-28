@@ -437,55 +437,68 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
     return withInbox(agentId, store.voteProposal({ agentId, proposalId, vote, comment }));
   }));
 
-  server.registerTool("devteam_note_set", {
-    title: "Write shared team memory",
-    description: "Write versioned shared memory. scope=task (default) belongs to this job; scope=project persists across every task in the same project. Project scope is inferred from the authorized taskId, never an arbitrary projectId. Re-read and merge on a version conflict.",
+  // One verb for project memory, replacing ten.
+  //
+  // The ten were `note_set`, `note_get`, `knowledge`, and seven `knowledge_*` variants — confirm,
+  // dispute, links, maintain, share, borrowed, write. Across 17 days and four projects, agents
+  // called them a combined **zero** times: all nine `knowledge.*` events on the board are
+  // `knowledge.superseded`, which DevTeam writes itself when a file-linked note goes stale. The
+  // vault filled itself to 626 notes without any of them.
+  //
+  // So the six with no use and no automatic counterpart are gone: confirm, dispute, links, maintain,
+  // share, borrowed. What remains is what an agent genuinely needs — pull a note the brief only
+  // summarised, and record something the event stream cannot see. `search` matters more than it did,
+  // because briefs are now headline-first: the headline says whether the body is worth fetching.
+  server.registerTool("devteam_memory", {
+    title: "Project memory",
+    description: "The project's memory, in two halves, and it is mostly written for you. DevTeam distils completed work, decisions, blockers and findings into a linked vault by itself, and your brief already carries the most relevant notes as headlines. action=search fetches the full body of a note the brief only summarised, or finds notes by words, path or category — reach for it whenever a headline looks relevant. action=write records a fact the events cannot capture: an API limit, why the obvious approach fails here, a convention the code follows but never states. Not a progress update (use devteam_message) and not a decision the team took (use devteam_propose). action=get and action=set are a small versioned key/value scratchpad — scope=task for this job, scope=project to persist across the project's tasks; re-read and merge on a version conflict.",
     inputSchema: {
       agentId: z.string().uuid(),
       taskId: z.string().uuid(),
-      scope: z.enum(["task", "project"]).default("task").describe("task for this job, project for durable memory shared by every task in the project"),
-      key: z.string().min(1).max(120).describe("e.g. 'world', 'decisions', 'open-questions', 'ownership'"),
-      value: z.string().min(0).max(100000).describe("The new content (plain text or a JSON string)"),
-      expectedVersion: z.number().int().min(0).optional().describe("The version you last read; omit only for a first write you know is uncontended"),
-    },
-  }, safe(async ({ agentId, taskId, scope, key, value, expectedVersion }) => {
-    requireIdentity(agentId);
-    return withInbox(agentId, store.noteSet({ agentId, taskId, scope, key, value, expectedVersion: expectedVersion ?? null }));
-  }));
-
-  server.registerTool("devteam_note_get", {
-    title: "Read shared team memory",
-    description: "Read versioned task or project memory. scope=task (default) is job-specific; scope=project persists across every task in the same project. Omit key to list keys; pass key for its full value and version.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      taskId: z.string().uuid(),
-      scope: z.enum(["task", "project"]).default("task"),
-      key: z.string().max(120).optional(),
-    },
-  }, safe(async ({ agentId, taskId, scope, key }) => {
-    requireIdentity(agentId);
-    store.assertMembership(agentId, taskId);
-    if (key) {
-      const note = store.noteGet(taskId, key, scope, agentId);
-      return withInbox(agentId, note || { scope, key, value: null, version: 0, missing: true });
-    }
-    return withInbox(agentId, { scope, keys: store.noteList(taskId, scope, agentId) });
-  }));
-
-  server.registerTool("devteam_knowledge", {
-    title: "Search durable project knowledge",
-    description: "Search the automatic Obsidian-compatible project vault. DevTeam creates and refreshes it from completed assignments, adopted decisions, blockers, findings, and project memory; agents do not need to maintain it manually.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      taskId: z.string().uuid(),
-      query: z.string().max(500).default("").describe("Words, file path, component, or decision to find; empty returns the most relevant recent notes"),
-      category: z.enum(["architecture", "decisions", "components", "conventions", "pitfalls", "workflows", "archive"]).optional(),
-      status: z.enum(["verified", "inferred", "disputed", "stale", "archived"]).optional(),
-      limit: z.number().int().min(1).max(50).default(20),
+      action: z.enum(["search", "write", "get", "set"]).default("search"),
+      query: z.string().max(500).default("").describe("search: words, a file path, a component or a decision; empty returns the most relevant recent notes"),
+      category: z.enum(["architecture", "decisions", "components", "conventions", "pitfalls", "workflows", "archive"]).optional()
+        .describe("search: narrow to one kind. write: required — architecture (how it fits together), decisions (a choice and its reason), components (what one part does), conventions (a rule the project follows), pitfalls (what will bite the next person), workflows (how a recurring job is done)."),
+      limit: z.number().int().min(1).max(50).default(20).describe("search only"),
+      title: z.string().min(1).max(200).optional().describe("write: the fact as a statement, not a topic — 'The billing API rate-limits at 30 requests/minute', not 'Billing API'"),
+      body: z.string().min(1).max(4000).optional().describe("write: the fact with enough context to act on. Link related notes inline with [[category/slug]] and they become navigable both ways."),
+      confidence: z.enum(["low", "medium", "high"]).default("medium").describe("write: be honest — a low-confidence note is still worth recording and is ranked accordingly. Notes you write are recorded as 'inferred'; verified means DevTeam observed it."),
+      relatedFiles: z.array(z.string().max(500)).max(20).default([]).describe("write: project-relative files this fact concerns, so it goes stale when they change"),
+      scope: z.enum(["task", "project"]).default("task").describe("get/set only"),
+      key: z.string().max(120).optional().describe("get/set: e.g. 'world', 'open-questions', 'ownership'. Omit on get to list the keys."),
+      value: z.string().min(0).max(100000).optional().describe("set: the new content, plain text or a JSON string"),
+      expectedVersion: z.number().int().min(0).optional().describe("set: the version you last read; omit only for a first write you know is uncontended"),
     },
   }, safe(async (args) => {
-    requireIdentity(args.agentId);
-    return withInbox(args.agentId, store.knowledgeSearch(args));
+    const { agentId, taskId, action } = args;
+    requireIdentity(agentId);
+    if (action === "write") {
+      if (!args.category || !args.title || !args.body) {
+        throw new Error("action=write needs category, title and body.");
+      }
+      return withInbox(agentId, store.knowledgeWrite({
+        agentId, taskId, category: args.category, title: args.title, body: args.body,
+        confidence: args.confidence, relatedFiles: args.relatedFiles,
+      }));
+    }
+    if (action === "set") {
+      if (!args.key || args.value === undefined) throw new Error("action=set needs key and value.");
+      return withInbox(agentId, store.noteSet({
+        agentId, taskId, scope: args.scope, key: args.key, value: args.value,
+        expectedVersion: args.expectedVersion ?? null,
+      }));
+    }
+    if (action === "get") {
+      store.assertMembership(agentId, taskId);
+      if (args.key) {
+        const note = store.noteGet(taskId, args.key, args.scope, agentId);
+        return withInbox(agentId, note || { scope: args.scope, key: args.key, value: null, version: 0, missing: true });
+      }
+      return withInbox(agentId, { scope: args.scope, keys: store.noteList(taskId, args.scope, agentId) });
+    }
+    return withInbox(agentId, store.knowledgeSearch({
+      agentId, taskId, query: args.query, category: args.category ?? null, limit: args.limit,
+    }));
   }));
 
   server.registerTool("devteam_codegraph", {
@@ -555,28 +568,6 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
     return withInbox(agentId, store.whyNotClaimable(assignmentId, agentId));
   }));
 
-  server.registerTool("devteam_split", {
-    title: "Divide work that turned out too big",
-    description: "Claimed something and found it is three days of work, or two unrelated jobs wearing one title? Split it into pieces instead of grinding through it or reporting blocked. You keep your claim and your write lease throughout — splitting never costs you the work you are holding. Each piece inherits the parent's write scope (unless it declares its own), its dependencies and its targeting, and is re-assessed on its own merits so a runtime gate does not treat a small piece as if it were the whole. Where two pieces declare overlapping write paths, DevTeam orders them for you rather than letting them contend for a lease. Use this when the shape of the work is wrong, not when it is merely hard.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      assignmentId: z.string().uuid().describe("The assignment you currently hold"),
-      claimToken: z.string().max(200).optional().describe("Your claimToken, so a stale session cannot reshape work whose lease has moved"),
-      keepParent: z.boolean().default(false).describe("Keep holding the original — use when you are part-way through one piece and want to hand off the rest. Default closes it, since its work now lives in the pieces."),
-      parts: z.array(z.object({
-        title: z.string().min(1).max(160),
-        description: z.string().min(1).max(12000),
-        role: z.string().min(1).max(40).optional().describe("Defaults to the parent's role; see devteam_roles"),
-        requiresWrite: z.boolean().optional().describe("Defaults to the parent's setting"),
-        paths: z.array(z.string().max(500)).max(50).optional().describe("This piece's own write scope. Omit to inherit the parent's — never omit it expecting a narrower lease, you will get the parent's."),
-        dependsOnPart: z.number().int().min(0).max(11).optional().describe("Index of an earlier part in this list that must finish first"),
-      })).min(2).max(12).describe("At least two pieces. If the work is simply mis-scoped rather than too big, report it blocked instead."),
-    },
-  }, safe(async (args) => {
-    requireIdentity(args.agentId);
-    return withInbox(args.agentId, store.splitAssignment(args));
-  }));
-
   server.registerTool("devteam_approve", {
     title: "Approve current task version",
     description: "Approve only after completing an independent read-only reviewer or tester assignment on the current version. Consensus accepts the task and keeps its agents assembled briefly for a same-conversation follow-up instead of disconnecting them.",
@@ -621,102 +612,6 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
       regressions: store.openRegressions(taskId),
       baseline: store.checkBaseline(taskId),
     });
-  }));
-
-  server.registerTool("devteam_knowledge_write", {
-    title: "Record something you learned",
-    description: "Write a durable note into the project's knowledge vault. Use this the moment you learn a fact the *next* session would otherwise have to rediscover — an API rate limit, why an obvious approach does not work here, a convention the code follows but does not state, a pitfall that cost you an hour. This is not a progress update (use devteam_message) and not a decision the team voted on (use devteam_propose): it is a fact about the project. Link related notes inline with [[category/slug]] and they become navigable both ways. Notes you write are recorded as 'inferred', never 'verified' — verified means DevTeam observed it, not that you were confident.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      taskId: z.string().uuid(),
-      category: z.enum(["architecture", "decisions", "components", "conventions", "pitfalls", "workflows"])
-        .describe("architecture: how the system fits together. decisions: a choice and its reason. components: what one part does. conventions: a rule the project follows. pitfalls: something that will bite the next person. workflows: how a recurring job is done."),
-      title: z.string().min(1).max(200).describe("The fact as a short statement, not a topic — 'The billing API rate-limits at 30 requests/minute', not 'Billing API'"),
-      body: z.string().min(1).max(4000).describe("The fact itself, with enough context to act on. Use [[category/slug]] to link related notes."),
-      confidence: z.enum(["low", "medium", "high"]).default("medium").describe("How sure you are. Be honest: a low-confidence note is still worth recording and is ranked accordingly."),
-      relatedFiles: z.array(z.string().max(500)).max(20).default([]).describe("Project-relative files this fact concerns, so it goes stale when they change"),
-    },
-  }, safe(async (args) => {
-    requireIdentity(args.agentId);
-    return withInbox(args.agentId, store.knowledgeWrite(args));
-  }));
-
-  server.registerTool("devteam_knowledge_maintain", {
-    title: "Knowledge that needs attention",
-    description: "Notes nobody has confirmed in a long time, and notes flagged as contradicting each other. A fact does not become false by getting old, but an unconfirmed one is a weaker basis for acting — and DevTeam ranks it lower until someone checks it. Work this queue when the room is quiet: confirm what still holds with devteam_knowledge_confirm, write over what does not.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      taskId: z.string().uuid(),
-      olderThanDays: z.number().int().min(1).max(3650).default(90),
-      limit: z.number().int().min(1).max(100).default(20),
-    },
-  }, safe(async (args) => {
-    requireIdentity(args.agentId);
-    return withInbox(args.agentId, store.knowledgeMaintenance(args));
-  }));
-
-  server.registerTool("devteam_knowledge_confirm", {
-    title: "Confirm a knowledge note still holds",
-    description: "Say that a note is still true of the project as it stands now. This is the only thing that resets a note's age, so use it only after actually checking — re-reading a note is not confirmation.",
-    inputSchema: { agentId: z.string().uuid(), taskId: z.string().uuid(), noteId: z.string().min(1).max(64) },
-  }, safe(async (args) => {
-    requireIdentity(args.agentId);
-    return withInbox(args.agentId, store.knowledgeConfirm(args));
-  }));
-
-  server.registerTool("devteam_knowledge_dispute", {
-    title: "Flag two knowledge notes as contradicting each other",
-    description: "When two notes about the same subject cannot both be true, say so. Both drop to 'disputed' and stop being served in briefings until resolved — better a gap than confidently serving one of two contradictory facts. devteam_knowledge_write tells you about likely conflicts when you write a note; this is how you act on that.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      taskId: z.string().uuid(),
-      noteIds: z.array(z.string().min(1).max(64)).min(2).max(10),
-      reason: z.string().min(1).max(1000).describe("What the disagreement is"),
-    },
-  }, safe(async (args) => {
-    requireIdentity(args.agentId);
-    return withInbox(args.agentId, store.knowledgeDispute(args));
-  }));
-
-  server.registerTool("devteam_knowledge_share", {
-    title: "Offer a lesson to other projects",
-    description: "Mark a convention or pitfall as worth carrying to other projects on this server, or withdraw it. Only conventions and pitfalls can be shared: an architecture note or a decision is about this system in particular and cannot be true elsewhere. A note containing anything credential-shaped is refused. Read what others have shared with devteam_knowledge_borrowed.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      taskId: z.string().uuid(),
-      noteId: z.string().min(1).max(64),
-      shared: z.boolean().default(true),
-    },
-  }, safe(async (args) => {
-    requireIdentity(args.agentId);
-    return withInbox(args.agentId, store.knowledgeShare(args));
-  }));
-
-  server.registerTool("devteam_knowledge_borrowed", {
-    title: "Lessons other projects have shared",
-    description: "Conventions and pitfalls other projects on this server chose to share. Each says which project it came from. Confirm a borrowed lesson applies here before acting on it — it was learned somewhere else.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      taskId: z.string().uuid(),
-      query: z.string().max(200).default(""),
-      limit: z.number().int().min(1).max(50).default(10),
-    },
-  }, safe(async (args) => {
-    requireIdentity(args.agentId);
-    return withInbox(args.agentId, store.knowledgeShared(args));
-  }));
-
-  server.registerTool("devteam_knowledge_links", {
-    title: "See what references a knowledge note",
-    description: "What points at this note, and what it points at. Use it to judge whether a note is load-bearing before acting against it: a decision with six things referencing it is not one to quietly reverse. Note IDs come from devteam_knowledge results.",
-    inputSchema: {
-      agentId: z.string().uuid(),
-      taskId: z.string().uuid(),
-      noteId: z.string().min(1).max(64),
-    },
-  }, safe(async (args) => {
-    requireIdentity(args.agentId);
-    return withInbox(args.agentId, store.knowledgeLinks(args));
   }));
 
   server.registerTool("devteam_roles", {
