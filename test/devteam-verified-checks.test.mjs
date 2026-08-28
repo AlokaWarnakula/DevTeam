@@ -970,3 +970,84 @@ test("an ambiguous regression is not charged to anyone's record", async (t) => {
     "a shared window is a guess, and a guess must not follow someone around as a number");
   assert.equal(store.agentReliability("Bob").regressionsCaused, 0);
 });
+
+// --- the confinement wrapper is graded apart from the thing it wraps -----------------------------
+//
+// Node's test runner, discovering files under the permission model, forwards an empty
+// `--allow-fs-read=` to the child process it spawns per test file; every child dies on it before
+// loading a line of the suite. DevTeam graded that non-zero exit as the project's failure, so a
+// sandboxed project could not report `node --test` as done however green it was — two agents spent
+// a whole task on it and ended up blocking the board over a bug in the wrapper.
+
+async function sandboxedTestRunnerFixture(t, { body }) {
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-wrapper-data-"));
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "devteam-wrapper-project-"));
+  await mkdir(path.join(projectRoot, "test"), { recursive: true });
+  await writeFile(path.join(projectRoot, "test", "suite.test.mjs"), body, "utf8");
+  await writeFile(path.join(projectRoot, "package.json"),
+    JSON.stringify({ name: "wrapper-fixture", scripts: { test: "node --test" } }, null, 2), "utf8");
+  const store = new DevTeamStore(dataDir, { knowledge: { enabled: false }, codegraph: { enabled: false }, checks: { timeoutMs: 60_000 } });
+  t.after(async () => {
+    try { store.close(); } catch { /* some tests close early */ }
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  });
+  const project = store.ensureProject("Wrapper project", projectRoot);
+  const task = store.createTask({ projectId: project.id, title: "Wrapper", description: "Exercise the sandbox wrapper." });
+  store.setProjectCheckCommands({ projectId: project.id, sandbox: true });
+  const agent = store.connectAgent({ name: "Reporter", provider: "fixture", freshTaskId: task.id });
+  const plan = store.claimNextAssignment(agent.id);
+  await store.completeAssignment({ agentId: agent.id, assignmentId: plan.id, claimToken: plan.claimToken, message: "Planned." });
+  return { store, project, task, agent, projectRoot };
+}
+
+const GREEN_SUITE = "import test from 'node:test';\nimport assert from 'node:assert/strict';\ntest('green', () => assert.equal(1, 1));\n";
+const RED_SUITE = "import test from 'node:test';\nimport assert from 'node:assert/strict';\ntest('red', () => assert.equal(1, 2));\n";
+
+test("a sandboxed `node --test` is verified, not failed on DevTeam's own wrapper", async (t) => {
+  const { store, task, agent } = await sandboxedTestRunnerFixture(t, { body: GREEN_SUITE });
+  const claim = claimWork(store, agent, task);
+
+  const result = await store.completeAssignment({
+    agentId: agent.id, assignmentId: claim.id, claimToken: claim.claimToken,
+    message: "Suite is green.",
+    checks: [{ label: "node --test passes", command: "test" }],
+  });
+
+  assert.equal(result.completed, true, "a passing suite can be reported as done under confinement");
+  const [record] = result.checks;
+  assert.equal(record.status, "passed");
+  assert.equal(record.verified, true, "and it counts as verified, not as the agent's word for it");
+  assert.match(record.output, /isolation=none/, "the substitution DevTeam had to make is on the record");
+});
+
+test("a suite that really fails under the sandbox is still a failure", async (t) => {
+  const { store, task, agent } = await sandboxedTestRunnerFixture(t, { body: RED_SUITE });
+  const claim = claimWork(store, agent, task);
+
+  const refused = await store.completeAssignment({
+    agentId: agent.id, assignmentId: claim.id, claimToken: claim.claimToken,
+    message: "All green, shipping it.",
+    checks: [{ label: "node --test passes", command: "test" }],
+  });
+
+  assert.equal(refused.completed, false, "working around the wrapper must not become a way past verification");
+  assert.equal(refused.checksFailed.failed.length, 1);
+});
+
+test("a wrapper DevTeam cannot get past is “not run”, never “did not pass”", async (t) => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "devteam-wrapper-stuck-"));
+  await mkdir(path.join(projectRoot, "test"), { recursive: true });
+  await writeFile(path.join(projectRoot, "test", "suite.test.mjs"), GREEN_SUITE, "utf8");
+  t.after(async () => { await rm(projectRoot, { recursive: true, force: true }); });
+
+  // Pinning isolation leaves no workaround to reach for, so the wrapper's rejection is all there is.
+  const stuck = await runVerifiedCheck({
+    argv: ["node", "--test", "--test-isolation=process"], cwd: projectRoot, sandbox: true, timeoutMs: 30_000,
+  });
+
+  assert.equal(stuck.status, "unavailable", "DevTeam's own wrapper failing is not evidence about the work");
+  assert.equal(stuck.verified, false, "and it grants no pass either");
+  assert.match(stuck.output, /NOT run/);
+  assert.match(stuck.output, /requires an argument/, "the human is shown what actually went wrong");
+});

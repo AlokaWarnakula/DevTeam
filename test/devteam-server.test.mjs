@@ -175,7 +175,12 @@ test("MCP assignment dependencies sequence work and devteam_brief stays compact"
   await client.callTool({ name: "devteam_report", arguments: { agentId, assignmentId: planner.structuredContent.assignment.id, claimToken: planner.structuredContent.assignment.claimToken, message: "Planned." } });
   const parentClaim = await client.callTool({ name: "devteam_next", arguments: { agentId, timeoutSeconds: 1 } });
   assert.equal(parentClaim.structuredContent.assignment.id, parent.structuredContent.id);
-  await client.callTool({ name: "devteam_report", arguments: { agentId, assignmentId: parent.structuredContent.id, claimToken: parentClaim.structuredContent.assignment.claimToken, message: "Parent done." } });
+  // A check with an explicit `command: null` means "this one is an assertion". The schema used to
+  // reject it outright — `Invalid input at checks[1]` — and the only way to find that out was to
+  // have a report refused mid-session and guess that a bare string was the shape it wanted.
+  const asserted = await client.callTool({ name: "devteam_report", arguments: { agentId, assignmentId: parent.structuredContent.id, claimToken: parentClaim.structuredContent.assignment.claimToken, message: "Parent done.", checks: [{ label: "Reviewed by hand", command: null }] } });
+  assert.equal(asserted.isError ?? false, false, "an explicit null command is an assertion, not a validation error");
+  assert.equal(asserted.structuredContent.checks[0].status, "asserted");
   const childClaim = await client.callTool({ name: "devteam_next", arguments: { agentId, timeoutSeconds: 1 } });
   assert.equal(childClaim.structuredContent.assignment.id, child.structuredContent.id);
 });

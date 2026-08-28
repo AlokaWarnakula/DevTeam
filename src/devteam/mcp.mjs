@@ -394,7 +394,7 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
         z.string().max(500).describe("An assertion you are making, recorded and labeled as agent-asserted."),
         z.object({
           label: z.string().min(1).max(500).describe("How this check should read in the timeline"),
-          command: z.string().max(200).optional().describe("Name of a command the human allowlisted for this project (for example \"test\", or \"npm run test\"). DevTeam runs it and grades the result; your text only selects an allowlisted entry, it is never executed as written."),
+          command: z.string().max(200).nullish().describe("Name of a command the human allowlisted for this project (for example \"test\", or \"npm run test\"). DevTeam runs it and grades the result; your text only selects an allowlisted entry, it is never executed as written. Omit it, or pass null, for a plain assertion."),
         }),
       ])).max(100).default([]),
       disconnectAfter: z.boolean().default(false),

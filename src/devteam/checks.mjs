@@ -252,9 +252,73 @@ export function sandboxFlagsFor(program, cwd) {
   return flags;
 }
 
-// The environment the check runs in: the operator's, minus anything that looks like a credential.
+// A confinement wrapper can be rejected by the runtime *before the check itself ever starts*. The
+// process then exits non-zero having run nothing, which looks exactly like a failing suite and was
+// graded as one: the report was refused, a failed baseline was written against the task, the
+// reporter's reliability was docked, and the only honest move left to the agent was to block the
+// whole task. None of that was evidence about anyone's work — it was DevTeam's own wrapper failing.
+//
+// So the wrapper is graded separately from the thing it wraps. This is a property of runners in
+// general, not of any one language or kind of project: whatever DevTeam wraps a command in, being
+// unable to start the command is "not run", never "did not pass".
+//
+// Matched narrowly, on the flags DevTeam itself injects, so a project whose own output happens to
+// discuss permission flags cannot talk its way out of a real failure. The direction of the mistake
+// is also the safe one: a misread here withholds a pass, it never grants one.
+const CONFINEMENT_REJECTED = /--allow-(?:fs-read|fs-write|child-process|worker)=?\s+requires an argument/;
+
+function confinementWasRejected(result) {
+  return result?.exitCode !== 0 && CONFINEMENT_REJECTED.test(String(result?.output ?? ""));
+}
+
+// The one confinement quirk DevTeam knows how to work around, kept here rather than spread through
+// the runner so the next one has an obvious place to go.
+//
+// Node's test runner, asked to *discover* files (`node --test` with no paths), appends an empty
+// entry to its own permission list and then forwards it to the per-file child processes it spawns.
+// Those children die on `--allow-fs-read= requires an argument` before loading a single test. It
+// reproduces on Node 24.18 with nothing but `--permission --test`, and `node --test` is the most
+// ordinary check a Node project has, so a sandboxed project could never verify anything.
+//
+// Running every file in one process sidesteps the child spawn entirely. That is not quite the run a
+// human gets — a suite that relies on per-file isolation can legitimately behave differently — so
+// the substitution is stated in the transcript rather than made quietly.
+function confinementWorkaround(args) {
+  if (!args.includes("--test")) return null;
+  if (args.some((argument) => argument === "--test-isolation" || argument.startsWith("--test-isolation="))) return null;
+  const flag = ["--test-isolation", "--experimental-test-isolation"]
+    .find((candidate) => process.allowedNodeEnvironmentFlags.has(candidate));
+  if (!flag) return null;
+  return {
+    args: [...args, `${flag}=none`],
+    note: `DevTeam's sandbox wrapper was rejected by Node when it spawned one process per test file, so the check was re-run with ${flag}=none (every file in one process) and passed. Node's own bug, not this project's: see the first transcript below.`,
+  };
+}
+
+// "DevTeam could not run this" — recorded as unavailable, with both attempts kept, because the
+// human is the only one who can fix a broken wrapper and cannot fix what they cannot see.
+function confinementFault(first, second) {
+  return {
+    verified: false, status: "unavailable", exitCode: null,
+    durationMs: (first.durationMs || 0) + (second?.durationMs || 0), timedOut: false,
+    output: boundCheckOutput([
+      "[DevTeam] This check was NOT run, and this is not a result for the work under review.",
+      "The sandbox DevTeam wraps around the command was rejected by the runtime before the command started.",
+      second ? "A documented workaround was tried and the wrapper rejected that too." : "No workaround applies to this command.",
+      "Turn off sandboxed checks for this project, or pin an allowlisted command the wrapper can start, and the check becomes verifiable again.",
+      "", "--- first attempt ---", first.output ?? "",
+      ...(second ? ["", "--- workaround attempt ---", second.output ?? ""] : []),
+    ].join("\n")),
+  };
+}
+
+// The environment the check runs in: the operator's, minus anything that looks like a credential —
+// and minus the marker Node's test runner sets on its own children. A check must behave the same
+// whatever DevTeam happens to be running inside; inherited, that one variable makes a project's
+// `node --test` announce a recursive run and quietly skip every file while exiting 0.
 function scrubbedEnvironment() {
-  return Object.fromEntries(Object.entries(process.env).filter(([name]) => !SECRET_ENV_PATTERN.test(name)));
+  return Object.fromEntries(Object.entries(process.env)
+    .filter(([name]) => !SECRET_ENV_PATTERN.test(name) && name !== "NODE_TEST_CONTEXT"));
 }
 
 // Run one allowlisted check inside the project root and grade it by exit code.
@@ -270,27 +334,51 @@ function scrubbedEnvironment() {
 // Every verdict below is the one the synchronous version produced for the same situation. The four
 // states spawnSync gave for free (clean exit, timeout kill, output flood, never started) are each
 // tracked explicitly here, because spawn hands back a stream instead of a result.
-export function runVerifiedCheck({ argv, cwd, timeoutMs = DEFAULT_CHECK_TIMEOUT_MS, sandbox = false, runner = null }) {
+export async function runVerifiedCheck({ argv, cwd, timeoutMs = DEFAULT_CHECK_TIMEOUT_MS, sandbox = false, runner = null }) {
   const [program, ...args] = argv;
   // `sandbox: true` and `runner: "node-permission"` are the same thing; the second spelling exists
   // so a caller can be explicit about which confinement it is asking for.
   const mode = runner || (sandbox ? "node-permission" : "host");
   const confinement = mode === "node-permission" ? sandboxFlagsFor(program, cwd) : null;
   if (mode === "node-permission" && !confinement) {
-    return Promise.resolve({
+    return {
       verified: false, status: "unavailable", exitCode: null, durationMs: 0, timedOut: false,
       output: boundCheckOutput(`This project runs checks sandboxed, and DevTeam can only confine "node". "${program}" was not run.`),
-    });
+    };
   }
   // Run the same Node that runs DevTeam rather than whatever "node" happens to resolve to on PATH.
   const executable = program === "node" ? process.execPath : program;
-  return spawnCheck({
+  const environment = scrubbedEnvironment();
+  const startedAt = Date.now();
+  const first = await spawnCheck({
     executable,
     args: confinement ? [...confinement, ...args] : args,
     cwd,
     timeoutMs,
-    env: scrubbedEnvironment(),
+    env: environment,
   });
+  // Unconfined, there is no wrapper to blame, so every result is the command's own.
+  if (!confinement || !confinementWasRejected(first)) return first;
+
+  // The wrapper failed. One retry, inside whatever is left of this command's budget — the report's
+  // budget belongs to the caller and is not extended by a retry DevTeam chose to make.
+  const workaround = confinementWorkaround(args);
+  const remaining = timeoutMs - (Date.now() - startedAt);
+  if (!workaround || remaining <= 1000) return confinementFault(first, null);
+  const second = await spawnCheck({
+    executable,
+    args: [...confinement, ...workaround.args],
+    cwd,
+    timeoutMs: remaining,
+    env: environment,
+  });
+  // If the wrapper rejected the workaround too, nothing ran twice over and there is still no result.
+  // Otherwise the workaround *did* run the project's own code, so its verdict is the check's verdict
+  // — grading every sandboxed suite "unavailable" would hand back the unverified board this feature
+  // exists to replace. The note rides along either way, so a failure that is really the changed
+  // isolation and not the work can be recognised as one instead of argued about.
+  if (confinementWasRejected(second)) return confinementFault(first, second);
+  return { ...second, output: boundCheckOutput(`[DevTeam] ${workaround.note}\n\n--- rejected attempt ---\n${first.output ?? ""}\n\n--- workaround run ---\n${second.output ?? ""}`) };
 }
 
 // Spawning and grading, shared by every runner. Which process to start is the runner's decision;
