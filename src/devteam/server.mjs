@@ -564,7 +564,9 @@ export async function startDevTeamServer({
   });
   app.post("/api/tasks/:taskId/accept", (req, res) => {
     requireFields(req.body, ["summary"]);
-    res.json(store.acceptTaskByHuman({ taskId: req.params.taskId, summary: req.body.summary }));
+    res.json(store.acceptTaskByHuman({
+      taskId: req.params.taskId, summary: req.body.summary, acceptStranded: req.body.acceptStranded === true,
+    }));
   });
   app.delete("/api/agents/:agentId", (req, res) => {
     res.json(store.forgetAgent(req.params.agentId, { force: req.body?.force === true }));

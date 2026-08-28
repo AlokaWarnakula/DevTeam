@@ -757,11 +757,13 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
 
   server.registerTool("devteam_block", {
     title: "Block a task",
-    description: "Stop the task when human input, authorization, or an external state change is genuinely required. Blocking disconnects assigned agents.",
+    description: "Stop the whole task when human input, authorization, or an external state change is genuinely required. This is the heaviest thing you can do: every teammate is stood down, all open work is closed, and only the human can reopen it from the dashboard — no MCP tool can. Finishing is NOT blocking: when the work is done, approve the current version and let the human accept it. A problem with one assignment is not a task blocker either — report that assignment with status=blocked instead, which queues planner triage and leaves the task running.",
     inputSchema: {
       agentId: z.string().uuid(),
       taskId: z.string().uuid(),
       reason: z.string().min(1).max(8000),
+      kind: z.enum(["needs-human", "over-my-head", "misrouted", "external"])
+        .describe("Which kind of blocker this is. needs-human: a decision or authorization only the owner can give. over-my-head: the task exceeds the model or effort available to you — say what capability is needed. misrouted: this work cannot correctly be done by you (for example, you authored what you are being asked to independently check). external: something outside the project must change first. There is deliberately no kind meaning \"finished\"."),
     },
   }, safe(async (args) => {
     requireIdentity(args.agentId);

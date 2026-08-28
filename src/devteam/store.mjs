@@ -36,6 +36,16 @@ import {
 // A task in one of these states hands out no work; named once so the candidate scan and the
 // scheduler's explanation can never disagree about what "closed" means.
 const CLOSED_TASK_STATUSES = ["accepted", "blocked", "cancelled"];
+// Why a task was stopped, recorded rather than inferred from prose. Blocking is the one action no
+// MCP tool can undo, and on the live board agents reached for that single verb to mean six different
+// things — including "done": six task.blocked events read "Done", "done", "because all work is
+// done". A finished task closed that way stands every teammate down and needs the human to reopen it
+// purely so it can be accepted. None of these kinds is "finished", which is the point: naming the
+// kind is what stops the verb from absorbing a meaning it should never have had.
+const BLOCK_KINDS = ["needs-human", "over-my-head", "misrouted", "external"];
+// The three above that describe work in flight. With an empty board there is nothing for them to
+// stop, so they are refused and the caller is pointed at the move it actually wanted.
+const BLOCK_KINDS_NEEDING_OPEN_WORK = BLOCK_KINDS.filter((kind) => kind !== "needs-human");
 // How far the candidate scan will look past lease-blocked and runtime-gated work before giving up.
 // Generous for a local single-user server, and bounded so a pathological board cannot stall a claim.
 const CANDIDATE_PAGE_SIZE = 20;
@@ -2416,6 +2426,26 @@ export class DevTeamStore extends EventEmitter {
     };
   }
 
+  // What the working agent gets, as opposed to what the dashboard gets. The full record carries six
+  // bookkeeping fields — evidence hashes, policy and assignment versions — that an agent cannot act
+  // on, and no instruction at all. On this board 27 of 54 assignments scored difficult or worse and
+  // not one of them produced a word of advice, because model gating needs a registered profile and
+  // there has never been one. So the brief says the quiet part: nobody is going to stop you, the
+  // judgement is yours, and here is the one move that works.
+  #assessmentForBrief(row, { gated = false } = {}) {
+    const record = this.#assessmentRecord(row);
+    if (!record) return null;
+    const demanding = ["difficult", "critical", "recovery", "exceptional"].includes(record.level);
+    return {
+      level: record.level,
+      score: record.score,
+      reasons: (record.reasons || []).slice(0, 3).map((reason) => reason.detail || String(reason)),
+      guidance: demanding && !gated
+        ? `This assignment scored ${record.level}. No model gate is active, so nothing will stop you if it is beyond the model or effort you are running — that judgement is yours alone. If it is beyond you, do not push on: call devteam_block with kind "over-my-head" and name the capability needed.`
+        : null,
+    };
+  }
+
   assignmentAssessment({ agentId = null, assignmentId, refresh = false }) {
     const assignment = this.db.prepare(`
       SELECT a.*, t.title AS task_title, t.description AS task_description, t.version AS task_version
@@ -3232,6 +3262,11 @@ export class DevTeamStore extends EventEmitter {
             && lease.scopes.some((held) => scopes.some((want) => this.#scopesOverlap(held, want))));
           if (conflict) continue;
         }
+        // A verifying assignment is never handed to whoever wrote the version it examines. Resolved
+        // per candidate rather than as a SQL predicate for the same reason the write lease is: it
+        // depends on session lineage and on who is connected right now, neither of which the scan's
+        // single query can see.
+        if (candidate.verifies && this.#verifierIsAuthor(agentId, candidate)) continue;
         const gate = this.#runtimeGate(agent, candidate);
         if (gate.skip) continue;
         // Preserve the queue's targeted-first ordering for recommendations, but do not let one
@@ -3334,7 +3369,7 @@ export class DevTeamStore extends EventEmitter {
       this.#recoverOrphanedClaims();
     }
     const assignment = this.db.prepare(`
-      SELECT a.*, t.status AS task_status, t.project_id, p.root AS project_root
+      SELECT a.*, t.status AS task_status, t.project_id, t.version AS task_version, p.root AS project_root
       FROM assignments a
       JOIN tasks t ON t.id = a.task_id
       JOIN projects p ON p.id = t.project_id
@@ -3419,6 +3454,28 @@ export class DevTeamStore extends EventEmitter {
     if (failed.has("awaiting_writer")) {
       const writers = this.#blockingWriters(assignment.id);
       add("awaiting_writer", `Verification waits for the writer “${writers[0].title}” to finish${writers.length > 1 ? ` (and ${writers.length - 1} more)` : ""}.`, { writers });
+    }
+    // Not a predicate: independence depends on session lineage and on who is connected, neither of
+    // which the scan's single query can see, so it is resolved here exactly as the scan resolves it.
+    if (assignment.verifies) {
+      if (agent && this.#verifierIsAuthor(agent.id, assignment)) {
+        add("verifier_is_author", `“${agent.name}” wrote version ${assignment.task_version}, so it cannot verify it; an independent teammate is free to take this one.`,
+          { version: assignment.task_version });
+      } else if (!agent) {
+        // The dashboard asks about the item rather than about a claimant, and "the people in this
+        // room who wrote it cannot check it" is a fact about the item. Reported non-blocking, for
+        // the same reason an absent target is: an independent teammate may be free to take this the
+        // very next second, and calling it blocked would put the explanation at odds with a scan
+        // that is about to hand it over. Both branches read the same two lineage sets the scan
+        // reads, so the item can never be skipped for a reason this cannot name.
+        const authors = this.#currentVersionAuthorLineages(assignment.task_id, assignment.task_version);
+        const connected = this.#connectedParticipantLineages(assignment.task_id);
+        const excluded = [...connected].filter((lineage) => authors.has(lineage));
+        if (excluded.length && this.#independentClaimantExists(assignment, authors, null)) {
+          add("verifier_is_author", `Held for an independent teammate: ${excluded.length} of the contributors in this room wrote version ${assignment.task_version} and cannot verify their own work.`,
+            { version: assignment.task_version, excludedAuthors: excluded.length }, false);
+        }
+      }
     }
 
     if (assignment.requires_write) {
@@ -4890,6 +4947,48 @@ export class DevTeamStore extends EventEmitter {
     return new Set([...this.#connectedParticipantLineages(taskId)].filter((lineage) => !authors.has(lineage)));
   }
 
+  // Reviewer ≠ author, asked at claim time. approveTask has always refused a self-approval, but
+  // refusing it *only* there meant the author was handed the review claim, read the whole diff, and
+  // then found the single exit was to block the assignment: seven blocked assignments on this board
+  // are exactly that refusal, the most recent from 2026-08-27, and they are why 264 completed
+  // assignments produced two requests for changes. Enforcing it where the claim is handed out costs
+  // the team nothing and is the difference between independent review and a rubber stamp.
+  //
+  // No dead-ends, the same rule the rest of consensus follows: with no independent teammate
+  // connected, the author still gets the work and the acceptance is labeled selfReviewed rather than
+  // the assignment sitting claimable-by-nobody.
+  #verifierIsAuthor(agentId, assignment) {
+    const authors = this.#currentVersionAuthorLineages(assignment.task_id, assignment.task_version);
+    if (!authors.has(this.#participantLineage(agentId))) return false;
+    return this.#independentClaimantExists(assignment, authors, agentId);
+  }
+
+  // "Could somebody else actually take this, right now?" — deliberately not "does an independent
+  // teammate exist". The difference is a deadlock, and the property suite found it on the first try:
+  // a teammate who is connected but already holding as much work as it can take will never claim
+  // this item, so excluding the author on its behalf leaves the assignment queued forever with a
+  // reason that reads like a promise nobody is going to keep.
+  //
+  // Asked through the full explanation surface rather than a hand-rolled subset of it, so this can
+  // never drift from what the scan will really do with that teammate.
+  //
+  // The recursion terminates at one level: whyNotClaimable consults #verifierIsAuthor in turn, but
+  // only for the teammates asked about here, and those are non-authors by construction — the lineage
+  // test above returns false for them before reaching this method again.
+  #independentClaimantExists(assignment, authors, excludeAgentId) {
+    const members = this.db.prepare(`
+      SELECT tm.agent_id FROM task_members tm
+      JOIN agents agent ON agent.id = tm.agent_id
+      WHERE tm.task_id = ? AND tm.role = 'contributor' AND agent.status != 'disconnected'
+    `).all(assignment.task_id);
+    for (const member of members) {
+      if (member.agent_id === excludeAgentId) continue;
+      if (authors.has(this.#participantLineage(member.agent_id))) continue;
+      if (this.whyNotClaimable(assignment.id, member.agent_id, { refreshLiveness: false }).claimable) return true;
+    }
+    return false;
+  }
+
   // No dead-ends: configured consensus cannot exceed the independent teammates who could
   // actually approve now. With none available, one honest self-review remains sufficient.
   #effectiveRequiredApprovals(taskId, configured, version) {
@@ -5131,11 +5230,23 @@ export class DevTeamStore extends EventEmitter {
     this.#event(taskId, null, "agent.standdown", note, { agents: affected.map((a) => a.name) });
   }
 
-  blockTask({ agentId = null, taskId, reason }) {
+  // `kind` defaults only for the human, who blocks from a dashboard button and is not choosing
+  // between six overloaded meanings. Agents are made to name it at the MCP boundary.
+  blockTask({ agentId = null, taskId, reason, kind = "needs-human" }) {
     if (agentId) this.getAgent(agentId);
     const task = this.getTask(taskId);
     if (!task) throw new Error("Task not found.");
     this.assertMembership(agentId, taskId);
+    const blockKind = String(kind || "needs-human").trim();
+    if (!BLOCK_KINDS.includes(blockKind)) {
+      throw new Error(`"${blockKind}" is not a kind of blocker. Use one of: ${BLOCK_KINDS.join(", ")}.`);
+    }
+    const openWork = Number(this.db.prepare(`
+      SELECT COUNT(*) AS count FROM assignments WHERE task_id = ? AND status IN ('queued', 'claimed')
+    `).get(taskId).count);
+    if (!openWork && BLOCK_KINDS_NEEDING_OPEN_WORK.includes(blockKind)) {
+      throw new Error(`Nothing is open on "${task.title}", so there is no work in flight for a ${blockKind} blocker to stop. Finishing is not blocking: if the work is done, approve the current version and let the human accept it. If you genuinely need the human, block with kind "needs-human" and say exactly what you need from them.`);
+    }
     const stamp = now();
     this.#transaction(() => {
       this.db.prepare("UPDATE tasks SET status = 'blocked', updated_at = ? WHERE id = ?").run(stamp, taskId);
@@ -5147,11 +5258,11 @@ export class DevTeamStore extends EventEmitter {
         UPDATE session_checkpoints SET status = 'cancelled', handoff_token_hash = NULL
         WHERE task_id = ? AND status = 'ready'
       `).run(taskId);
-      this.#event(taskId, agentId, "task.blocked", reason.trim(), {});
+      this.#event(taskId, agentId, "task.blocked", reason.trim(), { kind: blockKind });
       this.#standDownTaskAgents(taskId, stamp, "Task was blocked; co-workers were released to other work.");
     });
     this.#changed("task.blocked", taskId);
-    return { blocked: true, taskId, reason: reason.trim() };
+    return { blocked: true, taskId, reason: reason.trim(), kind: blockKind };
   }
 
   // A blocked task is the one dead end that genuinely needs the human: no MCP tool can reopen it.
@@ -5163,9 +5274,11 @@ export class DevTeamStore extends EventEmitter {
     const task = this.getTask(taskId);
     if (!task || task.status !== "blocked") return null;
     const blockEvent = this.db.prepare(`
-      SELECT message, created_at, author_name, author_kind FROM events
+      SELECT message, metadata, created_at, author_name, author_kind FROM events
       WHERE task_id = ? AND type = 'task.blocked' ORDER BY id DESC LIMIT 1
     `).get(taskId);
+    // Blocks recorded before the kind existed have none; say so rather than inventing one.
+    const blockKind = fromJson(blockEvent?.metadata, {}).kind || null;
     const strandedWork = this.db.prepare(`
       SELECT COUNT(*) AS count FROM assignments WHERE task_id = ? AND status = 'blocked'
     `).get(taskId).count;
@@ -5174,6 +5287,7 @@ export class DevTeamStore extends EventEmitter {
       taskTitle: task.title,
       version: task.version,
       reason: blockEvent?.message || null,
+      kind: blockKind,
       blockedBy: blockEvent?.author_kind === "human" ? "the human" : (blockEvent?.author_name || null),
       blockedAt: blockEvent?.created_at || null,
       strandedAssignments: Number(strandedWork),
@@ -5250,12 +5364,33 @@ export class DevTeamStore extends EventEmitter {
     return { resumed: true, taskId, assignmentId, version, status: "planning", targetAgentName: target };
   }
 
-  acceptTaskByHuman({ taskId, summary }) {
+  // `acceptStranded` is the human confirming they know work was stopped mid-flight and are closing the
+  // task anyway. It is never assumed.
+  acceptTaskByHuman({ taskId, summary, acceptStranded = false }) {
     const task = this.getTask(taskId);
     if (!task) throw new Error("Task not found.");
-    if (["blocked", "cancelled"].includes(task.status)) throw new Error(`Cannot accept a ${task.status} task.`);
+    if (task.status === "cancelled") throw new Error("Cannot accept a cancelled task.");
     if (task.status === "accepted") return { accepted: true, taskId, version: task.version, humanOverride: true };
-    if (task.status !== "review") throw new Error("Human acceptance is available only when the task is ready for review.");
+    // A blocked task used to be unacceptable, full stop — and the only way out was Resume, which
+    // bumps the version, clears the approvals and queues a fresh planning assignment. That is the
+    // right treatment for work that genuinely stopped. It is absurd for a task an agent blocked to
+    // *mean finished*, which on this board was six of them: closing already-finished work should not
+    // require replanning it. Twenty tasks are sitting blocked with three resumes ever recorded, and
+    // this is a large part of why.
+    let strandedAssignments = 0;
+    if (task.status === "blocked") {
+      strandedAssignments = Number(this.db.prepare(`
+        SELECT COUNT(*) AS count FROM assignments WHERE task_id = ? AND status = 'blocked'
+      `).get(taskId).count);
+      // Nothing was in flight when it stopped, so there is no unfinished work to bury. Where there
+      // was, say exactly how much and make the human ask for it a second time — accepting is how a
+      // stalled piece of work would get quietly lost.
+      if (strandedAssignments && !acceptStranded) {
+        throw new Error(`"${task.title}" was blocked with ${strandedAssignments} assignment${strandedAssignments === 1 ? "" : "s"} still in flight. Resume it to finish that work, or accept again confirming you are closing it with that work unfinished.`);
+      }
+    } else if (task.status !== "review") {
+      throw new Error("Human acceptance is available only when the task is ready for review.");
+    }
     const cleanSummary = String(summary || "").trim();
     if (!cleanSummary) throw new Error("An acceptance summary is required.");
     const openAssignments = Number(this.db.prepare(`
@@ -5268,13 +5403,15 @@ export class DevTeamStore extends EventEmitter {
     const stamp = now();
     this.#transaction(() => {
       this.db.prepare("UPDATE tasks SET status = 'accepted', updated_at = ? WHERE id = ?").run(stamp, taskId);
-      this.#event(taskId, null, "task.accepted", `Human accepted version ${task.version}: ${cleanSummary}`, {
-        summary: cleanSummary,
-        version: task.version,
-        approvalCount,
-        requiredApprovals: task.required_approvals,
-        humanOverride: true,
-      });
+      this.#event(taskId, null, "task.accepted",
+        `Human accepted version ${task.version}${task.status === "blocked" ? " from blocked" : ""}: ${cleanSummary}`, {
+          summary: cleanSummary,
+          version: task.version,
+          approvalCount,
+          requiredApprovals: task.required_approvals,
+          humanOverride: true,
+          ...(task.status === "blocked" ? { acceptedFromBlocked: true, strandedAssignments } : {}),
+        });
       this.db.prepare(`
         UPDATE agents SET status = 'waiting', current_task_id = NULL, last_seen = ?
         WHERE current_task_id = ? AND status != 'disconnected'
@@ -5577,7 +5714,7 @@ export class DevTeamStore extends EventEmitter {
   // same card already lists them as blockedBy.
   #schedulingHold(assignment) {
     if (assignment.status !== "queued") return null;
-    const HOLD_PRECEDENCE = ["awaiting_writer", "write_lease_conflict", "target_absent"];
+    const HOLD_PRECEDENCE = ["awaiting_writer", "write_lease_conflict", "verifier_is_author", "target_absent"];
     const { reasons } = this.whyNotClaimable(assignment.id);
     for (const code of HOLD_PRECEDENCE) {
       const hold = reasons.find((reason) => reason.code === code);
@@ -5834,10 +5971,10 @@ export class DevTeamStore extends EventEmitter {
         project_root: clip(currentSource.project_root || task.project_root, 2_000, "currentAssignmentProjectRoot"),
         project_name: clip(currentSource.project_name || task.project_name, 400, "currentAssignmentProjectName"),
         claimGeneration: Number(currentSource.claimGeneration ?? currentSource.claim_generation ?? 0),
-        assessment: this.#assessmentRecord(this.db.prepare(`
+        assessment: this.#assessmentForBrief(this.db.prepare(`
           SELECT * FROM complexity_assessments WHERE assignment_id = ? AND invalidated_at IS NULL
           ORDER BY created_at DESC LIMIT 1
-        `).get(currentSource.id)),
+        `).get(currentSource.id), { gated: Boolean(this.runtimeProfile(agentId)) }),
         runtimeProfile: this.runtimeProfile(agentId),
         ...(currentSource.claimToken ? { claimToken: currentSource.claimToken } : {}),
       };
@@ -5949,8 +6086,10 @@ export class DevTeamStore extends EventEmitter {
     }).map((note) => ({
       ...note,
       title: clip(note.title, 360, "knowledgeTitles"),
-      body: clip(note.body, 1_400, "knowledgeBodies"),
-      relatedFiles: (note.relatedFiles || []).slice(0, 20).map((file) => clip(file, 400, "knowledgePaths")),
+      // Only the few notes that carry a body pay for one. The rest arrive as a headline and a
+      // wikilink, which devteam_knowledge reads in full when the agent decides it matters.
+      ...(note.body === undefined ? {} : { body: clip(note.body, 1_400, "knowledgeBodies") }),
+      relatedFiles: (note.relatedFiles || []).slice(0, 8).map((file) => clip(file, 400, "knowledgePaths")),
     }));
     const sessionCheckpoint = this.db.prepare(`
       SELECT * FROM session_checkpoints WHERE task_id = ? AND status IN ('ready', 'claimed')
