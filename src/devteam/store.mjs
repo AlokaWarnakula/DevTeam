@@ -9,12 +9,7 @@ import { buildBudgetedBrief, clipUtf8, DEFAULT_BRIEF_BUDGET } from "./brief.mjs"
 import { DEFAULT_ROLES, loadProjectRoles, planningRole, roleBehaviour, ROLES_CONFIG_PATH } from "./roles.mjs";
 import { currentRung, ladderIsStale, loadLadders, requiredRung, rungLabel, saveLadder } from "./models.mjs";
 import { hashToken, mintToken, normalizeTokenLabel, tokensMatch } from "./access.mjs";
-import {
-  assessAssignment,
-  COMPLEXITY_POLICY_VERSION,
-  normalizeRuntimeProfile,
-  resolveRuntimeRequirement,
-} from "./runtime/index.mjs";
+import { assessAssignment, COMPLEXITY_POLICY_VERSION } from "./runtime/index.mjs";
 import {
   CHECK_ALLOWLIST_LIMIT,
   DEFAULT_CHECK_TIMEOUT_MS,
@@ -460,17 +455,6 @@ export class DevTeamStore extends EventEmitter {
         PRIMARY KEY (project_id, key)
       );
 
-      CREATE TABLE IF NOT EXISTS agent_runtime_profiles (
-        agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
-        profile TEXT NOT NULL,
-        schema_version INTEGER NOT NULL,
-        source TEXT NOT NULL,
-        confidence REAL NOT NULL,
-        observed_at TEXT NOT NULL,
-        expires_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-
       CREATE TABLE IF NOT EXISTS complexity_assessments (
         id TEXT PRIMARY KEY,
         assignment_id TEXT NOT NULL REFERENCES assignments(id) ON DELETE CASCADE,
@@ -484,21 +468,6 @@ export class DevTeamStore extends EventEmitter {
         requirements TEXT NOT NULL,
         created_at TEXT NOT NULL,
         invalidated_at TEXT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS runtime_decisions (
-        id TEXT PRIMARY KEY,
-        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-        assignment_id TEXT NOT NULL REFERENCES assignments(id) ON DELETE CASCADE,
-        agent_id TEXT NULL REFERENCES agents(id) ON DELETE SET NULL,
-        assessment_id TEXT NOT NULL REFERENCES complexity_assessments(id) ON DELETE CASCADE,
-        recommendation TEXT NOT NULL,
-        choice TEXT NOT NULL,
-        actor TEXT NOT NULL,
-        reason TEXT NULL,
-        human_approved INTEGER NOT NULL DEFAULT 0,
-        created_at TEXT NOT NULL,
-        expires_at TEXT NULL
       );
 
       -- The per-project allowlist of commands DevTeam may run to verify a reported check. Empty
@@ -634,9 +603,7 @@ export class DevTeamStore extends EventEmitter {
       CREATE INDEX IF NOT EXISTS idx_receipts_agent ON message_receipts(agent_id, delivered_at, seen_at);
       CREATE INDEX IF NOT EXISTS idx_proposals_task_status ON proposals(task_id, status);
       CREATE INDEX IF NOT EXISTS idx_task_members_agent ON task_members(agent_id);
-      CREATE INDEX IF NOT EXISTS idx_runtime_profiles_expiry ON agent_runtime_profiles(expires_at);
       CREATE INDEX IF NOT EXISTS idx_complexity_assignment ON complexity_assessments(assignment_id, created_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_runtime_decisions_gate ON runtime_decisions(assignment_id, agent_id, created_at DESC);
       PRAGMA optimize;
     `);
     // Additive columns for databases created before consensus snapshots/quorum/timeout existed.
@@ -651,11 +618,9 @@ export class DevTeamStore extends EventEmitter {
       ["assignments", "complexity_override", "TEXT"],
       ["tasks", "session_policy", "TEXT NOT NULL DEFAULT 'manual'"],
       ["tasks", "session_policy_version", "INTEGER NOT NULL DEFAULT 1"],
-      ["tasks", "base_runtime_profile", "TEXT"],
       ["agents", "session_generation", "INTEGER NOT NULL DEFAULT 1"],
       ["agents", "fresh_task_id", "TEXT"],
       ["agents", "replaced_by_agent_id", "TEXT"],
-      ["agents", "session_policy_ack_task_id", "TEXT"],
       // What this session reports it is running right now. Free text in the agent's own words: it is
       // the one party that actually knows, and DevTeam compares it only against that provider's own
       // reported ladder, never across vendors.
@@ -1496,20 +1461,7 @@ export class DevTeamStore extends EventEmitter {
     return this.db.prepare("SELECT * FROM projects WHERE id = ?").get(projectId);
   }
 
-  // A base runtime profile is human-entered. Reject a value that claims to be a full runtime
-  // profile but cannot normalize, so an unusable note is refused at the point the human can still
-  // fix it rather than silently ignored later by the gate. A bare {modelClass, effortClass} hint
-  // stays accepted: the session-handoff capsule has always read that shorter shape.
-  #validatedBaseRuntimeProfile(value) {
-    if (value == null) return null;
-    if (typeof value !== "object" || Array.isArray(value)) throw new Error("Base runtime profile must be an object or null.");
-    if (value.providerId || value.availableModels || value.currentModel) {
-      normalizeRuntimeProfile({ ...value, source: "user" });
-    }
-    return value;
-  }
-
-  createTask({ projectId, title, description, requiredApprovals = 2, sessionPolicy = "per_task", baseRuntimeProfile = null }) {
+  createTask({ projectId, title, description, requiredApprovals = 2, sessionPolicy = "per_task" }) {
     const project = this.db.prepare("SELECT * FROM projects WHERE id = ?").get(projectId);
     if (!project) throw new Error("Project not found.");
     const taskId = randomUUID();
@@ -1520,11 +1472,11 @@ export class DevTeamStore extends EventEmitter {
     this.#transaction(() => {
       this.db.prepare(`
         INSERT INTO tasks (id, project_id, title, description, status, version, required_approvals,
-          session_policy, session_policy_version, base_runtime_profile, created_at, updated_at)
-        VALUES (?, ?, ?, ?, 'planning', 1, ?, ?, 1, ?, ?, ?)
+          session_policy, session_policy_version, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 'planning', 1, ?, ?, 1, ?, ?)
       `).run(taskId, projectId, title.trim(), description.trim(), approvals,
         ["manual", "per_task", "adaptive", "per_assignment"].includes(sessionPolicy) ? sessionPolicy : "per_task",
-        baseRuntimeProfile ? json(this.#validatedBaseRuntimeProfile(baseRuntimeProfile)) : null, stamp, stamp);
+        stamp, stamp);
       this.db.prepare(`
         INSERT INTO assignments (id, task_id, title, description, role, requires_write, status, created_at, plans)
         VALUES (?, ?, ?, ?, ?, 0, 'queued', ?, 1)
@@ -1613,7 +1565,7 @@ export class DevTeamStore extends EventEmitter {
   // after creation, so a typo or a sharpened spec no longer means deleting and recreating the room.
   // This is metadata only: it does not touch the version, existing approvals, assignments, or the
   // timeline of work — it just records that the human revised the brief. At least one field changes.
-  updateTask(taskId, { title = undefined, description = undefined, requiredApprovals = undefined, sessionPolicy = undefined, baseRuntimeProfile = undefined } = {}) {
+  updateTask(taskId, { title = undefined, description = undefined, requiredApprovals = undefined, sessionPolicy = undefined } = {}) {
     const task = this.getTask(taskId);
     if (!task) throw new Error("Task not found.");
     if (task.status === "cancelled") throw new Error("A cancelled task cannot be edited.");
@@ -1626,9 +1578,8 @@ export class DevTeamStore extends EventEmitter {
       : Math.max(1, Math.min(8, Number(requiredApprovals) || task.required_approvals));
     const nextPolicy = sessionPolicy === undefined ? task.session_policy : String(sessionPolicy);
     if (!["manual", "per_task", "adaptive", "per_assignment"].includes(nextPolicy)) throw new Error("Invalid session policy.");
-    const nextBaseProfile = baseRuntimeProfile === undefined ? task.base_runtime_profile : (baseRuntimeProfile == null ? null : json(this.#validatedBaseRuntimeProfile(baseRuntimeProfile)));
     if (nextTitle === task.title && nextDescription === task.description && nextApprovals === task.required_approvals
-      && nextPolicy === task.session_policy && nextBaseProfile === task.base_runtime_profile) {
+      && nextPolicy === task.session_policy) {
       return this.getTask(taskId);
     }
     const changed = [
@@ -1636,13 +1587,12 @@ export class DevTeamStore extends EventEmitter {
       nextDescription !== task.description ? "description" : null,
       nextApprovals !== task.required_approvals ? "approvals" : null,
       nextPolicy !== task.session_policy ? "session policy" : null,
-      nextBaseProfile !== task.base_runtime_profile ? "base runtime profile" : null,
     ].filter(Boolean);
     const stamp = now();
     this.#transaction(() => {
       this.db.prepare(`UPDATE tasks SET title = ?, description = ?, required_approvals = ?, session_policy = ?,
-        session_policy_version = session_policy_version + ?, base_runtime_profile = ?, updated_at = ? WHERE id = ?`)
-        .run(nextTitle, nextDescription, nextApprovals, nextPolicy, nextPolicy === task.session_policy ? 0 : 1, nextBaseProfile, stamp, taskId);
+        session_policy_version = session_policy_version + ?, updated_at = ? WHERE id = ?`)
+        .run(nextTitle, nextDescription, nextApprovals, nextPolicy, nextPolicy === task.session_policy ? 0 : 1, stamp, taskId);
       this.#event(taskId, null, "task.updated", `Task details edited (${changed.join(", ")}).`, { changed, requiredApprovals: nextApprovals, sessionPolicy: nextPolicy });
     });
     this.#changed("task.updated", taskId);
@@ -1703,70 +1653,6 @@ export class DevTeamStore extends EventEmitter {
     return createHash("sha256").update(String(token)).digest("hex");
   }
 
-  #runtimeProfileRecord(row) {
-    if (!row) return null;
-    const profile = fromJson(row.profile, null);
-    try {
-      const normalized = normalizeRuntimeProfile({
-        ...profile,
-        source: profile?.source || row.source,
-        observedAt: profile?.observedAt || row.observed_at,
-        expiresAt: profile?.expiresAt || row.expires_at,
-      });
-      return { ...normalized, stale: Date.parse(normalized.expiresAt) <= Date.now() };
-    } catch {
-      return {
-        schemaVersion: Number(row.schema_version) || 0,
-        providerId: "invalid-stored-profile",
-        currentModel: null,
-        currentEffort: null,
-        currentModelClass: "unknown",
-        currentEffortClass: "unknown",
-        availableModels: [],
-        switchMode: "unknown",
-        source: "agent_estimate",
-        confidence: 0,
-        observedAt: row.observed_at,
-        expiresAt: row.expires_at,
-        stale: Date.parse(row.expires_at) <= Date.now(),
-        validationIssues: ["stored_profile_invalid"],
-      };
-    }
-  }
-
-  runtimeProfile(agentId) {
-    this.getAgent(agentId);
-    return this.#runtimeProfileRecord(this.db.prepare("SELECT * FROM agent_runtime_profiles WHERE agent_id = ?").get(agentId));
-  }
-
-  updateRuntimeProfile({ agentId, profile, force = false }) {
-    const agent = this.getAgent(agentId);
-    if (agent.status === "disconnected") throw new Error("A disconnected session cannot update its runtime profile.");
-    const normalized = normalizeRuntimeProfile(profile);
-    const existing = this.runtimeProfile(agentId);
-    if (!force && existing && !existing.stale && existing.confidence > normalized.confidence) {
-      throw new Error(`A fresh ${existing.source} runtime profile outranks this ${normalized.source} update. Refresh it from the authoritative source or use an explicit human correction.`);
-    }
-    const stamp = now();
-    this.db.prepare(`
-      INSERT INTO agent_runtime_profiles (
-        agent_id, profile, schema_version, source, confidence, observed_at, expires_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(agent_id) DO UPDATE SET
-        profile = excluded.profile, schema_version = excluded.schema_version, source = excluded.source,
-        confidence = excluded.confidence, observed_at = excluded.observed_at,
-        expires_at = excluded.expires_at, updated_at = excluded.updated_at
-    `).run(agentId, json(normalized), normalized.schemaVersion, normalized.source, normalized.confidence,
-      normalized.observedAt, normalized.expiresAt, stamp);
-    const taskId = agent.current_task_id || this.#memberTaskIds(agentId)[0] || null;
-    if (taskId) this.#event(taskId, agentId, "runtime.profile_updated", `${agent.name} updated its runtime profile from ${normalized.source}.`, {
-      source: normalized.source, switchMode: normalized.switchMode, expiresAt: normalized.expiresAt,
-      modelClass: normalized.currentModelClass, effortClass: normalized.currentEffortClass,
-    });
-    this.#changed("runtime.profile_updated", taskId);
-    return normalized;
-  }
-
   #dependencyDepth(assignmentId, seen = new Set()) {
     if (seen.has(assignmentId)) return 0;
     seen.add(assignmentId);
@@ -1796,10 +1682,10 @@ export class DevTeamStore extends EventEmitter {
   // What the working agent gets, as opposed to what the dashboard gets. The full record carries six
   // bookkeeping fields — evidence hashes, policy and assignment versions — that an agent cannot act
   // on, and no instruction at all. On this board 27 of 54 assignments scored difficult or worse and
-  // not one of them produced a word of advice, because model gating needs a registered profile and
-  // there has never been one. So the brief says the quiet part: nobody is going to stop you, the
-  // judgement is yours, and here is the one move that works.
-  #assessmentForBrief(row, { gated = false } = {}) {
+  // not one of them produced a word of advice, because model gating needed a registered profile and
+  // there never was one. The gate is gone; the brief says the quiet part instead: nobody is going to
+  // stop you, the judgement is yours, and here is the one move that works.
+  #assessmentForBrief(row) {
     const record = this.#assessmentRecord(row);
     if (!record) return null;
     const demanding = ["difficult", "critical", "recovery", "exceptional"].includes(record.level);
@@ -1807,7 +1693,7 @@ export class DevTeamStore extends EventEmitter {
       level: record.level,
       score: record.score,
       reasons: (record.reasons || []).slice(0, 3).map((reason) => reason.detail || String(reason)),
-      guidance: demanding && !gated
+      guidance: demanding
         ? `This assignment scored ${record.level}. No model gate is active, so nothing will stop you if it is beyond the model or effort you are running — that judgement is yours alone. If it is beyond you, do not push on: call devteam_stuck with kind "over-my-head" and name the capability needed.`
         : null,
     };
@@ -1873,117 +1759,7 @@ export class DevTeamStore extends EventEmitter {
     return assessment;
   }
 
-  #runtimeDecisionRecord(row) {
-    return row ? {
-      id: row.id, taskId: row.task_id, assignmentId: row.assignment_id, agentId: row.agent_id,
-      assessmentId: row.assessment_id, recommendation: fromJson(row.recommendation, null),
-      choice: row.choice, actor: row.actor, reason: row.reason, humanApproved: Boolean(row.human_approved),
-      createdAt: row.created_at, expiresAt: row.expires_at,
-    } : null;
-  }
-
-  runtimeDecision({ agentId = null, assignmentId, assessmentId = null, choice, actor = null, reason = "", humanApproved = false }) {
-    if (!["switched", "continue", "reassign", "cancel"].includes(choice)) throw new Error("Runtime choice must be switched, continue, reassign, or cancel.");
-    const assignment = this.db.prepare("SELECT * FROM assignments WHERE id = ?").get(assignmentId);
-    if (!assignment) throw new Error("Assignment not found.");
-    if (agentId) { this.getAgent(agentId); this.assertMembership(agentId, assignment.task_id); }
-    const assessment = this.assignmentAssessment({ agentId, assignmentId });
-    if (assessmentId && assessment.id !== assessmentId) throw new Error("The assignment assessment changed. Review the current recommendation before deciding.");
-    const profile = agentId ? this.runtimeProfile(agentId) : null;
-    const resolution = resolveRuntimeRequirement(assessment.requirements, profile);
-    if (choice === "switched" && !resolution.satisfied) throw new Error("The refreshed runtime profile still does not satisfy this assessment. Update the current host settings first or choose Continue anyway.");
-    if (assessment.requirements.humanApprovalRequired && ["switched", "continue"].includes(choice) && !humanApproved) {
-      throw new Error("Exceptional runtime settings require explicit human approval.");
-    }
-    const stamp = now();
-    const expiresAt = ["reassign", "cancel"].includes(choice) ? new Date(Date.now() + 5 * 60 * 1000).toISOString() : null;
-    const id = randomUUID();
-    this.db.prepare(`
-      INSERT INTO runtime_decisions (
-        id, task_id, assignment_id, agent_id, assessment_id, recommendation, choice,
-        actor, reason, human_approved, created_at, expires_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(id, assignment.task_id, assignmentId, agentId, assessment.id, json(resolution), choice,
-      String(actor || (agentId ? "agent" : "human")).trim().slice(0, 120), String(reason || "").trim().slice(0, 1000) || null,
-      humanApproved ? 1 : 0, stamp, expiresAt);
-    this.#event(assignment.task_id, agentId, "runtime.decision_recorded", `Runtime decision for “${assignment.title}”: ${choice}.`, {
-      assignmentId, assessmentId: assessment.id, choice, actor: actor || (agentId ? "agent" : "human"), humanApproved: Boolean(humanApproved),
-    });
-    if (choice === "switched") this.#event(assignment.task_id, agentId, "runtime.switch_verified", `Runtime switch verified for “${assignment.title}”.`, { assignmentId, assessmentId: assessment.id });
-    this.#changed("runtime.decision_recorded", assignment.task_id);
-    return this.#runtimeDecisionRecord(this.db.prepare("SELECT * FROM runtime_decisions WHERE id = ?").get(id));
-  }
-
-  // A task's base runtime profile is the human's standing statement about the session they run
-  // this task in ("I start these chats on Sonnet 5, medium effort"). It is always read back as a
-  // `user` claim regardless of what was stored, so a saved note can never impersonate a host or
-  // adapter observation and outrank a live session profile.
-  #taskBaseRuntimeProfile(taskId) {
-    const stored = fromJson(this.db.prepare("SELECT base_runtime_profile FROM tasks WHERE id = ?").get(taskId)?.base_runtime_profile, null);
-    if (!stored || typeof stored !== "object" || Array.isArray(stored)) return null;
-    try {
-      const normalized = normalizeRuntimeProfile({ ...stored, source: "user" });
-      return { ...normalized, stale: Date.parse(normalized.expiresAt) <= Date.now() };
-    } catch {
-      // A loose or malformed note is not evidence of anything; it must never gate work.
-      return null;
-    }
-  }
-
-  #runtimeGate(agent, candidate) {
-    // Candidate selection already authorizes either contributor membership or an exact targeted
-    // invitation. Assess without re-running the stricter room-membership check so a targeted agent
-    // can pass the runtime gate before its membership is persisted by the eventual claim.
-    const assessment = this.assignmentAssessment({ assignmentId: candidate.id });
-    const agentProfile = this.runtimeProfile(agent.id);
-    // Fall back to the task's standing profile only when the session itself advertises nothing.
-    const baseProfile = agentProfile ? null : this.#taskBaseRuntimeProfile(candidate.task_id);
-    const profile = agentProfile || baseProfile;
-    const profileSource = agentProfile ? "agent" : baseProfile ? "task_base" : null;
-    // Runtime profiles were added after DevTeam's original connect handshake. A session that did
-    // not send one, on a task with no usable base profile, remains a legacy client and keeps the
-    // old claim behavior; once a session opts into runtime discovery, stale/estimated/insufficient
-    // data is always gated and never guessed.
-    if (!profile) return { allowed: true, assessment, profile: null, resolution: null, legacyUnprofiled: true, profileSource: null };
-    // A standing declaration that has aged out is not evidence about the current session — but it
-    // must not stall the queue either. Aging out returns the agent to legacy behavior and asks the
-    // dashboard for a refresh, rather than blocking every claim on a stale human note.
-    if (baseProfile?.stale) {
-      return { allowed: true, assessment, profile: null, resolution: null, legacyUnprofiled: true, profileSource: null, baseProfileStale: true };
-    }
-    const resolution = resolveRuntimeRequirement(assessment.requirements, profile);
-    const decisionRow = this.db.prepare(`
-      SELECT * FROM runtime_decisions
-      WHERE assignment_id = ? AND assessment_id = ? AND (agent_id = ? OR agent_id IS NULL)
-      ORDER BY created_at DESC LIMIT 1
-    `).get(candidate.id, assessment.id, agent.id);
-    const decision = this.#runtimeDecisionRecord(decisionRow);
-    if (decision && ["reassign", "cancel"].includes(decision.choice)
-      && (!decision.expiresAt || Date.parse(decision.expiresAt) > Date.now())) return { skip: true, decision };
-    if (resolution.satisfied || decision?.choice === "continue") return { allowed: true, assessment, profile, resolution, decision, profileSource };
-    const priorRecommendation = this.db.prepare(`
-      SELECT id FROM events WHERE task_id = ? AND type = 'runtime.switch_recommended'
-        AND json_extract(metadata, '$.assignmentId') = ? AND json_extract(metadata, '$.assessmentId') = ?
-        AND json_extract(metadata, '$.agentId') = ? LIMIT 1
-    `).get(candidate.task_id, candidate.id, assessment.id, agent.id);
-    return {
-      runtimeActionRequired: true,
-      status: "runtime_action_required",
-      taskId: candidate.task_id,
-      assignment: { id: candidate.id, title: candidate.title, role: candidate.role, requiresWrite: Boolean(candidate.requires_write) },
-      assessment,
-      runtimeProfile: profile,
-      profileSource,
-      resolution,
-      alreadyRecommended: Boolean(priorRecommendation),
-      actions: ["switched", "continue", "reassign", "cancel"],
-      advisory: profile?.switchMode !== "automatic",
-      humanApprovalRequired: Boolean(assessment.requirements.humanApprovalRequired),
-      leaseAcquired: false,
-    };
-  }
-
-  connectAgent({ name, provider, capabilities = [], runtimeProfile = null, sessionGeneration = 1, freshTaskId = null, model = null, effort = null }) {
+  connectAgent({ name, provider, capabilities = [], sessionGeneration = 1, freshTaskId = null, model = null, effort = null }) {
     const cleanName = name.trim();
     const cleanProvider = provider.trim();
     if (!cleanName || !cleanProvider) throw new Error("Agent name and provider are required.");
@@ -2027,47 +1803,7 @@ export class DevTeamStore extends EventEmitter {
       catch (error) { room = { joined: false, taskId: freshTaskId, error: error.message }; }
     }
     // The resume token is returned exactly once, to this caller, and only its hash is stored.
-    if (runtimeProfile) this.updateRuntimeProfile({ agentId: id, profile: runtimeProfile });
-    return { ...this.getAgent(id), runtimeProfile: this.runtimeProfile(id), room, resumeToken };
-  }
-
-  sessionRotationRecommendation(agentId) {
-    const agent = this.getAgent(agentId);
-    if (!this.runtimeProfile(agentId)) return null;
-    const rooms = this.#claimableTaskIds(agentId);
-    for (const taskId of rooms) {
-      const task = this.getTask(taskId);
-      if (!task || !["per_task", "adaptive", "per_assignment"].includes(task.session_policy)) continue;
-      if (agent.fresh_task_id === taskId || agent.session_policy_ack_task_id === taskId) continue;
-      const eligible = Number(this.db.prepare("SELECT COUNT(*) AS count FROM assignments WHERE task_id = ? AND status = 'queued'").get(taskId).count);
-      if (!eligible) continue;
-      return {
-        status: "session_rotation_recommended", taskId, sessionPolicy: task.session_policy,
-        sessionGeneration: Number(agent.session_generation || 1),
-        reason: task.session_policy === "per_assignment"
-          ? "This experimental task policy recommends a fresh session for each assignment."
-          : "This task uses a fresh-session policy and the current profiled session was not started for this task.",
-        actions: ["open_fresh_session", "continue_current_session"],
-        next: "Open a fresh task-specific session or explicitly continue this session. Active claims are never released by this recommendation.",
-      };
-    }
-    return null;
-  }
-
-  continueCurrentSession({ agentId, taskId }) {
-    this.assertMembership(agentId, taskId);
-    const task = this.getTask(taskId);
-    if (!task) throw new Error("Task not found.");
-    this.db.prepare("UPDATE agents SET session_policy_ack_task_id = ?, last_seen = ? WHERE id = ?").run(taskId, now(), agentId);
-    this.#event(taskId, agentId, "session.rotation_continued", "The human chose to continue the current session despite the fresh-session recommendation.", { sessionPolicy: task.session_policy });
-    this.#changed("session.rotation_continued", taskId);
-    return { continued: true, taskId, advisory: true };
-  }
-
-  recordManagedLaunch({ taskId, agentId = null, adapterId, pid = null, status, message }) {
-    this.assertMembership(agentId, taskId);
-    this.#event(taskId, agentId, `runtime.managed_${status}`, message, { adapterId, pid });
-    this.#changed(`runtime.managed_${status}`, taskId);
+    return { ...this.getAgent(id), room, resumeToken };
   }
 
   getAgent(agentId) {
@@ -2204,7 +1940,6 @@ export class DevTeamStore extends EventEmitter {
       return {
         ...safe,
         capabilities: fromJson(row.capabilities, []),
-        runtimeProfile: this.#runtimeProfileRecord(this.db.prepare("SELECT * FROM agent_runtime_profiles WHERE agent_id = ?").get(row.id)),
         pending_messages: row.status === "disconnected" ? 0 : this.#pendingMessageCount(row),
       };
     });
@@ -2742,7 +2477,6 @@ export class DevTeamStore extends EventEmitter {
       `).all(...predicates.flatMap((predicate) => predicate.params), CANDIDATE_PAGE_SIZE, offset);
       const heldLeases = this.#heldWriteLeases();
       const stamp = now();
-      let firstRuntimeGate = null;
       const candidates = [];
       for (let offset = 0; offset < CANDIDATE_SCAN_CEILING; offset += CANDIDATE_PAGE_SIZE) {
         const page = readCandidatePage(offset);
@@ -2774,14 +2508,6 @@ export class DevTeamStore extends EventEmitter {
         // what that work needs. Stopping at the first hard item instead would strand work the
         // current model was perfectly capable of finishing.
         if (this.#aboveCurrentRung(agent, candidate)) continue;
-        const gate = this.#runtimeGate(agent, candidate);
-        if (gate.skip) continue;
-        // Preserve the queue's targeted-first ordering for recommendations, but do not let one
-        // incompatible item hide later work this agent can legally claim right now.
-        if (!gate.allowed) {
-          firstRuntimeGate ||= gate;
-          continue;
-        }
         const claimToken = randomBytes(18).toString("base64url");
         const result = this.db.prepare(`
           UPDATE assignments
@@ -2792,7 +2518,7 @@ export class DevTeamStore extends EventEmitter {
         const claimGeneration = this.db.prepare("SELECT claim_generation FROM assignments WHERE id = ?").get(candidate.id).claim_generation;
         if (candidate.task_session_policy === "per_assignment") {
           this.db.prepare(`UPDATE agents SET status = 'busy', current_task_id = ?, last_seen = ?,
-            fresh_task_id = NULL, session_policy_ack_task_id = NULL WHERE id = ?`)
+            fresh_task_id = NULL WHERE id = ?`)
             .run(candidate.task_id, stamp, agentId);
         } else {
           this.db.prepare("UPDATE agents SET status = 'busy', current_task_id = ?, last_seen = ? WHERE id = ?")
@@ -2835,26 +2561,10 @@ export class DevTeamStore extends EventEmitter {
           } : {}),
         };
       }
-      if (firstRuntimeGate) return firstRuntimeGate;
       this.db.prepare("UPDATE agents SET status = 'waiting', last_seen = ? WHERE id = ?").run(now(), agentId);
       return null;
     });
-    // A gate encountered while scanning must not count as delivered if later compatible work was
-    // claimed. Record the recommendation only when the gate is the result returned to the caller.
-    if (assignment?.runtimeActionRequired && !assignment.alreadyRecommended) {
-      this.#event(assignment.taskId, agentId, "runtime.switch_recommended", `Runtime action is required before “${assignment.assignment.title}” can be claimed.`, {
-        assignmentId: assignment.assignment.id,
-        assessmentId: assignment.assessment.id,
-        agentId,
-        level: assignment.assessment.level,
-        requirements: assignment.assessment.requirements,
-        recommendation: assignment.resolution.recommendation,
-      });
-    }
-    if (assignment) this.#changed(
-      assignment.runtimeActionRequired ? "runtime.switch_recommended" : "assignment.claimed",
-      assignment.task_id || assignment.taskId,
-    );
+    if (assignment) this.#changed("assignment.claimed", assignment.task_id);
     return assignment;
   }
 
@@ -3007,31 +2717,6 @@ export class DevTeamStore extends EventEmitter {
         sameRoom
           ? { conflictingAssignmentId: lease.id, conflictingTitle: lease.title, holder: lease.holder, paths: overlaps, sameRoom }
           : { conflictingAssignmentId: null, conflictingTitle: null, holder: null, paths: overlaps, sameRoom });
-      }
-    }
-
-    if (agent) {
-      const gate = this.#runtimeGate(agent, assignment);
-      if (gate.skip) {
-        add("runtime_decision_hold", `A standing runtime decision (${gate.decision.choice}) removes this assignment from “${agent.name}”'s queue until a human revisits it.`, { decision: gate.decision });
-      } else if (gate.runtimeActionRequired) {
-        const current = gate.resolution?.current;
-        const wanted = gate.resolution?.recommendation;
-        const runningLabel = current
-          ? `${current.modelLabel || current.modelId || current.modelClass}${current.effortLabel || current.effortId ? ` at ${current.effortLabel || current.effortId} effort` : ""}`
-          : "a runtime profile DevTeam cannot read";
-        const neededLabel = wanted
-          ? `${wanted.modelLabel || wanted.modelId || wanted.modelClass}${wanted.effortLabel || wanted.effortId ? ` at ${wanted.effortLabel || wanted.effortId} effort` : ""}`
-          : `the ${gate.assessment.requirements.modelClass} model class at ${gate.assessment.requirements.effortClass} effort, which this session advertises no way to reach`;
-        add("runtime_gate", `“${agent.name}” is running ${runningLabel}; this ${gate.assessment.level} assignment needs ${neededLabel}.`, {
-          level: gate.assessment.level,
-          assessmentId: gate.assessment.id,
-          requirements: gate.assessment.requirements,
-          current: current || null,
-          recommendation: wanted || null,
-          profileSource: gate.profileSource || null,
-          humanApprovalRequired: Boolean(gate.humanApprovalRequired),
-        });
       }
     }
 
@@ -4963,9 +4648,6 @@ export class DevTeamStore extends EventEmitter {
         SELECT * FROM complexity_assessments WHERE assignment_id = ? AND invalidated_at IS NULL
         ORDER BY created_at DESC LIMIT 1
       `).get(assignment.id));
-      const runtimeDecision = this.#runtimeDecisionRecord(this.db.prepare(`
-        SELECT * FROM runtime_decisions WHERE assignment_id = ? ORDER BY created_at DESC LIMIT 1
-      `).get(assignment.id));
       return {
         ...assignment,
         checklist: this.#checklistFor(assignment.id),
@@ -4980,7 +4662,6 @@ export class DevTeamStore extends EventEmitter {
         // The score in the words the human uses for their own models. "Base · Score 0" is DevTeam's
         // vocabulary, not anyone else's; "Needs Sonnet 5 · medium" is the same fact said usefully.
         needsRung: assessment ? this.#rungLabelFor(task.project_id, assessment.level) : null,
-        runtimeDecision,
       };
     });
     // The roles this project understands travel with the task, so the dashboard's assignment form
@@ -4990,9 +4671,7 @@ export class DevTeamStore extends EventEmitter {
       SELECT m.role, ag.id AS agent_id, ag.name AS agent_name, ag.provider AS agent_provider, ag.status
       FROM task_members m JOIN agents ag ON ag.id = m.agent_id
       WHERE m.task_id = ? ORDER BY m.joined_at ASC
-    `).all(taskId).map((member) => ({ ...member, runtimeProfile: this.#runtimeProfileRecord(
-      this.db.prepare("SELECT * FROM agent_runtime_profiles WHERE agent_id = ?").get(member.agent_id),
-    ) }));
+    `).all(taskId);
     const approvals = this.db.prepare(`
       SELECT ap.*, ag.name AS agent_name, ag.provider AS agent_provider
       FROM approvals ap JOIN agents ag ON ag.id = ap.agent_id
@@ -5203,8 +4882,7 @@ export class DevTeamStore extends EventEmitter {
         assessment: this.#assessmentForBrief(this.db.prepare(`
           SELECT * FROM complexity_assessments WHERE assignment_id = ? AND invalidated_at IS NULL
           ORDER BY created_at DESC LIMIT 1
-        `).get(currentSource.id), { gated: Boolean(this.runtimeProfile(agentId)) }),
-        runtimeProfile: this.runtimeProfile(agentId),
+        `).get(currentSource.id)),
         ...(currentSource.claimToken ? { claimToken: currentSource.claimToken } : {}),
       };
     }

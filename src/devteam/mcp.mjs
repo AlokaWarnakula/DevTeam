@@ -209,32 +209,17 @@ export function createDevTeamMcpServer(store, session = { agentId: null }) {
           next: "The team is deciding how to organise. Review each proposal and vote with devteam_verdict (agree or object, with a short reason). A proposal is adopted only when every connected teammate agrees.",
         };
       }
-      const rotation = store.sessionRotationRecommendation(agentId);
-      if (rotation) return { ...rotation, keepWaiting: true };
       const assignment = store.claimNextAssignment(agentId);
       if (assignment) {
-        if (assignment.runtimeActionRequired) {
-          // The first recommendation needs a model turn so the agent can ask the human. Once it has
-          // already been delivered, keep this local wait blocked instead of returning the same gate
-          // every 750 ms and burning a model turn per retry.
-          if (!assignment.alreadyRecommended) {
-            return {
-              ...assignment,
-              keepWaiting: true,
-              next: "No lease was acquired. Ask the user to switch, continue, reassign, or cancel, then record the choice with devteam_runtime_decision. If settings changed, call devteam_runtime_update first.",
-            };
-          }
-        } else {
-          return store.taskBrief(agentId, assignment.task_id, {
-            currentAssignment: assignment,
-            assignmentKey: "assignment",
-            responseCore: {
-              status: "assigned",
-              keepWaiting: true,
-              instructions: "Inspect the current project state before acting. Complete this bounded assignment, then call devteam_report — pass back assignment.claimToken so a stale report is fenced if your lease moved. Use devteam_plan to delegate follow-up implementation, testing, or independent review.",
-            },
-          });
-        }
+        return store.taskBrief(agentId, assignment.task_id, {
+          currentAssignment: assignment,
+          assignmentKey: "assignment",
+          responseCore: {
+            status: "assigned",
+            keepWaiting: true,
+            instructions: "Inspect the current project state before acting. Complete this bounded assignment, then call devteam_report — pass back assignment.claimToken so a stale report is fenced if your lease moved. Use devteam_plan to delegate follow-up implementation, testing, or independent review.",
+          },
+        });
       }
       store.heartbeat(agentId, "waiting");
       await sleep(Math.min(750, Math.max(0, deadline - Date.now())));

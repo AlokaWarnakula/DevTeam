@@ -1420,7 +1420,6 @@
 .complexity > strong { text-transform: capitalize; color: #b9d9ff; }
 .complexity > span, .complexity > small { color: var(--muted); }
 .complexity.pending { background: transparent; border-style: dashed; }
-.runtime-decision { display: block; color: #8fd3ad; margin-bottom: 6px; }
 .runtime-profile { color: #9fbce0 !important; }
 .runtime-profile.unknown { color: var(--muted) !important; }
 .runtime-dialog { width: min(700px, calc(100vw - 28px)); }
