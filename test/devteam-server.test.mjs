@@ -613,20 +613,6 @@ test("the runtime profile control plane persists human-entered models and stays 
   assert.equal(rejected.status >= 400, true, "an unusable profile is refused where the human can still fix it");
 });
 
-test("the dashboard renders advertised model names and states plainly when gating is inactive", async (t) => {
-  const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-runtime-ui-"));
-  const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd(), knowledge: { enabled: false } });
-  t.after(async () => { await instance.close(); await rm(dataDir, { recursive: true, force: true }); });
-  const script = await fetch(`${instance.url}/app.js`).then((response) => response.text());
-  const markup = await fetch(`${instance.url}`).then((response) => response.text());
-  // The human asked to stop reading bare capability classes: a name must be paired with its class.
-  assert.match(script, /modelLabel\}\s*\(\$\{[^}]*modelClass\}\)/, "the model name is rendered with its class, not the class alone");
-  assert.match(script, /effortLabel/, "the effort is rendered by its advertised label");
-  assert.match(script, /Model gating inactive/, "an unprofiled agent is told gating is off rather than shown a guess");
-  assert.match(script, /runtimeProfileSource/, "the dashboard distinguishes an agent profile from the task's standing one");
-  assert.match(markup, /runtime-dialog/, "the runtime decision dialog still ships");
-});
-
 test("the scheduler explains a held assignment over REST and over MCP", async (t) => {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), "devteam-explain-server-"));
   const instance = await startDevTeamServer({ port: 0, dataDir, workspaceRoot: process.cwd(), knowledge: { enabled: false } });
